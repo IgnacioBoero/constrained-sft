@@ -1,0 +1,40 @@
+# @package _global_
+
+hydra:
+  sweeper:
+    _target_: hydra._internal.BasicSweeper
+    max_batch_size: null
+    params:
+      exp.loss_type: erm,l2,l1,penalty, dual, dual_res
+      exp.loss_alpha: 1, 0.1, 10
+      exp.model_name: bert-base-uncased,bert-large-uncased,roberta-base
+
+train:
+  seed: 42
+  output_dir: "./outputs/bias/run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}"
+  do_train: true
+  do_initial_eval: true
+  use_wandb: true
+  wandb_project: "BIAS-v1"
+  run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}"
+  data_proportion: 1.0
+
+  hf_args:
+    per_device_train_batch_size: 32
+    per_device_eval_batch_size: 32
+    gradient_accumulation_steps: 4
+    num_train_epochs: 4
+    learning_rate: 2e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+    eval_strategy: "epoch"
+    save_strategy: "epoch"
+    load_best_model_at_end: true
+    metric_for_best_model: "accuracy"
+    greater_is_better: true
+
+exp:
+  name: "bias"
+  loss_alpha: 1.0
+  loss_type: "erm"  # Options: "erm", "l2", "l1"
+  model_name: "bert-base-uncased"

@@ -1,0 +1,6 @@
+*.ipynb
+*.pyc
+__pycache__/
+outputs/*
+*.log
+wandb/*
