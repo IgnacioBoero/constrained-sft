@@ -28,13 +28,13 @@ def main(cfg: DictConfig):
 
     # Data
     train_ds, eval_ds = exp.load_datasets(cfg)
-    preprocess = exp.preprocessing_fn(tok, model)
+    preprocess = exp.preprocessing_fn(tok, cfg)
     cols = train_ds.column_names
 
     train_ds = train_ds.map(preprocess, remove_columns=cols)
     eval_ds  = eval_ds.map(preprocess, remove_columns=cols)
     collator = exp.get_collator(tok)
-
+    # Find the largest sequence length in the training set where inputs_ids are not pad tokens
     # Loss and Metrics
     metric_fn  = exp.compute_metrics(tok, cfg)
 
@@ -45,6 +45,7 @@ def main(cfg: DictConfig):
         report_to=["wandb"] if cfg.train.use_wandb else [],
         run_name=cfg.train.run_name if cfg.train.use_wandb else None,
         remove_unused_columns=False,
+        logging_steps= 1,
     )
 
     trainer = exp.get_trainer_class()(
@@ -56,7 +57,6 @@ def main(cfg: DictConfig):
     trainer.add_callback(TrainSetEvalCallback(trainer))
     if cfg.train.do_initial_eval: 
         trainer.evaluate(metric_key_prefix="eval")
-        trainer.evaluate(train_ds, metric_key_prefix="train")
     if cfg.train.do_train: trainer.train()
 
     # Finish wandb run

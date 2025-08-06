@@ -1,7 +1,7 @@
 # src/your_proj/experiments/sft_cekl.py
 import torch, torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoTokenizer, DataCollatorWithPadding, AutoModelForMultipleChoice
+from transformers import AutoTokenizer, DataCollatorWithPadding, AutoModelForMultipleChoice,RobertaForMultipleChoice, AutoConfig
 from .base import Experiment
 from transformers import Trainer
 import torch, torch.nn.functional as F
@@ -10,7 +10,8 @@ from accelerate.utils import extract_model_from_parallel
 class BIAS(Experiment):
     
     def load_model_and_tok(self, cfg):
-        model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name)
+        # config = AutoConfig.from_pretrained(cfg.exp.model_name, hidden_dropout_prob=cfg.train.dropout, attention_probs_dropout_prob=cfg.train.dropout)
+        model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name)#, config=config)
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
@@ -20,26 +21,44 @@ class BIAS(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        tr = load_dataset("iboero16/winogrande_bias", split=f"train[:{int(cfg.train.data_proportion*100)}%]")
-        ev = load_dataset("iboero16/winogrande_bias", split=f"eval[:{int(cfg.train.data_proportion*100)}%]")
+        # Load and shuffle the full datasets first
+        tr = load_dataset("iboero16/winogrande_bias", split="train").shuffle(seed=cfg.train.seed)
+        ev = load_dataset("iboero16/winogrande_bias", split="eval").shuffle(seed=cfg.train.seed)
+        
+        # Take the required proportion after shuffling
+        tr_size = int(cfg.train.data_proportion * len(tr))
+        ev_size = int(cfg.train.data_proportion * len(ev))
+        tr = tr.select(range(tr_size))
+        ev = ev.select(range(ev_size))
+        
+        # Add index column
         tr = tr.add_column("index", list(range(len(tr))))
         ev = ev.add_column("index", list(range(len(ev))))
         return tr, ev
 
-    def preprocessing_fn(self, tok, model):
+    def preprocessing_fn(self, tok, cfg):
         def fn(sample):
             input_text = sample['sentence']
             if not isinstance(input_text, str):
                 raise ValueError(f'Unsupported type of `input`: {type(input_text)}. Expected: str.')
+            opt1, opt2 = sample["option1"], sample["option2"]
 
-            # Tokenize both choices
-            tokenized = tok([input_text, input_text], [sample['option1'], sample['option2']], return_tensors="pt",return_attention_mask=True, padding='max_length',max_length=128, truncation=True,padding_side='right')
-            
+            if "_" in input_text:
+                prefix, suffix = input_text.split("_", 1)
+            else:
+                raise ValueError(f'Unsupported type of `input`: {type(input_text)}. Expected: str.')
+
+            text_a = [prefix, prefix]
+            text_b = [opt1 + suffix, opt2 + suffix]
+
+            tokenized = tok(text_a, text_b, return_token_type_ids=True, return_attention_mask=True, return_tensors=None, padding='max_length', max_length=128, truncation=True, padding_side='right')
+      
             # Stack input_ids and attention_mask for both choices
             input_ids = tokenized["input_ids"]  # shape: (2, L)
             attention_mask = tokenized["attention_mask"]  # shape: (2, L)
             index = sample['index']  # Get the index for dual variable updates
-            
+            token_type_ids = tokenized["token_type_ids"]  # shape: (2, L)
+
             # Determine correct label (0 for option1, 1 for option2)
             correct = sample["answer"]
             if correct == sample["option1"]:  # answer is option1
@@ -48,14 +67,14 @@ class BIAS(Experiment):
                 label = 1
             else:
                 raise ValueError(f'Invalid `correct` value: {correct}. Expected one of: {sample["option1"]}, {sample["option2"]}.')
-            
-            
+
             return {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
-                'labels': torch.tensor(label, dtype=torch.long),
-                'is_constraint': sample['gender_bias'],
-                'index': torch.tensor(index, dtype=torch.long)
+                'token_type_ids':token_type_ids,
+                'labels': int(label),
+                'is_constraint': bool(sample['gender_bias']),
+                'index': int(index)
             }
         return fn
 
@@ -69,6 +88,8 @@ class BIAS(Experiment):
             def __call__(self, samples):
                 input_ids = torch.stack([torch.tensor(sample['input_ids']) for sample in samples])  # (B, 2, L)
                 attention_mask = torch.stack([torch.tensor(sample['attention_mask']) for sample in samples])  # (B, 2, L)
+                token_type_ids = torch.stack([torch.tensor(sample["token_type_ids"]) for sample in samples])      # (B, 2, L) ← NEW
+
                 labels = torch.tensor(
                     [sample['labels'] for sample in samples],
                     dtype=torch.long,
@@ -77,8 +98,6 @@ class BIAS(Experiment):
                     [sample['is_constraint'] for sample in samples],
                     dtype=torch.bool,
                 )
-
-                
                 index = torch.tensor(
                     [sample['index'] for sample in samples],
                     dtype=torch.long,
@@ -86,6 +105,7 @@ class BIAS(Experiment):
                 return {
                     'input_ids': input_ids,  # size = (B, 2, L)
                     'attention_mask': attention_mask.bool(),  # size = (B, 2, L)
+                    "token_type_ids": token_type_ids,
                     'labels': labels,  # size = (B,)
                     'is_constraint': is_constraint,  # size = (B,)
                     'index': index,  # size = (B,)
@@ -96,11 +116,15 @@ class BIAS(Experiment):
         def metric_fn(pred):
             logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
             labels = pred.label_ids
+            loss = pred.losses
             is_constraint = pred.inputs
-            logits = torch.tensor(logits); labels = torch.tensor(labels).long(); is_constraint = torch.tensor(is_constraint).bool()
+            logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); is_constraint = torch.tensor(is_constraint).bool()
+            log_probs = F.log_softmax(logits, dim=-1)
+
             constraint_slacks = (logits[:, 0] - logits[:, 1])[is_constraint]
-            objective = -1 * logits.gather(1, labels.reshape(-1, 1)).squeeze(1) * (~is_constraint).float()
-            acc =  (logits.argmax(dim=-1) == labels).float().mean().item()
+            objective = -1 * log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)[~is_constraint]
+            acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
+            bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
 
             # Log table with constraint slacks for wandb
             if cfg.train.use_wandb:
@@ -112,6 +136,8 @@ class BIAS(Experiment):
                     wandb.log({"constraint_slacks": table})
 
             return {"accuracy": acc, 
+                    "bias_accuracy": bias,
+                    "loss": loss.mean().item(),
                     "objective": objective.mean().item(), 
                     "mean_constraint_violation": constraint_slacks.abs().mean().item(),
                     "min_constraint_violation": constraint_slacks.abs().min().item(),
@@ -125,8 +151,8 @@ class BIAS(Experiment):
                 super().__init__(*args, **kwargs)
                 self.experiment = experiment
                 self.init_dual_vars()
-
-            
+                
+        
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros(len(self.train_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
@@ -147,6 +173,7 @@ class BIAS(Experiment):
                 
                 input_ids = inputs['input_ids']  # size = (B, 2, L)
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
+                token_type_ids = inputs['token_type_ids']  # size = (B, 2, L)
                 labels = inputs['labels']  # size = (B,)
                 incorrect_labels = (1 - labels)  # flip 0->1, 1->0
                 is_constraint = inputs['is_constraint'].squeeze()  # size = (B,)
@@ -159,26 +186,29 @@ class BIAS(Experiment):
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    token_type_ids=token_type_ids
                 )
                 logits = outputs.logits  # size = (B, 2) - logits for each choice
                 log_probs = F.log_softmax(logits, dim=-1)  # size = (B, 2)
-
                 # Get probabilities for correct and incorrect options
                 correct_log_probs = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)  # size = (B,)
                 incorrect_log_probs = log_probs.gather(1, incorrect_labels.unsqueeze(1)).squeeze(1)  # size = (B,)
-                
+
                 # Compute log probability difference (correct - incorrect)
                 log_prob_diff = correct_log_probs - incorrect_log_probs
                 
                 # For constraint samples, we want the probabilities to be equal (difference = 0)
                 # For non-constraint samples, we want correct to have higher probability
                 slack = log_prob_diff * is_constraint.float()  # constraint violation
-                objective = -1 * correct_log_probs * is_not_constraint.float()  # maximize correct for non-constraint
-                loss = objective
 
+                if is_not_constraint.any():
+                    loss = -correct_log_probs[is_not_constraint]
+                else:
+                    loss = torch.tensor(0.0, device=correct_log_probs.device, requires_grad=True)
+                
+                # Add constraint penalization
                 if cfg.loss_type == "erm":
                     pass
-
                 elif cfg.loss_type == "l2":
                     loss += (
                         cfg.loss_alpha
@@ -193,9 +223,7 @@ class BIAS(Experiment):
                         * slack.abs()
                     ).sum()
 
-                elif cfg.loss_type == "dual":
-                    # Update duals before computing the loss
-                    
+                elif cfg.loss_type == "dual":                   
                     dual_var += 2 * cfg.loss_alpha * slack
                     self.dual_vars[index] = dual_var  
                     loss += (
@@ -212,7 +240,6 @@ class BIAS(Experiment):
                         * slack
                     ).sum()
 
-                # Total loss
                 loss = loss.mean()
                 if return_outputs:
                     return loss, outputs

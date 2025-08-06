@@ -9,10 +9,12 @@ class TrainSetEvalCallback(TrainerCallback):
         self.trainer = trainer
         self.sample_size = sample_size
         self.prefix = prefix
+        self._inside = False
 
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if not control.should_evaluate:          # keep default val-split eval logic
-            return control                       # unchanged control object
+    def on_evaluate(self, args, state, control, **kwargs):
+        if self._inside:                      # second time → do nothing
+            return control
+        self._inside = True                    # unchanged control object
 
         ds = self.trainer.train_dataset
         if self.sample_size and self.sample_size < len(ds):
@@ -23,6 +25,8 @@ class TrainSetEvalCallback(TrainerCallback):
         self.trainer.evaluate(
             eval_dataset=ds,
             metric_key_prefix=self.prefix       # results appear as train/…
+            
         )
+        self._inside = False
         return control
 

@@ -1,13 +1,12 @@
 # @package _global_
 
 hydra:
+  mode: MULTIRUN
   sweeper:
-    _target_: hydra._internal.BasicSweeper
-    max_batch_size: null
     params:
-      exp.loss_type: erm,l2,l1,penalty, dual, dual_res
+      exp.loss_type: erm,l2,l1, dual, dual_res
       exp.loss_alpha: 1, 0.1, 10
-      exp.model_name: bert-base-uncased,bert-large-uncased,roberta-base
+      exp.model_name: roberta-base,bert-base-uncased,bert-large-uncased
 
 train:
   seed: 42
@@ -20,11 +19,12 @@ train:
   data_proportion: 1.0
 
   hf_args:
-    per_device_train_batch_size: 32
-    per_device_eval_batch_size: 32
+    per_device_train_batch_size: 16
+    per_device_eval_batch_size: 16
     gradient_accumulation_steps: 4
     num_train_epochs: 4
     learning_rate: 2e-5
+    lr_scheduler_type: "linear"
     warmup_ratio: 0.1
     weight_decay: 0.01
     eval_strategy: "epoch"
@@ -37,4 +37,4 @@ exp:
   name: "bias"
   loss_alpha: 1.0
   loss_type: "erm"  # Options: "erm", "l2", "l1"
-  model_name: "bert-base-uncased"
+  model_name: "roberta-base"
