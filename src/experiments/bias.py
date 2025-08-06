@@ -225,9 +225,9 @@ class BIAS(Experiment):
 
                 elif cfg.loss_type == "dual":                   
                     dual_var += 2 * cfg.loss_alpha * slack
-                    self.dual_vars[index] = dual_var  
+                    self.dual_vars[index] = dual_var.detach()  
                     loss += (
-                        dual_var
+                        dual_var.detach()
                         * slack
                     ).sum()
                     
