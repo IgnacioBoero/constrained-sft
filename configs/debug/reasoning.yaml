@@ -1,0 +1,44 @@
+# @package _global_
+
+
+train:
+  seed: 42
+  output_dir: "./outputs/debug"
+  do_train: true
+  do_initial_eval: false
+  use_wandb: false
+  data_proportion: 0.01
+  eval_on_train: true
+  max_length: 16384
+  train_ds: "GAIR/LIMO-v2"
+  enable_profiler: true
+  hf_args:
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 64
+    num_train_epochs: 15
+    learning_rate: 5e-6
+    warmup_ratio: 0.0
+    lr_scheduler_type: "cosine"
+    eval_strategy: "no"
+    save_strategy: "no"
+    # load_best_model_at_end: true
+    gradient_checkpointing: true
+    gradient_checkpointing_kwargs:
+      use_reentrant: false
+    bf16: true
+    deepspeed: "./configs/ds_zero3.json"
+
+exp:
+  name: "reasoning"
+  loss_tol: 0.0
+  loss_type: "erm"
+  model_name: "Qwen/Qwen2.5-32B-Instruct"
+  use_lora: true
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    lora_dropout: 0.1
+    bias: "none"
+    task_type: "CAUSAL_LM"

@@ -1,0 +1,26 @@
+{
+  "zero_optimization": {
+    "stage": 3,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 500000000,
+    "stage3_param_persistence_threshold": 1000000,
+    "stage3_prefetch_bucket_size": 100000000,
+    "offload_param": {"device": "none"},   
+    "offload_optimizer": {"device": "none"}     
+  }, 
+  "bf16": { "enabled": true },
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 64,
+  "gradient_clipping": 1.0,
+  "aio": {
+    "block_size": 1048576,
+    "queue_depth": 16,
+    "single_submit": false,
+    "overlap_events": true,
+    "thread_count": 1
+  },
+  "zero_allow_untested_optimizer": true,
+  "zero_force_ds_cpu_optimizer": false,
+  "wall_clock_breakdown": false
+} 

@@ -181,7 +181,6 @@ class BIAS(Experiment):
                 index = inputs['index']  # size = (B,)
                 dual_var = self.dual_vars[index].clone()  # Get dual variable for the current batch
                 
-                
                 # Get model outputs - for multiple choice, input shape should be (B, 2, L)
                 outputs = model(
                     input_ids=input_ids,
@@ -241,6 +240,7 @@ class BIAS(Experiment):
                     ).sum()
 
                 loss = loss.mean()
+                
                 if return_outputs:
                     return loss, outputs
                 else:

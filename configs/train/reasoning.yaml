@@ -1,0 +1,62 @@
+# @package _global_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: 1
+    params:
+      exp.loss_type: erm,l2,l1,dual
+      exp.loss_tol: 0.0, -0.1, -0.35
+
+  # Ensure sequential launching (no parallel launcher)
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  # Optional: get deterministic per-job folders 0,1,2,...
+  sweep:
+    dir: ./multirun
+    subdir: ${hydra.job.num}  # 0,1,2,... in the iteration order
+
+train:
+  seed: 42
+  output_dir: "./outputs/reasoning/run-${exp.loss_type}"
+  do_train: true
+  do_initial_eval: True
+  use_wandb: true
+  wandb_project: "REASONING-v1"
+  run_name: "run-${exp.loss_type}"
+  data_proportion: 1.0
+  train_ds: "GAIR/LIMO-v2"
+  max_length: 16384
+
+  hf_args:
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 64
+    num_train_epochs: 15
+    learning_rate: 5e-6
+    lr_scheduler_type: "cosine"
+    warmup_ratio: 0.0
+    save_strategy: "epoch"
+    eval_strategy: "no"
+    load_best_model_at_end: true
+    gradient_checkpointing: true
+    bf16: true
+    deepspeed: "./configs/ds_zero3.json"
+    
+exp:
+  name: "reasoning"
+  loss_tol: 1.0
+  loss_type: "erm"
+  model_name: "Qwen/Qwen2.5-32B-Instruct"
+  
+  # LoRA configuration
+  use_lora: true
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    lora_dropout: 0.1
+    bias: "none"
+    task_type: "CAUSAL_LM"

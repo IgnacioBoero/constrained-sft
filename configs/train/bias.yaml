@@ -9,8 +9,8 @@ hydra:
     # (If you're on Hydra 1.1/1.2 use: hydra._internal.basic_sweeper.BasicSweeper)
     max_batch_size: 1              # submit one job at a time → preserves order
     params:
-      exp.model_name: roberta-base,bert-base-uncased,bert-large-uncased
-      exp.loss_alpha: 0.1,0.01,1
+      exp.model_name: roberta-base
+      exp.loss_alpha: 0.03, 0.05, 0.07, 0.005
       exp.loss_type: l2,l1,dual
 
   # Ensure sequential launching (no parallel launcher)
@@ -31,6 +31,7 @@ train:
   wandb_project: "BIAS-v1"
   run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}"
   data_proportion: 1.0
+  eval_on_train: true
 
   hf_args:
     per_device_train_batch_size: 16
