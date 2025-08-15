@@ -1,0 +1,45 @@
+# @package _global_
+
+train:
+  seed: 42
+  output_dir: "./outputs/simple_train"
+  do_train: true
+  do_initial_eval: true
+  use_wandb: true
+  wandb_project: "simple-qwen-training"
+  run_name: "qwen-7b-alpaca-lora"
+  data_proportion: 1.0  # Use full dataset
+  max_length: 16384
+  enable_profiler: false  # Disabled for full training
+  
+  bf16: true
+  fp16: false
+  deepspeed: "./configs/ds_zero3.json"
+  
+  hf_args:
+    per_device_train_batch_size: 2
+    per_device_eval_batch_size: 2
+    gradient_accumulation_steps: 32
+    num_train_epochs: 3
+    learning_rate: 2e-4
+    warmup_ratio: 0.03
+    lr_scheduler_type: "cosine"
+    eval_strategy: "steps"
+    eval_steps: 500
+    save_strategy: "epoch"
+    save_total_limit: 2
+    load_best_model_at_end: true
+    metric_for_best_model: "eval_loss"
+    gradient_checkpointing: true
+
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  use_flash_attention: true
+  use_lora: true
+  
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    lora_dropout: 0.05
+    bias: "none"

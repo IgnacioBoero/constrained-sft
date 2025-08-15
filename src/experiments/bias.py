@@ -6,18 +6,17 @@ from .base import Experiment
 from transformers import Trainer
 import torch, torch.nn.functional as F
 from accelerate.utils import extract_model_from_parallel
-
+import numpy as np
 class BIAS(Experiment):
     
     def load_model_and_tok(self, cfg):
-        # config = AutoConfig.from_pretrained(cfg.exp.model_name, hidden_dropout_prob=cfg.train.dropout, attention_probs_dropout_prob=cfg.train.dropout)
-        model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name)#, config=config)
+        model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name)
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         model.config.loss_alpha = cfg.exp.loss_alpha
         model.config.loss_type = cfg.exp.loss_type
-        model.main_input_name = 'is_constraint'
+        model.main_input_name = 'ratio'
         return model, tok
 
     def load_datasets(self, cfg):
@@ -67,13 +66,20 @@ class BIAS(Experiment):
                 label = 1
             else:
                 raise ValueError(f'Invalid `correct` value: {correct}. Expected one of: {sample["option1"]}, {sample["option2"]}.')
-
+            if bool(sample['gender_bias']):
+                if cfg.exp.ratio == "fair":
+                    ratio = np.log(sample['stereo_prob'])
+                elif cfg.exp.ratio == "ones":
+                    ratio = np.log(1.0)
+            else:
+                ratio = -1.0
             return {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'token_type_ids':token_type_ids,
                 'labels': int(label),
                 'is_constraint': bool(sample['gender_bias']),
+                'ratio': ratio,  # Add ratio for fair/ones
                 'index': int(index)
             }
         return fn
@@ -98,6 +104,10 @@ class BIAS(Experiment):
                     [sample['is_constraint'] for sample in samples],
                     dtype=torch.bool,
                 )
+                ratio = torch.tensor(
+                    [sample['ratio'] for sample in samples],
+                    dtype=torch.float,
+                )
                 index = torch.tensor(
                     [sample['index'] for sample in samples],
                     dtype=torch.long,
@@ -108,6 +118,7 @@ class BIAS(Experiment):
                     "token_type_ids": token_type_ids,
                     'labels': labels,  # size = (B,)
                     'is_constraint': is_constraint,  # size = (B,)
+                    'ratio': ratio,  # size = (B,)
                     'index': index,  # size = (B,)
                 }
         return ClassificationBiasCollator(tok.pad_token_id)
@@ -117,11 +128,12 @@ class BIAS(Experiment):
             logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
             labels = pred.label_ids
             loss = pred.losses
-            is_constraint = pred.inputs
-            logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); is_constraint = torch.tensor(is_constraint).bool()
+            ratio = pred.inputs
+            logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); ratio = torch.tensor(ratio)
+            is_constraint = ratio != -1.0
             log_probs = F.log_softmax(logits, dim=-1)
 
-            constraint_slacks = (logits[:, 0] - logits[:, 1])[is_constraint]
+            constraint_slacks = (logits[:, 0] - logits[:, 1] - ratio)[is_constraint]
             objective = -1 * log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)[~is_constraint]
             acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
             bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
@@ -175,6 +187,7 @@ class BIAS(Experiment):
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
                 token_type_ids = inputs['token_type_ids']  # size = (B, 2, L)
                 labels = inputs['labels']  # size = (B,)
+                ratio = inputs['ratio']  # size = (B,)
                 incorrect_labels = (1 - labels)  # flip 0->1, 1->0
                 is_constraint = inputs['is_constraint'].squeeze()  # size = (B,)
                 is_not_constraint = ~is_constraint
@@ -194,7 +207,7 @@ class BIAS(Experiment):
                 incorrect_log_probs = log_probs.gather(1, incorrect_labels.unsqueeze(1)).squeeze(1)  # size = (B,)
 
                 # Compute log probability difference (correct - incorrect)
-                log_prob_diff = correct_log_probs - incorrect_log_probs
+                log_prob_diff = correct_log_probs - incorrect_log_probs - ratio
                 
                 # For constraint samples, we want the probabilities to be equal (difference = 0)
                 # For non-constraint samples, we want correct to have higher probability
@@ -221,15 +234,6 @@ class BIAS(Experiment):
                         / 2
                         * slack.abs()
                     ).sum()
-
-                elif cfg.loss_type == "dual":                   
-                    dual_var += 2 * cfg.loss_alpha * slack
-                    self.dual_vars[index] = dual_var.detach()  
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                    ).sum()
-                    
                 elif cfg.loss_type == "dual_res":
                     # Update duals before computing the loss
                     dual_var += -1 * dual_var + 2 * cfg.loss_alpha * (slack)
@@ -238,6 +242,29 @@ class BIAS(Experiment):
                         dual_var
                         * slack
                     ).sum()
+                elif cfg.loss_type == "dual":                   
+                    dual_var += 2 * cfg.loss_alpha * slack
+                    self.dual_vars[index] = dual_var.detach()  
+                    loss += (
+                        dual_var.detach()
+                        * slack
+                    ).sum()
+                elif cfg.loss_type == "dual_aug_l2":
+                    dual_var += 2 * cfg.loss_alpha * slack
+                    self.dual_vars[index] = dual_var.detach()  
+                    loss += (
+                        dual_var.detach()
+                        * slack
+                        + (cfg.loss_alpha / 2) * slack ** 2
+                    ).sum()
+                elif cfg.loss_type == "dual_aug_l1":
+                    dual_var += 2 * cfg.loss_alpha * slack
+                    self.dual_vars[index] = dual_var.detach()  
+                    loss += (
+                        dual_var.detach()
+                        * slack
+                        + (cfg.loss_alpha / 2) * slack.abs()
+                    ).sum()         
 
                 loss = loss.mean()
                 

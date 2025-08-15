@@ -9,18 +9,14 @@ from accelerate.utils import extract_model_from_parallel
 from utils import right_padding
 from torch.backends.cuda import sdp_kernel
 from torch.autograd.profiler import record_function
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 class REASONING(Experiment):
     
     def load_model_and_tok(self, cfg):
-        # config = AutoConfig.from_pretrained(cfg.exp.model_name, hidden_dropout_prob=cfg.train.dropout, attention_probs_dropout_prob=cfg.train.dropout)
-        
         model = AutoModelForCausalLM.from_pretrained(
             cfg.exp.model_name, 
-            attn_implementation='flash_attention_2',
-            torch_dtype=torch.bfloat16,
-            device_map="auto" if not cfg.train.hf_args.deepspeed else None,
+            torch_dtype=torch.bfloat16 if cfg.train.hf_args.bf16 else torch.float32,
             trust_remote_code=True
         )
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name)
@@ -39,23 +35,20 @@ class REASONING(Experiment):
             )
             model = get_peft_model(model, lora_config)
             model.print_trainable_parameters()
-        
+            model.enable_input_require_grads()
         model.config.loss_tol = cfg.exp.loss_tol
         model.config.loss_type = cfg.exp.loss_type
         model.config.use_cache = False
+        model.config.sliding_window = None
         return model, tok
 
     def load_datasets(self, cfg):
-        # Load and shuffle the full datasets first
         tr = load_dataset(cfg.train.train_ds, split="train")
         tr_size = int(cfg.train.data_proportion * len(tr))
         tr = tr.select(range(tr_size))
-        
         tr, ev = tr.train_test_split(test_size=0.1).values()
-        
         tr = tr.add_column("index", list(range(len(tr))))
         ev = ev.add_column("index", list(range(len(ev))))
-        
         return tr, ev
 
     def preprocessing_fn(self, tok, cfg):
@@ -84,8 +77,6 @@ class REASONING(Experiment):
             cutoff = len(prompt_ids)
             labels[:cutoff] = [-100] * cutoff
             index = sample['index']  # Get the index for dual variable updates
-            
-
             return {
                 'input_ids': full_ids,
                 'labels': labels,
@@ -125,7 +116,6 @@ class REASONING(Experiment):
 
     def compute_metrics(self, tok, cfg):
         def metric_fn(pred):
-            
             logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
             labels = pred.label_ids
             loss = pred.losses
@@ -133,12 +123,9 @@ class REASONING(Experiment):
             logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); input_ids = torch.tensor(input_ids)
             log_probs = torch.gather(F.log_softmax(logits[:,:-1], dim=-1), dim=-1, index=input_ids[:, 1:].unsqueeze(dim=-1)).squeeze(-1)
             log_probs = log_probs[labels[:,1:] != -100]
-            
             constraint_slacks = log_probs
             objective = -log_probs.mean().item()
             constraint_satisfaction = (constraint_slacks >= cfg.exp.loss_tol).float().mean().item()
-
-            # Log table with constraint slacks for wandb
             if cfg.train.use_wandb:
                 import wandb
                 if wandb.run is not None:
@@ -146,7 +133,6 @@ class REASONING(Experiment):
                     for slack in constraint_slacks.tolist():
                         table.add_data(slack)
                     wandb.log({"constraint_slacks": table})
-
 
             return {"loss": loss.mean().item(),
                     "objective": objective,
@@ -158,7 +144,6 @@ class REASONING(Experiment):
 
 
     def get_trainer_class(self):
-        from peft import PeftModel
         
         class CustomTrainer(Trainer):
             def __init__(self, *args, experiment=None, dual_vars=None, **kwargs):

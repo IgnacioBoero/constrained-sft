@@ -1,6 +1,7 @@
-# src/run.py
+# src/train.py
 from callbacks.trainer_eval import TrainSetEvalCallback
 from callbacks.profiler_callback import ProfilerCallback
+from callbacks.cache import SyncEmptyCacheCallback
 import hydra
 import wandb
 import torch
@@ -8,6 +9,7 @@ from omegaconf import DictConfig, OmegaConf
 from transformers import TrainingArguments, set_seed
 from experiments.registry import EXPERIMENTS
 from utils import dump_cuda_memory, trace_handler
+from transformers.integrations import HfDeepSpeedConfig
 
 @hydra.main(config_path="../configs", config_name="train/default", version_base=None)
 def main(cfg: DictConfig):
@@ -24,6 +26,11 @@ def main(cfg: DictConfig):
 
     ExpCls = EXPERIMENTS[cfg.exp.name]
     exp = ExpCls()
+    
+    # deepSpeed configuration
+    if "deepspeed" in cfg.train.hf_args and cfg.train.hf_args.deepspeed:
+        ds_cfg_path = cfg.train.hf_args.deepspeed
+        _ = HfDeepSpeedConfig(ds_cfg_path)
 
     # Model
     model,tok = exp.load_model_and_tok(cfg)
@@ -37,7 +44,7 @@ def main(cfg: DictConfig):
     eval_ds = eval_ds.map(preprocess, remove_columns=cols) 
     
     collator = exp.get_collator(tok)
-    metric_fn  = exp.compute_metrics(tok, cfg)
+    metric_fn = exp.compute_metrics(tok, cfg)
     args = TrainingArguments(
         output_dir=cfg.train.output_dir,
         **cfg.train.hf_args,
@@ -54,39 +61,36 @@ def main(cfg: DictConfig):
         data_collator=collator, tokenizer=tok,
         compute_metrics=metric_fn, experiment=exp
     )
-    if cfg.train.eval_on_train:
-        trainer.add_callback(TrainSetEvalCallback(trainer))
-
-
     
+    eval_on_train = getattr(cfg.train, "eval_on_train", False)
+    if eval_on_train:
+        trainer.add_callback(TrainSetEvalCallback(trainer))
+    
+    sync_empty_cache = getattr(cfg.train, "sync_empty_cache", False)
+    if sync_empty_cache:
+        trainer.add_callback(SyncEmptyCacheCallback(every_n_steps=1))
+   
     if cfg.train.do_train:
         # Configure profiler for GPU memory tracking
         profiler_enabled = getattr(cfg.train, 'enable_profiler', False)
         
         if profiler_enabled and torch.cuda.is_available():
             print("Profiler is enabled. Tracking GPU memory usage.")
-            schedule = torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=9999)
+            schedule = torch.profiler.schedule(wait=cfg.train.profiler.wait, warmup=cfg.train.profiler.warmup, active=cfg.train.profiler.active, repeat=cfg.train.profiler.repeat)
 
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                 schedule=schedule,
-                on_trace_ready=trace_handler("./log/profile"),
+                on_trace_ready=trace_handler(cfg.train.profiler.output_dir),
                 record_shapes=True,
                 profile_memory=True,
-                with_flops=True
+                with_flops=True,
+                # with_stack=True,
+                with_modules=True,
             ) as prof:
-                # Add profiler callback to step the profiler
                 trainer.add_callback(ProfilerCallback(prof))
                 trainer.train()
-                # try:
-                #     if cfg.train.do_initial_eval:
-                #         trainer.evaluate(metric_key_prefix="eval")
-                #     trainer.train()
-                # except RuntimeError as e:
-                #     if "CUDA out of memory" in str(e):
-                #         print("CUDA out of memory error encountered. Dumping CUDA memory snapshot.")
-                #         dump_cuda_memory(path="./log/cuda_mem_snapshot.pickle")
-                #     raise
+
         else:
             if cfg.train.do_initial_eval:
                 trainer.evaluate(metric_key_prefix="eval")

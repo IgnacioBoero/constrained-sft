@@ -4,54 +4,59 @@ hydra:
   mode: MULTIRUN
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
-    max_batch_size: 1
     params:
-      exp.loss_type: erm,l2,l1,dual
-      exp.loss_tol: 0.0, -0.1, -0.35
-
-  # Ensure sequential launching (no parallel launcher)
+      exp.loss_type: hf,erm,l2,l1
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
-
-  # Optional: get deterministic per-job folders 0,1,2,...
   sweep:
     dir: ./multirun
-    subdir: ${hydra.job.num}  # 0,1,2,... in the iteration order
+    subdir: ${hydra.job.num}
 
 train:
   seed: 42
-  output_dir: "./outputs/reasoning/run-${exp.loss_type}"
+  output_dir: "./outputs/reasoning"
   do_train: true
-  do_initial_eval: True
+  do_initial_eval: false
   use_wandb: true
   wandb_project: "REASONING-v1"
-  run_name: "run-${exp.loss_type}"
+  run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_tol}"
   data_proportion: 1.0
-  train_ds: "GAIR/LIMO-v2"
+  eval_on_train: true
   max_length: 16384
-
+  train_ds: "GAIR/LIMO-v2"
+  sync_empty_cache: true
+  # Profiler configuration
+  enable_profiler: true
+  profiler:
+    wait: 0
+    warmup: 0
+    active: 1
+    repeat: 9999
+    output_dir: "./log/reasoning/run-0/"
   hf_args:
     per_device_train_batch_size: 1
     per_device_eval_batch_size: 1
     gradient_accumulation_steps: 64
-    num_train_epochs: 15
+    num_train_epochs: 1
     learning_rate: 5e-6
-    lr_scheduler_type: "cosine"
     warmup_ratio: 0.0
-    save_strategy: "epoch"
+    lr_scheduler_type: "cosine"
     eval_strategy: "no"
-    load_best_model_at_end: true
+    save_strategy: "no"
+    # load_best_model_at_end: true
     gradient_checkpointing: true
+    gradient_checkpointing_kwargs:
+      use_reentrant: true
     bf16: true
     deepspeed: "./configs/ds_zero3.json"
-    
+    logging_strategy: "steps"
+    logging_steps: 1
+
 exp:
   name: "reasoning"
-  loss_tol: 1.0
+  loss_tol: 0.0
   loss_type: "erm"
   model_name: "Qwen/Qwen2.5-32B-Instruct"
-  
-  # LoRA configuration
   use_lora: true
   lora:
     r: 16
