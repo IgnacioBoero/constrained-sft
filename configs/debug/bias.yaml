@@ -28,5 +28,5 @@ exp:
   name: "bias"
   loss_alpha: 1.0
   loss_type: "erm"  # Options: "erm", "l2", "l1"
-  model_name: "FacebookAI/roberta-large"
+  model_name: "roberta-base"
   ratio: "fair"

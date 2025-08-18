@@ -10,7 +10,16 @@ import numpy as np
 class BIAS(Experiment):
     
     def load_model_and_tok(self, cfg):
-        model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name)
+        configuration = AutoConfig.from_pretrained(cfg.exp.model_name)
+        if cfg.exp.model_name == "answerdotai/ModernBERT-large":
+            configuration.attention_dropout = cfg.train.dropout
+            configuration.mlp_dropout = cfg.train.dropout
+            configuration.classifier_dropout = cfg.train.dropout
+        elif cfg.exp.model_name == "FacebookAI/roberta-large":
+            configuration.hidden_dropout_prob = cfg.train.dropout
+            configuration.attention_probs_dropout_prob = cfg.train.dropout
+            configuration.classifier_dropout = cfg.train.dropout
+        model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name, config=configuration)
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
@@ -24,6 +33,9 @@ class BIAS(Experiment):
         tr = load_dataset("iboero16/winogrande_bias", split="train").shuffle(seed=cfg.train.seed)
         ev = load_dataset("iboero16/winogrande_bias", split="eval").shuffle(seed=cfg.train.seed)
         
+        # if cfg.exp.loss_type == "erm":
+        #     tr = tr.filter(lambda s: not s["gender_bias"])
+        #     ev = ev.filter(lambda s: not s["gender_bias"])
         # Take the required proportion after shuffling
         tr_size = int(cfg.train.data_proportion * len(tr))
         ev_size = int(cfg.train.data_proportion * len(ev))
@@ -33,6 +45,7 @@ class BIAS(Experiment):
         # Add index column
         tr = tr.add_column("index", list(range(len(tr))))
         ev = ev.add_column("index", list(range(len(ev))))
+        print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
         return tr, ev
 
     def preprocessing_fn(self, tok, cfg):

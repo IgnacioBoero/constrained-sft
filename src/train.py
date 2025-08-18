@@ -69,8 +69,7 @@ def main(cfg: DictConfig):
     sync_empty_cache = getattr(cfg.train, "sync_empty_cache", False)
     if sync_empty_cache:
         trainer.add_callback(SyncEmptyCacheCallback(every_n_steps=1))
-   
-    if cfg.train.do_train:
+    if cfg.train.do_train:  
         # Configure profiler for GPU memory tracking
         profiler_enabled = getattr(cfg.train, 'enable_profiler', False)
         
@@ -89,6 +88,8 @@ def main(cfg: DictConfig):
                 with_modules=True,
             ) as prof:
                 trainer.add_callback(ProfilerCallback(prof))
+                # if cfg.train.do_initial_eval:
+                #     trainer.evaluate(metric_key_prefix="eval")
                 trainer.train()
 
         else:
