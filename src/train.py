@@ -10,14 +10,18 @@ from transformers import TrainingArguments, set_seed
 from experiments.registry import EXPERIMENTS
 from utils import dump_cuda_memory, trace_handler
 from transformers.integrations import HfDeepSpeedConfig
+import os
+from torch.distributed.elastic.multiprocessing.errors import record
 
+
+os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 @hydra.main(config_path="../configs", config_name="train/default", version_base=None)
 def main(cfg: DictConfig):
     
     set_seed(cfg.train.seed)
-    
+    rank = int(os.environ.get("RANK", "0"))
     # Initialize wandb if enabled
-    if cfg.train.use_wandb:
+    if cfg.train.use_wandb and rank == 0:
         wandb.init(
             project=cfg.train.wandb_project,
             name=cfg.train.run_name or f"{cfg.exp.name}-{cfg.model.name}",
@@ -98,7 +102,7 @@ def main(cfg: DictConfig):
             trainer.train()
 
     # Finish wandb run
-    if cfg.train.use_wandb:
+    if cfg.train.use_wandb and rank == 0:
         wandb.finish()
 
 if __name__ == "__main__":

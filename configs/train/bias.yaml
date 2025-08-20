@@ -5,10 +5,11 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
+      exp.ratio: fair, ones
       exp.model_name: FacebookAI/roberta-large
-      exp.loss_alpha: 0.01, 0.1, 1, 0.05
       exp.loss_type: l2,l1,dual
-      exp.ratio: fair,ones
+      exp.tol: 0
+      exp.loss_alpha: 10,100,1000,10000
 
   # Ensure sequential launching (no parallel launcher)
   launcher:
@@ -21,12 +22,12 @@ hydra:
 
 train:
   seed: 42
-  output_dir: "./outputs/bias/run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}"
+  output_dir: "./outputs/bias/run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
   do_train: true
   do_initial_eval: true
   use_wandb: true
-  wandb_project: "BIAS-v4"
-  run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}"
+  wandb_project: "BIAS-v5"
+  run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
   data_proportion: 1.0
   eval_on_train: true
   enable_profiler: false
@@ -36,12 +37,12 @@ train:
     warmup: 0
     active: 1
     repeat: 9999
-    output_dir: "./log/bias/${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}/"
+    output_dir: "./log/bias/${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}/"
   hf_args:
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 8
     gradient_accumulation_steps: 1
-    num_train_epochs: 8
+    num_train_epochs: 5
     learning_rate: 5e-6
     lr_scheduler_type: "linear"
     warmup_ratio: 0.1
@@ -54,7 +55,8 @@ train:
     save_total_limit: 1
 exp:
   name: "bias"
-  loss_alpha: 1.0
-  loss_type: "erm"
-  model_name: "FacebookAI/roberta-large"
-  ratio: "fair"  # Options: "fair", "ones"
+  loss_alpha: 10
+  loss_type: l2
+  model_name: FacebookAI/roberta-large
+  ratio: fair # Options: "fair", "ones"
+  tol: 0.0

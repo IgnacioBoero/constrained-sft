@@ -7,6 +7,7 @@ from transformers import Trainer
 import torch, torch.nn.functional as F
 from accelerate.utils import extract_model_from_parallel
 import numpy as np
+import os
 class BIAS(Experiment):
     
     def load_model_and_tok(self, cfg):
@@ -25,7 +26,8 @@ class BIAS(Experiment):
             tok.pad_token = tok.eos_token
         model.config.loss_alpha = cfg.exp.loss_alpha
         model.config.loss_type = cfg.exp.loss_type
-        model.main_input_name = 'ratio'
+        model.config.tol = cfg.exp.tol
+        model.main_input_name = 'probs'
         return model, tok
 
     def load_datasets(self, cfg):
@@ -81,18 +83,18 @@ class BIAS(Experiment):
                 raise ValueError(f'Invalid `correct` value: {correct}. Expected one of: {sample["option1"]}, {sample["option2"]}.')
             if bool(sample['gender_bias']):
                 if cfg.exp.ratio == "fair":
-                    ratio = np.log(sample['stereo_prob'])
+                    probs = sample['stereo_prob'] / (1 + sample['stereo_prob'])
                 elif cfg.exp.ratio == "ones":
-                    ratio = np.log(1.0)
+                    probs = 0.5
             else:
-                ratio = -1.0
+                probs = -1.0
             return {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'token_type_ids':token_type_ids,
                 'labels': int(label),
                 'is_constraint': bool(sample['gender_bias']),
-                'ratio': ratio,  # Add ratio for fair/ones
+                'probs': probs,  # Add ratio for fair/ones
                 'index': int(index)
             }
         return fn
@@ -117,8 +119,8 @@ class BIAS(Experiment):
                     [sample['is_constraint'] for sample in samples],
                     dtype=torch.bool,
                 )
-                ratio = torch.tensor(
-                    [sample['ratio'] for sample in samples],
+                probs = torch.tensor(
+                    [sample['probs'] for sample in samples],
                     dtype=torch.float,
                 )
                 index = torch.tensor(
@@ -131,7 +133,7 @@ class BIAS(Experiment):
                     "token_type_ids": token_type_ids,
                     'labels': labels,  # size = (B,)
                     'is_constraint': is_constraint,  # size = (B,)
-                    'ratio': ratio,  # size = (B,)
+                    'probs': probs,  # size = (B,)
                     'index': index,  # size = (B,)
                 }
         return ClassificationBiasCollator(tok.pad_token_id)
@@ -141,32 +143,44 @@ class BIAS(Experiment):
             logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
             labels = pred.label_ids
             loss = pred.losses
-            ratio = pred.inputs
-            logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); ratio = torch.tensor(ratio)
-            is_constraint = ratio != -1.0
+            probs = pred.inputs
+            logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); probs = torch.tensor(probs)
+            is_constraint = probs != -1.0
             log_probs = F.log_softmax(logits, dim=-1)
+            correct_log_probs = log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)
+            incorrect_log_probs = log_probs.gather(1, (1 - labels).reshape(-1, 1)).squeeze(1)
 
-            constraint_slacks = (logits[:, 0] - logits[:, 1] - ratio)[is_constraint]
+            constraint_slacks = probs * (torch.log(probs) - correct_log_probs) + (1 - probs) * (torch.log(1 - probs) - incorrect_log_probs)  # KL divergence
+            constraint_slacks = constraint_slacks[is_constraint]  # Only keep constraint samples
+            metric_constraints = torch.abs(probs - torch.exp(correct_log_probs))[is_constraint]
             objective = -1 * log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)[~is_constraint]
             acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
             bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
 
             # Log table with constraint slacks for wandb
-            if cfg.train.use_wandb:
+            rank = int(os.environ.get("RANK", "0"))
+            if cfg.train.use_wandb and rank == 0:
                 import wandb
                 if wandb.run is not None:
-                    table = wandb.Table(columns=["constraint_slack"])
-                    for slack in constraint_slacks.tolist():
-                        table.add_data(slack)
-                    wandb.log({"constraint_slacks": table})
+                    table_metrics = wandb.Table(columns=["constraint_slack", "metric_constraint"])
+                    for slack, metric in zip(constraint_slacks.tolist(), metric_constraints.tolist()):
+                        table_metrics.add_data(slack, metric)
+                    wandb.log({"constraint_slacks_metrics": table_metrics})
+                # Add histogram of constraint slacks
+                wandb.log({"constraint_slacks_histogram": wandb.Histogram(constraint_slacks.cpu().numpy())})
+                wandb.log({"metric_constraints_histogram": wandb.Histogram(metric_constraints.cpu().numpy())})
 
-            return {"accuracy": acc, 
+            return {"accuracy": acc,
                     "bias_accuracy": bias,
                     "loss": loss.mean().item(),
                     "objective": objective.mean().item(), 
-                    "mean_constraint_violation": constraint_slacks.abs().mean().item(),
-                    "min_constraint_violation": constraint_slacks.abs().min().item(),
-                    "max_constraint_violation": constraint_slacks.abs().max().item()}
+                    "mean_dkl_violation": constraint_slacks.mean().item(),
+                    "min_dkl_violation": constraint_slacks.min().item(),
+                    "max_dkl_violation": constraint_slacks.max().item(),
+                    "mean_metric_constraint": metric_constraints.mean().item(),
+                    "min_metric_constraint": metric_constraints.min().item(),
+                    "max_metric_constraint": metric_constraints.max().item()
+                    }
         return metric_fn
 
 
@@ -200,7 +214,7 @@ class BIAS(Experiment):
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
                 token_type_ids = inputs['token_type_ids']  # size = (B, 2, L)
                 labels = inputs['labels']  # size = (B,)
-                ratio = inputs['ratio']  # size = (B,)
+                target = inputs['probs']  # size = (B,)
                 incorrect_labels = (1 - labels)  # flip 0->1, 1->0
                 is_constraint = inputs['is_constraint'].squeeze()  # size = (B,)
                 is_not_constraint = ~is_constraint
@@ -218,13 +232,14 @@ class BIAS(Experiment):
                 # Get probabilities for correct and incorrect options
                 correct_log_probs = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)  # size = (B,)
                 incorrect_log_probs = log_probs.gather(1, incorrect_labels.unsqueeze(1)).squeeze(1)  # size = (B,)
-
+                target = target.clamp(1e-7, 1 - 1e-7)  # Avoid log(-1) issues on non-constraint samples
                 # Compute log probability difference (correct - incorrect)
-                log_prob_diff = correct_log_probs - incorrect_log_probs - ratio
+                dkl = target * (torch.log(target) - correct_log_probs) + (1 - target) * (torch.log(1 - target) - incorrect_log_probs) # KL divergence
+
                 
                 # For constraint samples, we want the probabilities to be equal (difference = 0)
                 # For non-constraint samples, we want correct to have higher probability
-                slack = log_prob_diff * is_constraint.float()  # constraint violation
+                slack = (dkl - cfg.tol) * is_constraint.float()  # constraint violation
 
                 if is_not_constraint.any():
                     loss = -correct_log_probs[is_not_constraint]
