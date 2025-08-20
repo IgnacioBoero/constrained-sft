@@ -1,0 +1,57 @@
+# @package _global_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.model_name: answerdotai/ModernBERT-base,answerdotai/ModernBERT-large
+      exp.loss_type: ls,l2,l1,dual
+      exp.loss_tol: 0, 0.1,0.3,1.0
+
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun
+    subdir: ${hydra.job.num}
+
+train:
+  seed: 42
+  output_dir: "./outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.loss_tol}"
+  do_train: true
+  do_initial_eval: true
+  use_wandb: true
+  wandb_project: "RERANKER-v1"
+  run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.loss_tol}"
+  eval_on_train: true
+  enable_profiler: false
+  dropout: 0.0
+  data_proportion: 1.0
+  hf_args:
+    per_device_train_batch_size: 4          # ST recipe
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 8
+    num_train_epochs: 3                      # ST example uses 1 epoch
+    learning_rate: 2e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.0
+    lr_scheduler_type: "linear"
+    eval_strategy: "epoch"
+    save_strategy: "epoch"
+    save_total_limit: 1
+    load_best_model_at_end: true
+    metric_for_best_model: "NanoBEIR_R100_mean_ndcg@10"
+    greater_is_better: true
+    bf16: true
+    fp16: false
+
+exp:
+  name: "reranker"           # must match the key in your experiments.registry
+  model_name: "answerdotai/ModernBERT-base"
+  num_negatives: 5                 # ST example uses 5
+  scale: 10.0                      # ST example uses 10.0
+  max_length: 512
+  loss_type: "erm"                 # Options: "erm", "l2", "l1", "dual"
+  loss_tol: 0.0

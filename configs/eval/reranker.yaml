@@ -1,0 +1,25 @@
+# @package _global_
+
+train:
+  seed: 42
+  model_path: "./outputs/reranker/${exp.model_name}"
+  eval_on_train: false  # Set to true to also evaluate on training set
+  debug_metrics: false  # Set to true to add breakpoint in compute_metrics
+  use_wandb: false
+  wandb_project: "RERANKER-EVAL-v1"
+  run_name: "eval-reranker-${exp.model_name}"
+  data_proportion: 1.0
+  hf_args:
+    per_device_eval_batch_size: 1
+    bf16: true
+    fp16: false
+    remove_unused_columns: false
+
+exp:
+  name: "reranker"           # must match the key in your experiments.registry
+  model_name: "answerdotai/ModernBERT-large"
+  num_negatives: 5                 # ST example uses 5
+  scale: 10.0                      # ST example uses 10.0
+  max_length: 512
+  loss_type: "erm"                 # Options: "erm", "l2", "l1", "dual"
+  loss_tol: 0.0
