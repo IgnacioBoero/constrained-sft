@@ -6,3 +6,4 @@ outputs/*
 wandb/*
 multirun/*
 log/*
+plotting/*
