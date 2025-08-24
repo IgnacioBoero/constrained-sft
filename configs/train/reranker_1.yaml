@@ -6,8 +6,8 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.model_name: answerdotai/ModernBERT-large,answerdotai/ModernBERT-base
-      exp.loss_type: dual,l2
-      exp.loss_tol: 0, 0.1,1.0
+      exp.loss_type: ls
+      exp.loss_tol: 0.1,1.0
 
 
   launcher:

@@ -82,6 +82,8 @@ class RERANKER(Experiment):
 
         train = train.map(mnrl_mapper, batched=True, remove_columns=train.column_names)
         eval = eval.map(mnrl_mapper, batched=True, remove_columns=eval.column_names)
+        # tr_size = int(cfg.train.data_proportion * len(train))
+        # ev_size = int(cfg.train.data_proportion * len(eval))
         tr_size = int(cfg.train.data_proportion * len(train))
         ev_size = int(cfg.train.data_proportion * len(eval))
         train = train.select(range(tr_size))
@@ -179,7 +181,6 @@ class RERANKER(Experiment):
             if labels.ndim == 1:
                 raise ValueError("Labels should be grouped per query: shape (N, G).")
             N, G = labels.shape
-
             if logits.numel() == N * G:
                 logits = logits.view(N, G)
 
@@ -213,11 +214,11 @@ class RERANKER(Experiment):
             # For a single relevant doc, MAP reduces to precision@rank = 1/rank
 
             out = {
-                "eval_NanoBEIR_R100_mean_ndcg@10": float(mean_ndcg10),
-                "eval_mrr@10": float(mrr10),
-                "mean_constraint_violation": constraint_slacks.abs().mean().item(),
-                "min_constraint_violation": constraint_slacks.abs().min().item(),
-                "max_constraint_violation": constraint_slacks.abs().max().item(),
+                "NanoBEIR_R100_mean_ndcg@10": float(mean_ndcg10),
+                "mrr@10": float(mrr10),
+                "mean_constraint_violation": abs(constraint_slacks).mean().item(),
+                "min_constraint_violation": abs(constraint_slacks).min().item(),
+                "max_constraint_violation": abs(constraint_slacks).max().item(),
             }
             breakp = getattr(cfg.train, "debug_metrics", False)
             if breakp:
@@ -266,22 +267,22 @@ class RERANKER(Experiment):
                 # Assume index 0 is positive, 1..K negatives (we encoded that in preprocessing)
                 s_pos = logits[:, 0].unsqueeze(1)    # (B, 1)
                 s_neg = logits[:, 1:]                # (B, K)
-                slack = -(s_pos - s_neg) + cfg.exp.loss_tol
+                slack = -(s_pos - s_neg) + cfg.loss_tol
 
                 if cfg.loss_type == "ls":
-                    loss = -F.logsigmoid(slack * cfg.loss_alpha).sum()
+                    loss = -F.logsigmoid(-10 * slack).mean()
                 elif cfg.loss_type == "l2":
-                    loss = (torch.clamp(slack , 0.0)**2).sum()
+                    loss = (torch.clamp(slack , 0.0)**2).mean()
                 elif cfg.loss_type == "l1":
-                    loss = torch.clamp(slack, 0.0).sum()
+                    loss = torch.clamp(slack, 0.0).mean()
                 elif cfg.loss_type == "dual":
                     dual_var = self.dual_vars[index].clone()
-                    dual_var += 2 * cfg.loss_alpha * slack
+                    dual_var += 2 * slack
                     self.dual_vars[index] = dual_var.detach()
                     loss += (
                         dual_var.detach()
                         * slack
-                    ).sum()
+                    ).mean()
                 if return_outputs:
                     # Return flattened outputs so HF eval loop collects predictions consistently
                     outputs.logits = logits.view(B * G, 1)

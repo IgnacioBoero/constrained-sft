@@ -10,13 +10,32 @@ from transformers import TrainingArguments, set_seed
 from experiments.registry import EXPERIMENTS
 from utils import dump_cuda_memory, trace_handler
 from transformers.integrations import HfDeepSpeedConfig
+import os
+from transformers.trainer_utils import is_main_process
+import atexit, torch, torch.distributed as dist
+
+def _ddp_teardown():
+    if dist.is_available() and dist.is_initialized():
+        try: dist.barrier()
+        except Exception: pass
+        try: dist.destroy_process_group()
+        except Exception: pass
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+atexit.register(_ddp_teardown)
 
 @hydra.main(config_path="../configs", config_name="train/default", version_base=None)
 def main(cfg: DictConfig):
     set_seed(cfg.train.seed)
-    
+    # BEFORE wandb.init
+    if cfg.train.use_wandb and not is_main_process():
+        os.environ["WANDB_DISABLED"] = "true"
     # Initialize wandb if enabled
-    if cfg.train.use_wandb:
+    if cfg.train.use_wandb and is_main_process():
         wandb.init(
             project=cfg.train.wandb_project,
             name=cfg.train.run_name or f"{cfg.exp.name}-{cfg.model.name}",
@@ -97,7 +116,7 @@ def main(cfg: DictConfig):
             trainer.train()
 
     # Finish wandb run
-    if cfg.train.use_wandb:
+    if cfg.train.use_wandb and is_main_process():
         wandb.finish()
 
 if __name__ == "__main__":
