@@ -86,6 +86,8 @@ class BIAS(Experiment):
                     probs = sample['stereo_prob'] / (1 + sample['stereo_prob'])
                 elif cfg.exp.ratio == "ones":
                     probs = 0.5
+                elif cfg.exp.ratio == "reverse":
+                    probs = 1 - (sample['stereo_prob'] / (1 + sample['stereo_prob']))
             else:
                 probs = -1.0
             return {
@@ -220,7 +222,8 @@ class BIAS(Experiment):
                 is_not_constraint = ~is_constraint
                 index = inputs['index']  # size = (B,)
                 dual_var = self.dual_vars[index].clone()  # Get dual variable for the current batch
-                
+                epoch = self.state.epoch if self.state.epoch is not None else 0.0
+                epoch_idx = int(epoch + 1e-9) + 1 # integer epoch index
                 # Get model outputs - for multiple choice, input shape should be (B, 2, L)
                 outputs = model(
                     input_ids=input_ids,
@@ -278,7 +281,7 @@ class BIAS(Experiment):
                         * slack
                     ).sum()
                 elif cfg.loss_type == "dual_aug_l2":
-                    dual_var += 2 * cfg.loss_alpha * slack
+                    dual_var += cfg.loss_alpha * slack
                     self.dual_vars[index] = dual_var.detach()  
                     loss += (
                         dual_var.detach()
@@ -286,14 +289,32 @@ class BIAS(Experiment):
                         + (cfg.loss_alpha / 2) * slack ** 2
                     ).sum()
                 elif cfg.loss_type == "dual_aug_l1":
-                    dual_var += 2 * cfg.loss_alpha * slack
+                    dual_var += cfg.loss_alpha * slack
                     self.dual_vars[index] = dual_var.detach()  
                     loss += (
                         dual_var.detach()
                         * slack
                         + (cfg.loss_alpha / 2) * slack.abs()
                     ).sum()         
-
+                elif cfg.loss_type == "dual_aug_l2_increase":
+                    loss_alpha = cfg.loss_alpha * 2 ** epoch_idx
+                    dual_var += loss_alpha * slack
+                    self.dual_vars[index] = dual_var.detach()
+                    loss += (
+                        dual_var.detach()
+                        * slack
+                        + (loss_alpha / 2) * slack ** 2
+                    ).sum()
+                elif cfg.loss_type == "dual_aug_l1_increase":
+                    loss_alpha = cfg.loss_alpha * 2 ** epoch_idx
+                    dual_var += loss_alpha * slack
+                    self.dual_vars[index] = dual_var.detach()
+                    loss += (
+                        dual_var.detach()
+                        * slack
+                        + (loss_alpha / 2) * slack.abs()
+                    ).sum()
+                    
                 loss = loss.mean()
                 
                 if return_outputs:

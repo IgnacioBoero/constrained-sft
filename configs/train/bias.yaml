@@ -5,11 +5,11 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.ratio: fair, ones
+      exp.ratio: fair, ones, reverse
       exp.model_name: FacebookAI/roberta-large
-      exp.loss_type: l2,l1,dual
+      exp.loss_type: dual_aug_l2, dual_aug_l1, dual_aug_l1_increase, dual_aug_l2_increase
       exp.tol: 0
-      exp.loss_alpha: 10,100,1000,10000
+      exp.loss_alpha: 100,1000,10000
 
   # Ensure sequential launching (no parallel launcher)
   launcher:
@@ -58,5 +58,5 @@ exp:
   loss_alpha: 10
   loss_type: l2
   model_name: FacebookAI/roberta-large
-  ratio: fair # Options: "fair", "ones"
+  ratio: reverse # Options: "fair", "ones"
   tol: 0.0
