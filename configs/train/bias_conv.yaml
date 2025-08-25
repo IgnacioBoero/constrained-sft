@@ -7,10 +7,10 @@ hydra:
     params:
       exp.ratio: fair, ones, reverse
       exp.model_name: FacebookAI/roberta-large
-      exp.loss_type: dual
+      exp.loss_type: erm
       exp.tol: 0.0
       exp.loss_alpha: 1000
-      train.dropout: 0.05,0.1, 0.2
+      train.dropout: 0.1,0.2, 0.3
 
   # Ensure sequential launching (no parallel launcher)
   launcher:
@@ -23,12 +23,12 @@ hydra:
 
 train:
   seed: 42
-  output_dir: "./outputs/bias/run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
+  output_dir: "./outputs/bias/debug"
   do_train: true
   do_initial_eval: true
   use_wandb: true
-  wandb_project: "BIAS-[debug]"
-  run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
+  wandb_project: "BIAS-debug"
+  run_name: "run-${exp.loss_type}-${train.dropout}"
   data_proportion: 1.0
   eval_on_train: true
   enable_profiler: false
@@ -43,7 +43,7 @@ train:
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 8
     gradient_accumulation_steps: 1
-    num_train_epochs: 3
+    num_train_epochs: 4
     learning_rate: 5e-6
     lr_scheduler_type: "linear"
     warmup_ratio: 0.1
