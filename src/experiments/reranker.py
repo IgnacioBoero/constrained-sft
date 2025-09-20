@@ -1,5 +1,6 @@
 # src/your_proj/experiments/reranker_cmnrl.py
 import math
+import numpy as np
 from collections import defaultdict
 from typing import Dict, Any, List
 
@@ -36,7 +37,9 @@ class RERANKER(Experiment):
         # Set a 1-dim regression head (score)
         configuration.num_labels = 1
         configuration.problem_type = "regression"
-        
+        configuration.attention_dropout = cfg.train.dropout
+        configuration.mlp_dropout = cfg.train.dropout
+        configuration.classifier_dropout = cfg.train.dropout
         model = AutoModelForSequenceClassification.from_pretrained(name, config=configuration)
         tok = AutoTokenizer.from_pretrained(name)
         if tok.pad_token is None:
@@ -45,50 +48,32 @@ class RERANKER(Experiment):
 
         # Pass training constants to the model config for convenience
         model.config.num_negatives = int(cfg.exp.num_negatives)
-        model.config.scale = float(cfg.exp.scale)
         model.config.loss_type = cfg.exp.loss_type
         model.config.loss_tol = float(cfg.exp.loss_tol)
+        model.config.alpha = float(cfg.exp.alpha)  # only for dual loss
+        model.config.length_constraint = cfg.exp.length_constraint
+        model.config.ls_clamp = getattr(cfg.exp, "ls_clamp", False)
 
         return model, tok
 
     # ---------- Dataset ----------
     def load_datasets(self, cfg):
-        """
-        Replicates the ST mapping:
-          - Keep queries that have >= num_negatives negatives and exactly one positive
-          - Produce columns: query, positive, negative_1..K
-          - Split: train/test via train_test_split(test_size=10_000)
-        """
+        
         num_neg = int(cfg.exp.num_negatives)
-        assert num_neg >= 1
+        assert num_neg >= 1, f"num_negatives must be >= 1, got {num_neg}"
+        dataset_size = getattr(cfg.train, 'size',' large')
+        
+        # Load all splits
+        train = load_dataset("iboero16/reranker", dataset_size, split="train")
+        eval = load_dataset("iboero16/reranker", dataset_size, split="validation")
 
-        train = load_dataset("microsoft/ms_marco", "v1.1", split="train")
-        eval = load_dataset("microsoft/ms_marco", "v1.1", split="validation")
-
-        def mnrl_mapper(batch):
-            out = defaultdict(list)
-            for query, passages_info in zip(batch["query"], batch["passages"]):
-                is_sel = passages_info["is_selected"]
-                if (1 not in is_sel) or (sum(1 for b in is_sel if b == 0) < num_neg):
-                    continue
-                pos_idx = is_sel.index(1)
-                neg_idxes = [i for i, b in enumerate(is_sel) if b == 0][:num_neg]
-
-                out["query"].append(query)
-                out["positive"].append(passages_info["passage_text"][pos_idx])
-                for j, ni in enumerate(neg_idxes):
-                    out[f"negative_{j+1}"].append(passages_info["passage_text"][ni])
-            return out
-
-        train = train.map(mnrl_mapper, batched=True, remove_columns=train.column_names)
-        eval = eval.map(mnrl_mapper, batched=True, remove_columns=eval.column_names)
-        # tr_size = int(cfg.train.data_proportion * len(train))
-        # ev_size = int(cfg.train.data_proportion * len(eval))
+        # Apply data proportion if specified
         tr_size = int(cfg.train.data_proportion * len(train))
         ev_size = int(cfg.train.data_proportion * len(eval))
         train = train.select(range(tr_size))
         eval = eval.select(range(ev_size))
-        # Add a simple query id for grouping if you want to log it
+        
+        # Add index columns for tracking
         train = train.add_column("index", list(range(len(train))))
         eval = eval.add_column("index", list(range(len(eval))))
 
@@ -103,7 +88,7 @@ class RERANKER(Experiment):
         def fn(sample):
             q = sample["query"]
             pos = sample["positive"]
-            negs = [sample[f"negative_{i+1}"] for i in range(num_neg)]
+            negs = sample["negative"]
             left = [q] * (1 + num_neg)
             right = [pos] + negs
 
@@ -116,6 +101,11 @@ class RERANKER(Experiment):
                 return_attention_mask=True,
                 return_token_type_ids=True,
             )
+            
+            # Extract length information from the lengths dict
+            lengths_dict = sample["lengths"]
+            passage_lengths = [lengths_dict["positive"]] + lengths_dict["negatives"]
+            
             # Labels: 1 for positive (index 0), 0 for negatives
             labels = [1] + [0] * num_neg
             out = {
@@ -123,6 +113,7 @@ class RERANKER(Experiment):
                 "attention_mask": enc["attention_mask"],       # (1+K, L)
                 "labels": labels,                               # (1+K,)
                 "index": int(sample["index"]),
+                "passage_lengths": passage_lengths,            # (1+K,) - lengths of positive + negatives
             }
             if "token_type_ids" in enc:
                 out["token_type_ids"] = enc["token_type_ids"]  # (1+K, L)
@@ -141,12 +132,16 @@ class RERANKER(Experiment):
                 attn = torch.tensor([ex["attention_mask"] for ex in batch], dtype=torch.long)         # (B, G, L)
                 labels = torch.tensor([ex["labels"] for ex in batch], dtype=torch.long)               # (B, G)
                 index = torch.tensor([ex["index"] for ex in batch], dtype=torch.long)                    # (B,)
+                
+                # Handle new length features
+                passage_lengths = torch.tensor([ex["passage_lengths"] for ex in batch], dtype=torch.long)  # (B, G)
 
                 features = {
                     "input_ids": input_ids,
                     "attention_mask": attn.bool(),
                     "labels": labels,
                     "index": index,
+                    "passage_lengths": passage_lengths,
                 }
 
                 if use_token_type and ("token_type_ids" in batch[0]):
@@ -165,13 +160,42 @@ class RERANKER(Experiment):
                 return 0.0
             # IDCG for a single relevant item is 1 / log2(1 + 1) == 1
             return 1.0 / math.log2(rank + 1)
+        
+        def compute_passage_lengths_from_tokens(input_ids, tok):
+            """Compute actual passage lengths from tokenized input_ids"""
+            # input_ids shape: (N*G, L) where G = 1 + num_negatives
+            # We need to compute the length of the second part (passage) for each pair
+            lengths = []
+            for i in range(input_ids.shape[0]):
+                tokens = input_ids[i]
+                
+                
+                # Find the separator token (usually [SEP] or equivalent)
+                sep_token_id = tok.sep_token_id if tok.sep_token_id is not None else tok.eos_token_id
+                
+                # Find positions of separator tokens
+                mask = (tokens == sep_token_id)
+                first_pos = mask.argmax(axis=1)
+                second_pos = (mask.cumsum(axis=1) == 2).argmax(axis=1)
+                
+                if len(first_pos) != tokens.shape[0] or len(second_pos) != tokens.shape[0]:
+                    raise ValueError("Could not find two separator tokens in the input sequence.")
+            
+                passage_length = second_pos - first_pos
+                lengths += list(passage_length)
+            print(lengths)
+            return lengths
 
         def metric_fn(pred):
+            # Access inputs if available
+            inputs = getattr(pred, 'inputs', None)
+            
             # predictions could be (N*G, 1) or (N*G,) depending on model head
             logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
             labels = pred.label_ids  # expected shape (N, G), 1 positive per row
 
             # Ensure shapes
+            # inputs = torch.tensor(inputs)
             logits = torch.tensor(logits)
             if logits.ndim == 2 and logits.size(-1) == 1:
                 logits = logits.squeeze(-1)
@@ -183,6 +207,13 @@ class RERANKER(Experiment):
             N, G = labels.shape
             if logits.numel() == N * G:
                 logits = logits.view(N, G)
+            else:
+                raise ValueError(f"Logits shape {logits.shape} is incompatible with labels shape {labels.shape}.")
+
+            # Compute passage lengths if inputs are available
+            passage_lengths = None
+            all_lengths = compute_passage_lengths_from_tokens(inputs, tok)
+            passage_lengths = torch.tensor(all_lengths).view(N, G)  # (N, G)
 
             # Compute rank of the positive for each query
             scores = logits.detach().cpu().numpy()
@@ -191,6 +222,7 @@ class RERANKER(Experiment):
             y = labels.detach().cpu().numpy()
             constraint_slacks = s_pos[:, None] - s_neg  # (N, K)
             constraint_slacks = constraint_slacks.flatten()
+            
             # Flatten slacks and output table to wandb
             if cfg.train.use_wandb:
                 import wandb
@@ -201,25 +233,57 @@ class RERANKER(Experiment):
                     wandb.log({"constraint_slacks": table})
 
             ranks = []
+            length_weighted_scores = []
+            acc_at_3_scores = []
+            top3_avg_lengths = []
+            
             for i in range(N):
-                order = scores[i].argsort()[::-1]  # descending
+                order = scores[i].argsort()[::-1]  # descending order of scores
                 # position (1-based) of the positive (label == 1)
                 pos_idx = int((y[i] == 1).nonzero()[0])
                 rank = int((order == pos_idx).nonzero()[0]) + 1
                 ranks.append(rank)
+                
+                # Acc@3: 1 if positive is in top 3, 0 otherwise
+                acc_at_3_scores.append(1.0 if rank <= 3 else 0.0)
+                
+                if passage_lengths is not None:
+                    # Length-weighted ranking metric (only for negatives)
+                    neg_lengths = passage_lengths[i, 1:].numpy()  # lengths of negatives only
+                    neg_scores = scores[i, 1:]  # scores of negatives only
+                    neg_order = neg_scores.argsort()[::-1]  # descending order of negative scores
+                    
+                    # Compute length-weighted score: sum of (length / rank) for each negative
+                    length_weighted_score = 0.0
+                    for rank_idx, neg_idx in enumerate(neg_order):
+                        weight = 1.0 / (rank_idx + 1)  # 1/1, 1/2, 1/3, etc.
+                        length_weighted_score += neg_lengths[neg_idx] * weight
+                    length_weighted_scores.append(length_weighted_score)
+                    
+                    # Average length of top-3 passages (including positive if in top 3)
+                    top3_indices = order[:3]
+                    top3_lengths = [passage_lengths[i, idx].item() for idx in top3_indices]
+                    top3_avg_lengths.append(np.mean(top3_lengths))
 
-            # Metrics
+            # Standard metrics
             mrr10 = sum((1.0 / r) if r <= 10 else 0.0 for r in ranks) / N
             mean_ndcg10 = sum(ndcg_at_k(r, 10) for r in ranks) / N
-            # For a single relevant doc, MAP reduces to precision@rank = 1/rank
+            acc_at_3 = np.mean(acc_at_3_scores)
 
             out = {
                 "NanoBEIR_R100_mean_ndcg@10": float(mean_ndcg10),
                 "mrr@10": float(mrr10),
+                "acc@3": float(acc_at_3),
                 "mean_constraint_violation": abs(constraint_slacks).mean().item(),
                 "min_constraint_violation": abs(constraint_slacks).min().item(),
                 "max_constraint_violation": abs(constraint_slacks).max().item(),
             }
+            
+            # Add length-based metrics if available
+            if passage_lengths is not None and length_weighted_scores:
+                out["length_weighted_mrr"] = float(np.mean(length_weighted_scores))
+                out["avg_top3_length"] = float(np.mean(top3_avg_lengths))
+            
             breakp = getattr(cfg.train, "debug_metrics", False)
             if breakp:
                 breakpoint()
@@ -236,12 +300,8 @@ class RERANKER(Experiment):
     # ---------- Trainer ----------
     def get_trainer_class(self):
         class CustomTrainer(Trainer):
-            """
-            Implements Cached-MNRL-like loss:
-                L = mean_{i in batch} mean_{neg in 1..K} -log sigma(scale * (s_pos - s_neg))
-                where s_* are raw logits (higher is more relevant)
-            """
-            def __init__(self, *args, experiment=None, dual_vars=None,eval=False, **kwargs):
+
+            def __init__(self, *args, experiment=None, dual_vars=None, eval=False, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.experiment = experiment
                 if not eval:
@@ -252,8 +312,13 @@ class RERANKER(Experiment):
                 self.dual_vars = torch.zeros(len(self.train_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
 
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                eps = 1e-8
                 labels = inputs.pop("labels")  # (B, G) with exactly one '1' per row
                 index = inputs.pop("index", None)
+                # Remove length features (they're not needed for model forward pass)
+                passage_lengths = inputs.pop("passage_lengths", None)
+                query_lengths = inputs.pop("query_lengths", None) # (B, G)
+                
                 core_model = extract_model_from_parallel(model)
                 cfg = core_model.config
                 # Flatten (B, G, L) -> (B*G, L)
@@ -262,27 +327,60 @@ class RERANKER(Experiment):
 
                 outputs = model(**flat)
                 logits = outputs.logits.squeeze(-1)  # (B*G,)
+                
+                query_lengths = inputs.pop("query_lengths", None) # (B, G)
                 logits = logits.view(B, G)           # (B, G)
+                
+                # Compute the Anti-Corr for loss between length and negartive scores
+                s = logits[:, 1:]                        # scores for negatives, (B, G-1)
+                L = passage_lengths[:, 1:].to(s.dtype)   # lengths for negatives, (B, G-1)
+                s_centered = s - s.mean(dim=1, keepdim=True)
+                L_centered = L - L.mean(dim=1, keepdim=True)
 
-                # Assume index 0 is positive, 1..K negatives (we encoded that in preprocessing)
+                cov = (s_centered * L_centered).mean(dim=1)  # (B,)
+                std_s = s_centered.pow(2).mean(dim=1).sqrt().clamp_min(eps)  # (B,)
+                std_L = L_centered.pow(2).mean(dim=1).sqrt().clamp_min(eps)  # (B,)
+
+                corr = cov / (std_s * std_L)              # Pearson corr(s, L) per sample, (B,)
+                obj = (1.0 + corr) * 0.5                  # anti-corr loss in [0,1]; 0 is best (perfect inverse)
+                
+                
+                if cfg.length_constraint:
+                    loss = obj
+                else:
+                    loss = torch.zeros(B, dtype=logits.dtype, device=logits.device)
+
                 s_pos = logits[:, 0].unsqueeze(1)    # (B, 1)
                 s_neg = logits[:, 1:]                # (B, K)
-                slack = -(s_pos - s_neg) + cfg.loss_tol
+                slack = cfg.loss_tol -(s_pos - s_neg) 
 
                 if cfg.loss_type == "ls":
-                    loss = -F.logsigmoid(-10 * slack).mean()
+                    loss += -1 * cfg.alpha * F.logsigmoid(-10 * torch.clamp(slack,min=0.0)).sum(dim=1)
                 elif cfg.loss_type == "l2":
-                    loss = (torch.clamp(slack , 0.0)**2).mean()
+                    loss += cfg.alpha * (torch.clamp(slack ,min=0.0)**2).sum(dim=1)
                 elif cfg.loss_type == "l1":
-                    loss = torch.clamp(slack, 0.0).mean()
+                    loss += cfg.alpha * torch.clamp(slack, min=0.0)
                 elif cfg.loss_type == "dual":
                     dual_var = self.dual_vars[index].clone()
-                    dual_var += 2 * slack
+                    dual_var += 2 * cfg.alpha * slack
                     self.dual_vars[index] = dual_var.detach()
                     loss += (
                         dual_var.detach()
                         * slack
-                    ).mean()
+                    ).sum(dim=1)
+                
+                loss = loss.mean()
+                
+                # Log additional metrics during training
+                if self.state.global_step > 0:  # Only log after first step
+                    self.log({
+                        "train/obj": obj.mean().item(),
+                        "train/avg_constraint_slack": slack.mean().item(),
+                        "train/max_constraint_slack": slack.max().item(),
+                        "train/min_constraint_slack": slack.min().item(),
+                        "train/correlation": corr.mean().item(),
+                    })
+                
                 if return_outputs:
                     # Return flattened outputs so HF eval loop collects predictions consistently
                     outputs.logits = logits.view(B * G, 1)

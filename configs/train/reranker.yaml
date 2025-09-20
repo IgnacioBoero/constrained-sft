@@ -5,10 +5,9 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.model_name: answerdotai/ModernBERT-large,answerdotai/ModernBERT-base
-      exp.loss_type: dual,l2
-      exp.loss_tol: 0, 0.1,1.0
-
+      exp.loss_type: ls
+      exp.length_constraint: true, false
+      exp.loss_tol: 0,10,100
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -19,20 +18,21 @@ hydra:
 
 train:
   seed: 42
-  output_dir: "./outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.loss_tol}"
+  output_dir: "./outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.loss_tol}-${train.size}"
   do_train: true
   do_initial_eval: true
   use_wandb: true
-  wandb_project: "RERANKER-v1"
-  run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.loss_tol}"
-  eval_on_train: true
+  wandb_project: "RERANKER-v3"
+  run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.loss_tol}-${train.size}"
+  eval_on_train: false
   enable_profiler: false
-  dropout: 0.0
+  dropout: 0.07
   data_proportion: 1.0
+  size: small
   hf_args:
-    per_device_train_batch_size: 4          # ST recipe
+    per_device_train_batch_size: 2          # ST recipe
     per_device_eval_batch_size: 1
-    gradient_accumulation_steps: 8
+    gradient_accumulation_steps: 16
     num_train_epochs: 3                      # ST example uses 1 epoch
     learning_rate: 2e-5
     warmup_ratio: 0.1
@@ -41,17 +41,16 @@ train:
     eval_strategy: "epoch"
     save_strategy: "epoch"
     save_total_limit: 1
-    load_best_model_at_end: true
-    metric_for_best_model: "NanoBEIR_R100_mean_ndcg@10"
-    greater_is_better: true
     bf16: true
     fp16: false
 
 exp:
   name: "reranker"           # must match the key in your experiments.registry
-  model_name: "answerdotai/ModernBERT-base"
-  num_negatives: 5                 # ST example uses 5
-  scale: 10.0                      # ST example uses 10.0
+  model_name: "answerdotai/ModernBERT-large"
+  num_negatives: 9                 # Use 4 negatives to match our dataset
   max_length: 512
-  loss_type: "ls"                 # Options: "erm", "l2", "l1", "dual"
+  loss_type: ls                 # Options: "erm", "l2", "l1", "dual"
   loss_tol: 0.0
+  alpha: 1                       # Only used for dual loss
+  length_constraint: true
+  ls_clamp: false

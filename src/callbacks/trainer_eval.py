@@ -4,7 +4,7 @@ import random
 
 
 class TrainSetEvalCallback(TrainerCallback):
-    def __init__(self, trainer, sample_size: int | None = 5000, prefix="train"):
+    def __init__(self, trainer, sample_size: int | None = None, prefix="train"):
         super().__init__()
         self.trainer = trainer
         self.sample_size = sample_size

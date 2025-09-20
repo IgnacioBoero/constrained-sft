@@ -5,12 +5,10 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.ratio: fair, ones, reverse
-      exp.model_name: FacebookAI/roberta-large
-      exp.loss_type: dual
-      exp.tol: 0.0
-      exp.loss_alpha: 1000
-      train.dropout: 0.05,0.1, 0.2
+      exp.tol: 0.02, 0.05
+      exp.ratio: fair,reverse
+      exp.loss_alpha: 10,100,1000
+      exp.loss_type: erm
 
   # Ensure sequential launching (no parallel launcher)
   launcher:
@@ -27,12 +25,12 @@ train:
   do_train: true
   do_initial_eval: true
   use_wandb: true
-  wandb_project: "BIAS-[debug]"
+  wandb_project: "BIAS-6"
   run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
   data_proportion: 1.0
   eval_on_train: true
   enable_profiler: false
-  dropout: 0.0
+  dropout: 0.15
   profiler:
     wait: 99
     warmup: 0
@@ -43,7 +41,7 @@ train:
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 8
     gradient_accumulation_steps: 1
-    num_train_epochs: 3
+    num_train_epochs: 40
     learning_rate: 5e-6
     lr_scheduler_type: "linear"
     warmup_ratio: 0.1
@@ -56,8 +54,8 @@ train:
     save_total_limit: 1
 exp:
   name: "bias"
-  loss_alpha: 10
-  loss_type: l2
+  loss_alpha: 1000
+  loss_type: dual
   model_name: FacebookAI/roberta-large
   ratio: reverse # Options: "fair", "ones"
   tol: 0.0
