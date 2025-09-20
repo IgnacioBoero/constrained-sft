@@ -275,6 +275,7 @@ class BIAS(Experiment):
                     ).sum()
                 elif cfg.loss_type == "dual":                   
                     dual_var += 2 * cfg.loss_alpha * slack
+                    dual_var = torch.clamp(dual_var, min=0.0)
                     self.dual_vars[index] = dual_var.detach()  
                     loss += (
                         dual_var.detach()
@@ -282,6 +283,7 @@ class BIAS(Experiment):
                     ).sum()
                 elif cfg.loss_type == "dual_aug_l2":
                     dual_var += cfg.loss_alpha * slack
+                    dual_var = torch.clamp(dual_var, min=0.0)
                     self.dual_vars[index] = dual_var.detach()  
                     loss += (
                         dual_var.detach()
@@ -290,6 +292,7 @@ class BIAS(Experiment):
                     ).sum()
                 elif cfg.loss_type == "dual_aug_l1":
                     dual_var += cfg.loss_alpha * slack
+                    dual_var = torch.clamp(dual_var, min=0.0)
                     self.dual_vars[index] = dual_var.detach()  
                     loss += (
                         dual_var.detach()
@@ -299,6 +302,7 @@ class BIAS(Experiment):
                 elif cfg.loss_type == "dual_aug_l2_increase":
                     loss_alpha = cfg.loss_alpha * 2 ** epoch_idx
                     dual_var += loss_alpha * slack
+                    dual_var = torch.clamp(dual_var, min=0.0)
                     self.dual_vars[index] = dual_var.detach()
                     loss += (
                         dual_var.detach()
@@ -308,6 +312,7 @@ class BIAS(Experiment):
                 elif cfg.loss_type == "dual_aug_l1_increase":
                     loss_alpha = cfg.loss_alpha * 2 ** epoch_idx
                     dual_var += loss_alpha * slack
+                    dual_var = torch.clamp(dual_var, min=0.0)
                     self.dual_vars[index] = dual_var.detach()
                     loss += (
                         dual_var.detach()
