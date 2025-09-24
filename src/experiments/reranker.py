@@ -53,6 +53,8 @@ class RERANKER(Experiment):
         model.config.alpha = float(cfg.exp.alpha)  # only for dual loss
         model.config.length_constraint = cfg.exp.length_constraint
         model.config.ls_clamp = getattr(cfg.exp, "ls_clamp", False)
+        model.config.obj_type = cfg.exp.obj_type
+        model.config.k_lambda = getattr(cfg.exp, "k_lambda", 2)
 
         return model, tok
 
@@ -183,7 +185,6 @@ class RERANKER(Experiment):
             
                 passage_length = second_pos - first_pos
                 lengths += list(passage_length)
-            print(lengths)
             return lengths
 
         def metric_fn(pred):
@@ -331,31 +332,115 @@ class RERANKER(Experiment):
                 query_lengths = inputs.pop("query_lengths", None) # (B, G)
                 logits = logits.view(B, G)           # (B, G)
                 
-                # Compute the Anti-Corr for loss between length and negartive scores
+                # Compute objective function based on configured type
                 s = logits[:, 1:]                        # scores for negatives, (B, G-1)
                 L = passage_lengths[:, 1:].to(s.dtype)   # lengths for negatives, (B, G-1)
-                s_centered = s - s.mean(dim=1, keepdim=True)
-                L_centered = L - L.mean(dim=1, keepdim=True)
 
-                cov = (s_centered * L_centered).mean(dim=1)  # (B,)
-                std_s = s_centered.pow(2).mean(dim=1).sqrt().clamp_min(eps)  # (B,)
-                std_L = L_centered.pow(2).mean(dim=1).sqrt().clamp_min(eps)  # (B,)
+                obj_type = cfg.obj_type
 
-                corr = cov / (std_s * std_L)              # Pearson corr(s, L) per sample, (B,)
-                obj = (1.0 + corr) * 0.5                  # anti-corr loss in [0,1]; 0 is best (perfect inverse)
+                if obj_type == 'pearson_corr':
+                    # Original: Anti-correlation between scores and lengths
+                    s_centered = s - s.mean(dim=1, keepdim=True)
+                    L_centered = L - L.mean(dim=1, keepdim=True)
+                    cov = (s_centered * L_centered).mean(dim=1)  # (B,)
+                    std_s = s_centered.pow(2).mean(dim=1).sqrt().clamp_min(eps)  # (B,)
+                    std_L = L_centered.pow(2).mean(dim=1).sqrt().clamp_min(eps)  # (B,)
+                    corr = cov / (std_s * std_L)              # Pearson corr(s, L) per sample, (B,)
+                    obj = (1.0 + corr) * 0.5                  # anti-corr loss in [0,1]; 0 is best (perfect inverse)
                 
+                elif obj_type == 'spearman_corr':
+                    # Spearman rank correlation between scores and lengths
+                    s_ranks = s.argsort(dim=1, descending=True).argsort(dim=1).to(s.dtype) + 1
+                    L_ranks = L.argsort(dim=1).argsort(dim=1).to(s.dtype) + 1
+                    s_ranks_centered = s_ranks - s_ranks.mean(dim=1, keepdim=True)
+                    L_ranks_centered = L_ranks - L_ranks.mean(dim=1, keepdim=True)
+                    spearman_corr = (s_ranks_centered * L_ranks_centered).sum(dim=1) / torch.sqrt(
+                        (s_ranks_centered**2).sum(dim=1) * (L_ranks_centered**2).sum(dim=1) + eps)
+                    obj = (1.0 + spearman_corr) * 0.5  # Anti-correlation
                 
-                if cfg.length_constraint:
-                    loss = obj
+                elif obj_type == 'kendall_tau':
+                    # Kendall's Tau rank correlation (approximation for differentiability)
+                    n = s.size(1)
+                    concordant = 0.0
+                    for i in range(n):
+                        for j in range(i+1, n):
+                            s_diff = s[:, i] - s[:, j]  # Score difference
+                            L_diff = L[:, j] - L[:, i]  # Length difference (reversed for anti-correlation)
+                            concordant += torch.tanh(s_diff * L_diff)  # Smooth sign function
+                    tau = concordant / (n * (n - 1) / 2)  # Normalize by total pairs
+                    obj = (1.0 - tau) * 0.5  # Convert to [0,1] with 0 being best
+                    
+                elif obj_type == 'lambda_loss':
+
+                    B, N = s.shape
+                    K = int(getattr(cfg, "k", 2) or 2)
+                    K = max(1, min(K, N))
+
+                    # Gains: higher for shorter lengths (any monotone map works)
+                    gains = (L.max(dim=1, keepdim=True).values - L).clamp_min(0)  # (B, N)
+
+                    # Current ranks from model scores (1 = top)
+                    order = s.argsort(dim=1, descending=True)
+                    ranks = torch.empty_like(order, dtype=torch.long)
+                    ranks.scatter_(1, order, torch.arange(1, N+1, device=s.device).unsqueeze(0).expand(B, N))
+
+                    # Discount 1 / log2(rank+1)
+                    discount = 1.0 / torch.log2(ranks.to(s.dtype) + 1.0)  # (B, N)
+
+                    # Ideal DCG@K for normalization (sort by gains desc)
+                    ideal_idx = gains.argsort(dim=1, descending=True)
+                    ideal_ranks = torch.arange(1, N+1, device=s.device).unsqueeze(0).expand(B, N)
+                    ideal_discount = 1.0 / torch.log2(ideal_ranks.to(s.dtype) + 1.0)
+                    idcg = (gains.gather(1, ideal_idx) * (ideal_discount * (ideal_ranks <= K)).to(s.dtype)).sum(dim=1).clamp_min(eps)  # (B,)
+
+                    # All upper-triangular pairs i<j (per list)
+                    I, J = torch.triu_indices(N, N, offset=1, device=s.device)  # (P,)
+                    obj_per_list = []
+                    for b in range(B):
+                        gb = gains[b]         # (N,)
+                        sb = s[b]             # (N,)
+                        rb = ranks[b]         # (N,)
+                        db = discount[b]      # (N,)
+                        idcgb = idcg[b]       # scalar
+
+                        # Ground-truth pair preference sign ∈{-1,0,1}; 0=ties ignored
+                        y_ij = torch.sign(gb[I] - gb[J])
+
+                        # ΔDCG@K if we swap items at current ranks r_i and r_j
+                        ri, rj = rb[I], rb[J]
+                        in_top_i = (ri <= K).to(s.dtype)
+                        in_top_j = (rj <= K).to(s.dtype)
+                        dcg_before = gb[I] * db[I] * in_top_i + gb[J] * db[J] * in_top_j
+                        dcg_after  = gb[I] * db[J] * in_top_j + gb[J] * db[I] * in_top_i
+                        w = (dcg_after - dcg_before).abs() / idcgb  # (P,)
+
+                        # Weighted pairwise logistic: log(1 + exp(-y_ij * (s_i - s_j)))
+                        sdiff = sb[I] - sb[J]
+                        mask = (y_ij != 0)
+                        pair_loss = torch.nn.functional.softplus(-y_ij.to(s.dtype) * sdiff) * w * mask.to(s.dtype)
+
+                        denom = (w * mask.to(s.dtype)).sum().clamp_min(eps)
+                        obj_per_list.append((pair_loss.sum() / denom).unsqueeze(0))
+
+                    obj = torch.cat(obj_per_list, dim=0)  # (B,)
                 else:
-                    loss = torch.zeros(B, dtype=logits.dtype, device=logits.device)
+                    raise ValueError(f"Unknown objective type: {obj_type}")
+                
+            
+                loss = torch.zeros(B, dtype=logits.dtype, device=logits.device)
+
+                if cfg.length_constraint:
+                    loss += obj
+
 
                 s_pos = logits[:, 0].unsqueeze(1)    # (B, 1)
                 s_neg = logits[:, 1:]                # (B, K)
                 slack = cfg.loss_tol -(s_pos - s_neg) 
 
-                if cfg.loss_type == "ls":
-                    loss += -1 * cfg.alpha * F.logsigmoid(-10 * torch.clamp(slack,min=0.0)).sum(dim=1)
+                if cfg.alpha == 0.0:
+                    pass
+                elif cfg.loss_type == "ls":
+                    loss += -1 * cfg.alpha * F.logsigmoid(-10 * slack).sum(dim=1)
                 elif cfg.loss_type == "l2":
                     loss += cfg.alpha * (torch.clamp(slack ,min=0.0)**2).sum(dim=1)
                 elif cfg.loss_type == "l1":
@@ -373,13 +458,18 @@ class RERANKER(Experiment):
                 
                 # Log additional metrics during training
                 if self.state.global_step > 0:  # Only log after first step
-                    self.log({
+                    log_dict = {
                         "train/obj": obj.mean().item(),
                         "train/avg_constraint_slack": slack.mean().item(),
                         "train/max_constraint_slack": slack.max().item(),
                         "train/min_constraint_slack": slack.min().item(),
-                        "train/correlation": corr.mean().item(),
-                    })
+                    }
+                    
+                    # Add correlation metric if using pearson_corr
+                    if cfg.obj_type == 'pearson_corr':
+                        log_dict["train/correlation"] = corr.mean().item()
+                    
+                    self.log(log_dict)
                 
                 if return_outputs:
                     # Return flattened outputs so HF eval loop collects predictions consistently

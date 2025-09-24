@@ -1,25 +1,23 @@
 # @package _global_
 
+# Path to the train config file that was used for training
+train_config: "configs/train/reranker.yaml"
+
+# Basic evaluation settings
 train:
   seed: 42
-  model_path: "./outputs/reranker/${exp.model_name}"
-  eval_on_train: false  # Set to true to also evaluate on training set
-  debug_metrics: false  # Set to true to add breakpoint in compute_metrics
-  use_wandb: false
-  wandb_project: "RERANKER-EVAL-v1"
-  run_name: "eval-reranker-${exp.model_name}"
-  data_proportion: 1.0
+  data_proportion: 1.0  # Use full dataset for evaluation
+  size: small           # Match the training dataset size
+  dropout: 0.07         # Default dropout value
+  output_dir: "./outputs/eval"  # Temporary output dir for evaluation
   hf_args:
-    per_device_eval_batch_size: 1
+    per_device_eval_batch_size: 2
     bf16: true
     fp16: false
-    remove_unused_columns: false
 
+# Experiment configuration (should match training)
 exp:
-  name: "reranker"           # must match the key in your experiments.registry
+  name: "reranker"
   model_name: "answerdotai/ModernBERT-large"
-  num_negatives: 5                 # ST example uses 5
-  scale: 10.0                      # ST example uses 10.0
+  num_negatives: 9
   max_length: 512
-  loss_type: "erm"                 # Options: "erm", "l2", "l1", "dual"
-  loss_tol: 0.0

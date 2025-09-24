@@ -7,3 +7,4 @@ wandb/*
 multirun/*
 log/*
 plotting/*
+src/plotting/*

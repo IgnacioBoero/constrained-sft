@@ -5,9 +5,8 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_type: ls
-      exp.length_constraint: true, false
-      exp.loss_tol: 0,10,100
+      exp.loss_tol: 0,1,3
+      exp.alpha: 0.1,0.3
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -18,17 +17,17 @@ hydra:
 
 train:
   seed: 42
-  output_dir: "./outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.loss_tol}-${train.size}"
+  output_dir: "./outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   do_train: true
   do_initial_eval: true
   use_wandb: true
-  wandb_project: "RERANKER-v3"
-  run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.loss_tol}-${train.size}"
-  eval_on_train: false
+  wandb_project: "RERANKER-final"
+  run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
+  eval_on_train: true
   enable_profiler: false
-  dropout: 0.07
+  dropout: 0.0
   data_proportion: 1.0
-  size: small
+  size: large
   hf_args:
     per_device_train_batch_size: 2          # ST recipe
     per_device_eval_batch_size: 1
@@ -54,3 +53,6 @@ exp:
   alpha: 1                       # Only used for dual loss
   length_constraint: true
   ls_clamp: false
+  obj_type: lambda_loss        # Options: "pearson_corr", "rank_weighted_length", "spearman_corr", "top_k_length", "exp_length_penalty", "kendall_tau"
+  top_k: 3                      # Only used for top_k_length objective
+  k_lambda: 3

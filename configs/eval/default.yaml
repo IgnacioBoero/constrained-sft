@@ -1,0 +1,14 @@
+# @package _global_
+
+# Default eval config
+defaults:
+  - reranker
+
+# Basic evaluation settings
+train:
+  seed: 42
+  data_proportion: 1.0
+  hf_args:
+    per_device_eval_batch_size: 1
+    bf16: true
+    fp16: false
