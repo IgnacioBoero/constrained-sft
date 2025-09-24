@@ -266,6 +266,101 @@ class RERANKER(Experiment):
                     top3_lengths = [passage_lengths[i, idx].item() for idx in top3_indices]
                     top3_avg_lengths.append(np.mean(top3_lengths))
 
+            # Compute objective value (same as in loss_fn)
+            eps = 1e-8
+            s = torch.tensor(scores[:, 1:])  # scores for negatives, (N, G-1)
+            L = passage_lengths[:, 1:].to(s.dtype)  # lengths for negatives, (N, G-1)
+            
+            obj_type = cfg.exp.obj_type
+            
+            if obj_type == 'pearson_corr':
+                # Anti-correlation between scores and lengths
+                s_centered = s - s.mean(dim=1, keepdim=True)
+                L_centered = L - L.mean(dim=1, keepdim=True)
+                cov = (s_centered * L_centered).mean(dim=1)  # (N,)
+                std_s = s_centered.pow(2).mean(dim=1).sqrt().clamp_min(eps)  # (N,)
+                std_L = L_centered.pow(2).mean(dim=1).sqrt().clamp_min(eps)  # (N,)
+                corr = cov / (std_s * std_L)  # Pearson corr(s, L) per sample, (N,)
+                obj = (1.0 + corr) * 0.5  # anti-corr loss in [0,1]; 0 is best (perfect inverse)
+            
+            elif obj_type == 'spearman_corr':
+                # Spearman rank correlation between scores and lengths
+                s_ranks = s.argsort(dim=1, descending=True).argsort(dim=1).to(s.dtype) + 1
+                L_ranks = L.argsort(dim=1).argsort(dim=1).to(s.dtype) + 1
+                s_ranks_centered = s_ranks - s_ranks.mean(dim=1, keepdim=True)
+                L_ranks_centered = L_ranks - L_ranks.mean(dim=1, keepdim=True)
+                spearman_corr = (s_ranks_centered * L_ranks_centered).sum(dim=1) / torch.sqrt(
+                    (s_ranks_centered**2).sum(dim=1) * (L_ranks_centered**2).sum(dim=1) + eps)
+                obj = (1.0 + spearman_corr) * 0.5  # Anti-correlation
+            
+            elif obj_type == 'kendall_tau':
+                # Kendall's Tau rank correlation (approximation for differentiability)
+                n = s.size(1)
+                concordant = 0.0
+                for i in range(n):
+                    for j in range(i+1, n):
+                        s_diff = s[:, i] - s[:, j]  # Score difference
+                        L_diff = L[:, j] - L[:, i]  # Length difference (reversed for anti-correlation)
+                        concordant += torch.tanh(s_diff * L_diff)  # Smooth sign function
+                tau = concordant / (n * (n - 1) / 2)  # Normalize by total pairs
+                obj = (1.0 - tau) * 0.5  # Convert to [0,1] with 0 being best
+                
+            elif obj_type == 'lambda_loss':
+                N_obj, N = s.shape
+                K = int(getattr(cfg.exp, "k_lambda", 2) or 2)
+                K = max(1, min(K, N))
+
+                # Gains: higher for shorter lengths (any monotone map works)
+                gains = (L.max(dim=1, keepdim=True).values - L).clamp_min(0)  # (N, N)
+
+                # Current ranks from model scores (1 = top)
+                order = s.argsort(dim=1, descending=True)
+                ranks = torch.empty_like(order, dtype=torch.long)
+                ranks.scatter_(1, order, torch.arange(1, N+1, device=s.device).unsqueeze(0).expand(N_obj, N))
+
+                # Discount 1 / log2(rank+1)
+                discount = 1.0 / torch.log2(ranks.to(s.dtype) + 1.0)  # (N, N)
+
+                # Ideal DCG@K for normalization (sort by gains desc)
+                ideal_idx = gains.argsort(dim=1, descending=True)
+                ideal_ranks = torch.arange(1, N+1, device=s.device).unsqueeze(0).expand(N_obj, N)
+                ideal_discount = 1.0 / torch.log2(ideal_ranks.to(s.dtype) + 1.0)
+                idcg = (gains.gather(1, ideal_idx) * (ideal_discount * (ideal_ranks <= K)).to(s.dtype)).sum(dim=1).clamp_min(eps)  # (N,)
+
+                # All upper-triangular pairs i<j (per list)
+                I, J = torch.triu_indices(N, N, offset=1, device=s.device)  # (P,)
+                obj_per_list = []
+                for b in range(N_obj):
+                    gb = gains[b]         # (N,)
+                    sb = s[b]             # (N,)
+                    rb = ranks[b]         # (N,)
+                    db = discount[b]      # (N,)
+                    idcgb = idcg[b]       # scalar
+
+                    # Ground-truth pair preference sign ∈{-1,0,1}; 0=ties ignored
+                    y_ij = torch.sign(gb[I] - gb[J])
+
+                    # ΔDCG@K if we swap items at current ranks r_i and r_j
+                    ri, rj = rb[I], rb[J]
+                    in_top_i = (ri <= K).to(s.dtype)
+                    in_top_j = (rj <= K).to(s.dtype)
+                    dcg_before = gb[I] * db[I] * in_top_i + gb[J] * db[J] * in_top_j
+                    dcg_after  = gb[I] * db[J] * in_top_j + gb[J] * db[I] * in_top_i
+                    w = (dcg_after - dcg_before).abs() / idcgb  # (P,)
+
+                    # Weighted pairwise logistic: log(1 + exp(-y_ij * (s_i - s_j)))
+                    sdiff = sb[I] - sb[J]
+                    mask = (y_ij != 0)
+                    pair_loss = torch.nn.functional.softplus(-y_ij.to(s.dtype) * sdiff) * w * mask.to(s.dtype)
+
+                    denom = (w * mask.to(s.dtype)).sum().clamp_min(eps)
+                    obj_per_list.append((pair_loss.sum() / denom).unsqueeze(0))
+
+                obj = torch.cat(obj_per_list, dim=0)  # (N,)
+            else:
+                # Default to 0 if obj_type is unknown
+                obj = torch.zeros(N)
+
             # Standard metrics
             mrr10 = sum((1.0 / r) if r <= 10 else 0.0 for r in ranks) / N
             mean_ndcg10 = sum(ndcg_at_k(r, 10) for r in ranks) / N
@@ -278,7 +373,10 @@ class RERANKER(Experiment):
                 "mean_constraint_violation": abs(constraint_slacks).mean().item(),
                 "min_constraint_violation": abs(constraint_slacks).min().item(),
                 "max_constraint_violation": abs(constraint_slacks).max().item(),
+                "objective_value": float(obj.mean().item()),
             }
+            
+                    
             
             # Add length-based metrics if available
             if passage_lengths is not None and length_weighted_scores:
