@@ -5,10 +5,10 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.tol: 0.02, 0.05
-      exp.ratio: fair,reverse
-      exp.loss_alpha: 10,100,1000
-      exp.loss_type: erm
+      exp.tol: 0.02
+      exp.ratio: fair
+      exp.loss_alpha: 3,100
+      exp.loss_type: l2
 
   # Ensure sequential launching (no parallel launcher)
   launcher:
@@ -25,7 +25,7 @@ train:
   do_train: true
   do_initial_eval: true
   use_wandb: true
-  wandb_project: "BIAS-6"
+  wandb_project: "BIAS-paper"
   run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
   data_proportion: 1.0
   eval_on_train: true
@@ -41,7 +41,7 @@ train:
     per_device_train_batch_size: 8
     per_device_eval_batch_size: 8
     gradient_accumulation_steps: 1
-    num_train_epochs: 40
+    num_train_epochs: 6
     learning_rate: 5e-6
     lr_scheduler_type: "linear"
     warmup_ratio: 0.1

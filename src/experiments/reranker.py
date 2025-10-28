@@ -265,7 +265,12 @@ class RERANKER(Experiment):
                     top3_indices = order[:3]
                     top3_lengths = [passage_lengths[i, idx].item() for idx in top3_indices]
                     top3_avg_lengths.append(np.mean(top3_lengths))
-
+            
+            # Standard metrics
+            mrr10 = sum((1.0 / r) if r <= 10 else 0.0 for r in ranks) / N
+            mean_ndcg10 = sum(ndcg_at_k(r, 10) for r in ranks) / N
+            acc_at_3 = np.mean(acc_at_3_scores)
+            
             # Compute objective value (same as in loss_fn)
             eps = 1e-8
             s = torch.tensor(scores[:, 1:])  # scores for negatives, (N, G-1)
@@ -361,10 +366,7 @@ class RERANKER(Experiment):
                 # Default to 0 if obj_type is unknown
                 obj = torch.zeros(N)
 
-            # Standard metrics
-            mrr10 = sum((1.0 / r) if r <= 10 else 0.0 for r in ranks) / N
-            mean_ndcg10 = sum(ndcg_at_k(r, 10) for r in ranks) / N
-            acc_at_3 = np.mean(acc_at_3_scores)
+
 
             out = {
                 "NanoBEIR_R100_mean_ndcg@10": float(mean_ndcg10),

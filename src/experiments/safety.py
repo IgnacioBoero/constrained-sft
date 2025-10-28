@@ -37,12 +37,11 @@ class SAFETY(Experiment):
 
     def load_datasets(self, cfg):
         # Load and shuffle the full datasets first
-        tr = load_dataset("iboero16/winogrande_bias", split="train").shuffle(seed=cfg.train.seed)
-        ev = load_dataset("iboero16/winogrande_bias", split="eval").shuffle(seed=cfg.train.seed)
+        tr = load_dataset("iboero16/SAFE-ALPACA", split="safe_alpaca_100").shuffle(seed=cfg.train.seed)
+        split = tr.train_test_split(test_size=0.1, seed=cfg.train.seed, stratify_key="safety_label")
+        ev = split['test'].shuffle(seed=cfg.train.seed)
+        tr = split['train'].shuffle(seed=cfg.train.seed)
         
-        # if cfg.exp.loss_type == "erm":
-        #     tr = tr.filter(lambda s: not s["gender_bias"])
-        #     ev = ev.filter(lambda s: not s["gender_bias"])
         # Take the required proportion after shuffling
         tr_size = int(cfg.train.data_proportion * len(tr))
         ev_size = int(cfg.train.data_proportion * len(ev))
