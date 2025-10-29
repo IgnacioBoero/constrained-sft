@@ -40,7 +40,11 @@ class RERANKER(Experiment):
         configuration.attention_dropout = cfg.train.dropout
         configuration.mlp_dropout = cfg.train.dropout
         configuration.classifier_dropout = cfg.train.dropout
-        model = AutoModelForSequenceClassification.from_pretrained(name, config=configuration)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            name, 
+            config=configuration,
+            torch_dtype=torch.bfloat16 if cfg.train.hf_args.bf16 else torch.float32
+        )
         tok = AutoTokenizer.from_pretrained(name)
         if tok.pad_token is None:
             # Prefer SEP if available, otherwise EOS if present

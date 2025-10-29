@@ -16,15 +16,3 @@ class Experiment(ABC):
     def compute_metrics(self, tok: PreTrainedTokenizerBase, cfg) -> Callable: ...
     @abstractmethod
     def get_trainer_class(self) -> Any: ...
-    
-from .bias import BIAS
-from .reasoning import REASONING
-from .reranker import RERANKER
-from .safety import SAFETY
-
-EXPERIMENTS = {
-    "bias": BIAS,
-    "reasoning": REASONING,
-    "reranker": RERANKER,
-    "safety": SAFETY
-}

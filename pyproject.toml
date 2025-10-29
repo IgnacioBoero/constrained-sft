@@ -67,6 +67,9 @@ Issues = "https://github.com/yourusername/constrained-sft/issues"
 [project.scripts]
 constrained-sft-train = "src.train:main"
 
+[tool.setuptools]
+py-modules = ["utils", "train", "eval"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

@@ -7,7 +7,7 @@ import wandb
 import torch
 from omegaconf import DictConfig, OmegaConf
 from transformers import TrainingArguments, set_seed
-from experiments.base import EXPERIMENTS
+from experiments.registry import EXPERIMENTS
 from utils import dump_cuda_memory, trace_handler
 from transformers.integrations import HfDeepSpeedConfig
 import os
