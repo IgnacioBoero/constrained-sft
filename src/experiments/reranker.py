@@ -13,9 +13,9 @@ from transformers import (
     AutoModelForSequenceClassification,
 )
 from .base import Experiment  # your existing base class
+from .utils import project_nonneg_l1_ball
 from transformers import Trainer
 from accelerate.utils import extract_model_from_parallel
-
 
 class RERANKER(Experiment):
     """
@@ -414,7 +414,7 @@ class RERANKER(Experiment):
 
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
-                self.dual_vars = torch.zeros(len(self.train_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
+                self.dual_vars = torch.zeros((len(self.train_dataset), cfg.k), dtype=torch.float, requires_grad=False).to(self.model.device)
 
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 eps = 1e-8
@@ -539,20 +539,45 @@ class RERANKER(Experiment):
 
                 s_pos = logits[:, 0].unsqueeze(1)    # (B, 1)
                 s_neg = logits[:, 1:]                # (B, K)
-                slack = cfg.loss_tol -(s_pos - s_neg) 
+                slack = cfg.loss_tol - 10*(s_pos - s_neg) # (B, K)
+                if cfg.mean_constraint:
+                    slack = slack.mean(dim=0) # (K,)
 
-                if cfg.alpha == 0.0:
-                    pass
-                elif cfg.loss_type == "ls":
-                    loss += -1 * cfg.alpha * F.logsigmoid(-10 * slack).sum(dim=1)
-                elif cfg.loss_type == "l2":
-                    loss += cfg.alpha * (torch.clamp(slack ,min=0.0)**2).sum(dim=1)
-                elif cfg.loss_type == "l1":
-                    loss += cfg.alpha * torch.clamp(slack, min=0.0)
+                if cfg.loss_type == "clamped":
+                    if cfg.resilient_type == "ls":
+                        loss += -1 * cfg.alpha * F.logsigmoid(-slack).sum(dim=1)
+                    elif cfg.resilient_type == "l2":
+                        loss += cfg.alpha * (torch.clamp(slack ,min=0.0)**2).sum(dim=1)
+                    elif cfg.resilient_type == "l1":
+                        loss += cfg.alpha * torch.clamp(slack, min=0.0)
+                    elif cfg.resilient_type == "linf":
+                        loss += cfg.alpha * torch.max(torch.abs(slack), dim=1).values
                 elif cfg.loss_type == "dual":
                     dual_var = self.dual_vars[index].clone()
-                    dual_var += 2 * cfg.alpha * slack
-                    self.dual_vars[index] = dual_var.detach()
+                    if cfg.resilient_type == "ls":
+                        eps = 1e-8
+                        dual_cost_grad = torch.log((1-dual_var)/(dual_var))
+                        dual_var += cfg.dual_lr*(slack + cfg.alpha * dual_cost_grad)
+                        dual_var = dual_var.clamp(min=eps, max=1-eps)
+                        self.dual_vars[index] = dual_var.detach()
+                    elif cfg.resilient_type == "l2":
+                        dual_cost_grad = - dual_var
+                        dual_var += cfg.dual_lr*(slack + cfg.alpha * dual_cost_grad)
+                        dual_var = dual_var.clamp(min=0.0)
+                        self.dual_vars[index] = dual_var.detach()
+                    elif cfg.resilient_type == "l1":
+                        dual_var += cfg.dual_lr*(slack)
+                        dual_var = dual_var.clamp(min=0.0, max=cfg.alpha)
+                        self.dual_vars[index] = dual_var.detach()
+                    elif cfg.resilient_type == "linf":
+                        dual_var += cfg.dual_lr*(slack)
+                        dual_var = dual_var.clamp(min=0.0)
+                        self.dual_vars[index] = dual_var.detach()
+                        # project into L1 alpha ball if necessary
+                        if self.dual_vars.sum() > cfg.alpha:
+                            self.dual_vars = project_nonneg_l1_ball(self.dual_vars, cfg.alpha)
+                            dual_var = self.dual_vars[index]
+                    
                     loss += (
                         dual_var.detach()
                         * slack
