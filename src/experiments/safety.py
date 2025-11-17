@@ -3,204 +3,255 @@ import torch, torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoTokenizer, DataCollatorWithPadding, AutoModelForMultipleChoice,RobertaForMultipleChoice, AutoConfig
 from .base import Experiment
-from transformers import Trainer
+from transformers import Trainer, AutoModelForCausalLM
 import torch, torch.nn.functional as F
 from accelerate.utils import extract_model_from_parallel
 import numpy as np
 import os
+from torch.nn.utils.rnn import pad_sequence
+from tqdm.auto import tqdm
+from torch.utils.data import DataLoader, SequentialSampler, DistributedSampler
+import torch.distributed as dist
+from utils import format_prompt, right_padding
 
-
-
+from peft import LoraConfig, get_peft_model
 
 
 class SAFETY(Experiment):
     
     def load_model_and_tok(self, cfg):
-        configuration = AutoConfig.from_pretrained(cfg.exp.model_name)
-        if cfg.exp.model_name == "answerdotai/ModernBERT-large":
-            configuration.attention_dropout = cfg.train.dropout
-            configuration.mlp_dropout = cfg.train.dropout
-            configuration.classifier_dropout = cfg.train.dropout
-        elif cfg.exp.model_name == "FacebookAI/roberta-large":
-            configuration.hidden_dropout_prob = cfg.train.dropout
-            configuration.attention_probs_dropout_prob = cfg.train.dropout
-            configuration.classifier_dropout = cfg.train.dropout
-        model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name, config=configuration)
-        tok = AutoTokenizer.from_pretrained(cfg.exp.model_name)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        model.config.loss_alpha = cfg.exp.loss_alpha
-        model.config.loss_type = cfg.exp.loss_type
-        model.config.tol = cfg.exp.tol
-        model.main_input_name = 'probs'
+        tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
+        tok.pad_token = tok.eos_token  # Ensure pad token is defined
+        model = AutoModelForCausalLM.from_pretrained(cfg.exp.model_name, low_cpu_mem_usage=True, torch_dtype=torch.float16)
+
+        model = get_peft_model(
+                    model,
+                    LoraConfig(
+                        r=cfg.train.lora.r,
+                        lora_alpha=cfg.train.lora.lora_alpha,
+                        lora_dropout=cfg.train.lora.lora_dropout,
+                        target_modules=[
+                            "q_proj",
+                            "k_proj",
+                            "v_proj",
+                            "o_proj",
+                            "gate_proj",
+                            "down_proj",
+                            "up_proj",
+                            "lm_head",
+                        ],
+                    ),
+                )
         return model, tok
 
     def load_datasets(self, cfg):
         # Load and shuffle the full datasets first
-        tr = load_dataset("iboero16/SAFE-ALPACA", split="safe_alpaca_100").shuffle(seed=cfg.train.seed)
-        split = tr.train_test_split(test_size=0.1, seed=cfg.train.seed, stratify_key="safety_label")
+        complete_dl = load_dataset("iboero16/SAFE-ALPACA", split="safe_alpaca_100").shuffle(seed=cfg.train.seed)
+        # Keep a pure bool copy
+        complete_dl = complete_dl.map(lambda ex: {"safe": ex["safety_label"]})
+        # Encode only `safety_label` for stratification
+        complete_dl = complete_dl.class_encode_column("safety_label")
+        complete_dl = complete_dl.add_column("index", list(range(len(complete_dl))))
+        
+        complete_dl_size = int(cfg.train.data_proportion * len(complete_dl))
+        complete_dl = complete_dl.select(range(complete_dl_size))
+
+        split = complete_dl.train_test_split(test_size=0.1, seed=cfg.train.seed, stratify_by_column="safety_label")
         ev = split['test'].shuffle(seed=cfg.train.seed)
         tr = split['train'].shuffle(seed=cfg.train.seed)
         
-        # Take the required proportion after shuffling
-        tr_size = int(cfg.train.data_proportion * len(tr))
-        ev_size = int(cfg.train.data_proportion * len(ev))
-        tr = tr.select(range(tr_size))
-        ev = ev.select(range(ev_size))
         
-        # Add index column
-        tr = tr.add_column("index", list(range(len(tr))))
-        ev = ev.add_column("index", list(range(len(ev))))
         print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
-        return tr, ev
+        return tr, ev, complete_dl
 
     def preprocessing_fn(self, tok, cfg):
         def fn(sample):
-            input_text = sample['sentence']
+            input_text = ' '.join((sample['instruction'], sample['input'])) if sample['input'] else sample['instruction']
             if not isinstance(input_text, str):
                 raise ValueError(f'Unsupported type of `input`: {type(input_text)}. Expected: str.')
-            opt1, opt2 = sample["option1"], sample["option2"]
+            answer = sample["output"]
+            prompt = format_prompt(input=input_text, eos_token=tok.eos_token)
 
-            if "_" in input_text:
-                prefix, suffix = input_text.split("_", 1)
-            else:
-                raise ValueError(f'Unsupported type of `input`: {type(input_text)}. Expected: str.')
-
-            text_a = [prefix, prefix]
-            text_b = [opt1 + suffix, opt2 + suffix]
-
-            tokenized = tok(text_a, text_b, return_token_type_ids=True, return_attention_mask=True, return_tensors=None, padding='max_length', max_length=128, truncation=True, padding_side='right')
-      
-            # Stack input_ids and attention_mask for both choices
-            input_ids = tokenized["input_ids"]  # shape: (2, L)
-            attention_mask = tokenized["attention_mask"]  # shape: (2, L)
+            text = prompt + answer
+            
+            prompt_ids = tok(prompt, return_tensors='pt', truncation=True)['input_ids'][0]
+            len_prompt_ids = len(prompt_ids)
+        
+            input_ids = tok(text,  return_tensors='pt', truncation=True)['input_ids'][0]
+            if input_ids[-1].item() != tok.eos_token_id:
+                input_ids = torch.cat(
+                    [input_ids, torch.tensor([tok.eos_token_id], dtype=input_ids.dtype)]
+                )   
             index = sample['index']  # Get the index for dual variable updates
-            token_type_ids = tokenized["token_type_ids"]  # shape: (2, L)
+  
+            response_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            response_mask[len_prompt_ids:] = True
+    
 
-            # Determine correct label (0 for option1, 1 for option2)
-            correct = sample["answer"]
-            if correct == sample["option1"]:  # answer is option1
-                label = 0
-            elif correct == sample["option2"]:  # other_answer is option2
-                label = 1
-            else:
-                raise ValueError(f'Invalid `correct` value: {correct}. Expected one of: {sample["option1"]}, {sample["option2"]}.')
-            if bool(sample['gender_bias']):
-                if cfg.exp.ratio == "fair":
-                    probs = sample['stereo_prob'] / (1 + sample['stereo_prob'])
-                elif cfg.exp.ratio == "ones":
-                    probs = 0.5
-                elif cfg.exp.ratio == "reverse":
-                    probs = 1 - (sample['stereo_prob'] / (1 + sample['stereo_prob']))
-            else:
-                probs = -1.0
             return {
                 'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'token_type_ids':token_type_ids,
-                'labels': int(label),
-                'is_constraint': bool(sample['gender_bias']),
-                'probs': probs,  # Add ratio for fair/ones
-                'index': int(index)
+                'safe': sample["safe"],
+                'response_mask': response_mask,
+                'index': index,
+                'labels': index, # AS LABELS ARE UNUSED, STORE INDEX HERE FOR METRICS COMPUTATION
             }
         return fn
 
     def get_collator(self, tok):
-        class ClassificationBiasCollator():
+        class SafetyCollator():
             
             def __init__(self, pad_token_id: int) -> None:
                 """Initialize a collator."""
                 self.pad_token_id = pad_token_id
                 
             def __call__(self, samples):
-                input_ids = torch.stack([torch.tensor(sample['input_ids']) for sample in samples])  # (B, 2, L)
-                attention_mask = torch.stack([torch.tensor(sample['attention_mask']) for sample in samples])  # (B, 2, L)
-                token_type_ids = torch.stack([torch.tensor(sample["token_type_ids"]) for sample in samples])      # (B, 2, L) ← NEW
+                
+                input_ids = right_padding(
+                            [torch.tensor(sample['input_ids']) for sample in samples],
+                            padding_value=self.pad_token_id,
+                        )
 
-                labels = torch.tensor(
-                    [sample['labels'] for sample in samples],
-                    dtype=torch.long,
+                response_masks = right_padding(
+                    [torch.tensor(sample['response_mask']) for sample in samples],
+                    padding_value=0,
                 )
-                is_constraint = torch.tensor(
-                    [sample['is_constraint'] for sample in samples],
+
+                attention_mask = input_ids.ne(self.pad_token_id)
+                safe = torch.tensor(
+                    [sample['safe'] for sample in samples],
                     dtype=torch.bool,
-                )
-                probs = torch.tensor(
-                    [sample['probs'] for sample in samples],
-                    dtype=torch.float,
-                )
+                )   
                 index = torch.tensor(
                     [sample['index'] for sample in samples],
                     dtype=torch.long,
                 )
-                return {
-                    'input_ids': input_ids,  # size = (B, 2, L)
-                    'attention_mask': attention_mask.bool(),  # size = (B, 2, L)
-                    "token_type_ids": token_type_ids,
-                    'labels': labels,  # size = (B,)
-                    'is_constraint': is_constraint,  # size = (B,)
-                    'probs': probs,  # size = (B,)
-                    'index': index,  # size = (B,)
+                labels = torch.tensor(
+                    [sample['labels'] for sample in samples],
+                    dtype=torch.long,
+                )
+
+                batch = {
+                    "input_ids": input_ids,              # (B, L)
+                    "attention_mask": attention_mask.bool(),
+                    "index": index,                      # (B,)
+                    "safe": safe,                        # (B,)
+                    "response_mask": response_masks.bool(),
+                    "labels": labels,
                 }
-        return ClassificationBiasCollator(tok.pad_token_id)
+
+                # BASELINE IS COMPUTED AFTER PRECOMPUTE STEP
+                if "baseline_logprob" in samples[0]:
+                    baseline_logprob = torch.tensor(
+                        [sample["baseline_logprob"] for sample in samples],
+                        dtype=torch.float,
+                    )
+                    batch["baseline_logprob"] = baseline_logprob  # (B,)
+
+                return batch
+        return SafetyCollator(tok.pad_token_id)
 
     def compute_metrics(self, tok, cfg):
-        def metric_fn(pred):
-            logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
-            labels = pred.label_ids
-            loss = pred.losses
-            probs = pred.inputs
-            logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); probs = torch.tensor(probs)
-            is_constraint = probs != -1.0
-            log_probs = F.log_softmax(logits, dim=-1)
-            correct_log_probs = log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)
-            incorrect_log_probs = log_probs.gather(1, (1 - labels).reshape(-1, 1)).squeeze(1)
-
-            constraint_slacks = probs * (torch.log(probs) - correct_log_probs) + (1 - probs) * (torch.log(1 - probs) - incorrect_log_probs)  # KL divergence
-            constraint_slacks = constraint_slacks[is_constraint]  # Only keep constraint samples
-            metric_constraints = torch.abs(probs - torch.exp(correct_log_probs))[is_constraint]
-            objective = -1 * log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)[~is_constraint]
-            acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
-            bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
-
-            # Log table with constraint slacks for wandb
-            rank = int(os.environ.get("RANK", "0"))
-            if cfg.train.use_wandb and rank == 0:
-                import wandb
-                if wandb.run is not None:
-                    table_metrics = wandb.Table(columns=["constraint_slack", "metric_constraint"])
-                    for slack, metric in zip(constraint_slacks.tolist(), metric_constraints.tolist()):
-                        table_metrics.add_data(slack, metric)
-                    wandb.log({"constraint_slacks_metrics": table_metrics})
-                # Add histogram of constraint slacks
-                wandb.log({"constraint_slacks_histogram": wandb.Histogram(constraint_slacks.cpu().numpy())})
-                wandb.log({"metric_constraints_histogram": wandb.Histogram(metric_constraints.cpu().numpy())})
-
-            return {"accuracy": acc,
-                    "bias_accuracy": bias,
-                    "loss": loss.mean().item(),
-                    "objective": objective.mean().item(), 
-                    "mean_dkl_violation": constraint_slacks.mean().item(),
-                    "min_dkl_violation": constraint_slacks.min().item(),
-                    "max_dkl_violation": constraint_slacks.max().item(),
-                    "mean_metric_constraint": metric_constraints.mean().item(),
-                    "min_metric_constraint": metric_constraints.min().item(),
-                    "max_metric_constraint": metric_constraints.max().item()
-                    }
-        return metric_fn
+        return None
 
 
     def get_trainer_class(self):
         class CustomTrainer(Trainer):
-            def __init__(self, *args, experiment=None, dual_vars=None, **kwargs):
+            
+            def __init__(self, *args, custom_cfg=None,complete_dataset=None, experiment=None, dual_vars=None, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.experiment = experiment
+                self.custom_cfg = custom_cfg
+                self.complete_ds = complete_dataset
                 self.init_dual_vars()
+                self.precompute_answer_logprobs()
+                self.compute_metrics = self._compute_metrics ## OVERRIDE COMPUTE METRICS SO I CAN USE SELF. 
+
                 
-        
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
-                self.dual_vars = torch.zeros(len(self.train_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
+                self.dual_vars = torch.zeros(len(self.train_dataset) + len(self.eval_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
+
+            def precompute_answer_logprobs(self):
+                """
+                Precompute average answer log-probs for *all* samples in complete_ds
+                in a multi-GPU safe way.
+                """
+                model = self.model
+                model.eval()
+
+                device = model.device
+                dtype = model.dtype
+                n_total = len(self.complete_ds)
+
+                # local tensor: full size, but this rank only writes its own indices
+                all_probs_local = torch.zeros(n_total, dtype=dtype, device=device)
+
+                # Decide sampler: DistributedSampler if DDP, else SequentialSampler
+                if dist.is_available() and dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    rank = dist.get_rank()
+                    sampler = DistributedSampler(
+                        self.complete_ds,
+                        num_replicas=world_size,
+                        rank=rank,
+                        shuffle=False,   # for deterministic precompute
+                        drop_last=False,
+                    )
+                else:
+                    sampler = SequentialSampler(self.complete_ds)
+
+                # Build dataloader directly
+                dataloader = DataLoader(
+                    self.complete_ds,
+                    sampler=sampler,
+                    batch_size=self.args.per_device_train_batch_size,
+                    collate_fn=self.data_collator,
+                    pin_memory=self.args.dataloader_pin_memory,
+                )
+
+                desc = "Precompute answer logprobs"
+                if dist.is_available() and dist.is_initialized():
+                    desc += f" [rank {dist.get_rank()}]"
+
+                with torch.no_grad():
+                    for batch in tqdm(dataloader, desc=desc, unit="batch"):
+                        input_ids = batch["input_ids"].to(device)
+                        attention_mask = batch["attention_mask"].to(device)
+                        response_mask = batch["response_mask"].to(device)
+                        index = batch["index"].to(device)   # global indices in [0, n_total)
+
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                        )
+                        logits = outputs.logits[:, :-1]                  # (B, L-1, V)
+                        log_probs = F.log_softmax(logits, dim=-1)        # (B, L-1, V)
+                        answer_log_probs = torch.gather(
+                            log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)
+                        ).squeeze(-1)                                    # (B, L-1)
+                        answer_log_probs = answer_log_probs * response_mask[:, 1:]
+                        answer_log_probs = answer_log_probs.sum(dim=-1)  # (B,)
+                        denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                        answer_log_probs = answer_log_probs / denom      # average log-prob
+
+                        all_probs_local[index] = answer_log_probs
+
+                # Now combine results across ranks
+                if dist.is_available() and dist.is_initialized():
+                    # each rank has non-zero entries only for its shard;
+                    # sum across ranks to get full vector on all ranks
+                    dist.all_reduce(all_probs_local, op=dist.ReduceOp.SUM)
+
+                all_probs_local = all_probs_local.detach().cpu()
+                def add_baseline(example):
+                    idx = example["index"]             # global index
+                    example["baseline_logprob"] = float(all_probs_local[idx])
+                    return example
+                print("Adding baseline logprobs to datasets...")
+                self.complete_ds = self.complete_ds.map(add_baseline)
+                self.train_dataset = self.train_dataset.map(add_baseline)
+                self.eval_dataset  = self.eval_dataset.map(add_baseline)
+                model.train()
 
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 """Loss function for the bias classification algorithm using Multiple Choice.
@@ -213,116 +264,113 @@ class SAFETY(Experiment):
                 Returns:
                     dict[str, torch.Tensor]: loss, objective, constraint_value
                 """
-                core_model = extract_model_from_parallel(model)
-                cfg = core_model.config
+                cfg = self.custom_cfg.exp
                 
                 input_ids = inputs['input_ids']  # size = (B, 2, L)
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
-                token_type_ids = inputs['token_type_ids']  # size = (B, 2, L)
-                labels = inputs['labels']  # size = (B,)
-                target = inputs['probs']  # size = (B,)
-                incorrect_labels = (1 - labels)  # flip 0->1, 1->0
-                is_constraint = inputs['is_constraint'].squeeze()  # size = (B,)
+                response_mask = inputs['response_mask']  # size = (B, 2, L)
+                precomputed_answer_log_probs = inputs['baseline_logprob']  # size = (B,)
+                is_constraint = inputs['safe'].long()  # size = (B,)                
                 is_not_constraint = ~is_constraint
                 index = inputs['index']  # size = (B,)
-                dual_var = self.dual_vars[index].clone()  # Get dual variable for the current batch
-                epoch = self.state.epoch if self.state.epoch is not None else 0.0
-                epoch_idx = int(epoch + 1e-9) + 1 # integer epoch index
-                # Get model outputs - for multiple choice, input shape should be (B, 2, L)
+                index_constraints = index[is_constraint]
+                dual_var = self.dual_vars[index_constraints].clone()  # Get dual variable for the current batch
+                                
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    token_type_ids=token_type_ids
                 )
-                logits = outputs.logits  # size = (B, 2) - logits for each choice
-                log_probs = F.log_softmax(logits, dim=-1)  # size = (B, 2)
-                # Get probabilities for correct and incorrect options
-                correct_log_probs = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)  # size = (B,)
-                incorrect_log_probs = log_probs.gather(1, incorrect_labels.unsqueeze(1)).squeeze(1)  # size = (B,)
-                target = target.clamp(1e-7, 1 - 1e-7)  # Avoid log(-1) issues on non-constraint samples
-                # Compute log probability difference (correct - incorrect)
-                dkl = target * (torch.log(target) - correct_log_probs) + (1 - target) * (torch.log(1 - target) - incorrect_log_probs) # KL divergence
-
+                logits = outputs.logits[:, :-1]  # size = (B, L-1, Vocab)
+                log_probs = F.log_softmax(logits, dim=-1)  # size = (B, L-1, Vocab)
+                answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
+                answer_log_probs = answer_log_probs * response_mask[:, 1:]
+                answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
+                denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                avg_answer_log_probs = answer_log_probs / denom
                 
-                # For constraint samples, we want the probabilities to be equal (difference = 0)
-                # For non-constraint samples, we want correct to have higher probability
-                slack = (dkl - cfg.tol) * is_constraint.float()  # constraint violation
-
-                if is_not_constraint.any():
-                    loss = -correct_log_probs[is_not_constraint]
-                else:
-                    loss = torch.tensor(0.0, device=correct_log_probs.device, requires_grad=True)
+                avg_answer_log_ratios = avg_answer_log_probs - precomputed_answer_log_probs
                 
-                # Add constraint penalization
+                avg_answer_log_ratios_objective = avg_answer_log_ratios[is_not_constraint]
+                avg_answer_log_ratios_constraint = avg_answer_log_ratios[is_constraint]
+                
+                loss = -1 * avg_answer_log_ratios_objective.mean()
+                slack = cfg.tol - avg_answer_log_ratios_constraint
+
                 if cfg.loss_type == "erm":
                     pass
+                elif cfg.loss_type == "penalty":
+                    loss += cfg.loss_alpha * slack.sum()
                 elif cfg.loss_type == "l2":
                     loss += (
-                        cfg.loss_alpha
-                        / 2
-                        * slack ** 2
-                    ).sum()
-
-                elif cfg.loss_type == "l1":
-                    loss += (
-                        cfg.loss_alpha
-                        / 2
-                        * slack.abs()
-                    ).sum()
-                elif cfg.loss_type == "dual_res":
-                    # Update duals before computing the loss
-                    dual_var += -1 * dual_var + 2 * cfg.loss_alpha * (slack)
-                    self.dual_vars[index] = dual_var
-                    loss += (
-                        dual_var
-                        * slack
+                        cfg.loss_alpha / 2
+                        * torch.clamp(slack, min=0.0) ** 2
                     ).sum()
                 elif cfg.loss_type == "dual":                   
-                    dual_var += 2 * cfg.loss_alpha * slack
-                    self.dual_vars[index] = dual_var.detach()  
+                    dual_var = torch.clamp(dual_var + 2 * cfg.loss_alpha * slack, min=0.0)
+                    self.dual_vars[index_constraints] = dual_var.detach()  
                     loss += (
                         dual_var.detach()
                         * slack
                     ).sum()
-                elif cfg.loss_type == "dual_aug_l2":
-                    dual_var += cfg.loss_alpha * slack
-                    self.dual_vars[index] = dual_var.detach()  
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                        + (cfg.loss_alpha / 2) * slack ** 2
-                    ).sum()
-                elif cfg.loss_type == "dual_aug_l1":
-                    dual_var += cfg.loss_alpha * slack
-                    self.dual_vars[index] = dual_var.detach()  
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                        + (cfg.loss_alpha / 2) * slack.abs()
-                    ).sum()         
-                elif cfg.loss_type == "dual_aug_l2_increase":
-                    loss_alpha = cfg.loss_alpha * 2 ** epoch_idx
-                    dual_var += loss_alpha * slack
-                    self.dual_vars[index] = dual_var.detach()
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                        + (loss_alpha / 2) * slack ** 2
-                    ).sum()
-                elif cfg.loss_type == "dual_aug_l1_increase":
-                    loss_alpha = cfg.loss_alpha * 2 ** epoch_idx
-                    dual_var += loss_alpha * slack
-                    self.dual_vars[index] = dual_var.detach()
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                        + (loss_alpha / 2) * slack.abs()
-                    ).sum()
-                    
+
                 loss = loss.mean()
                 
                 if return_outputs:
                     return loss, outputs
                 else:
                     return loss
+                
+                
+            def _compute_metrics(self, pred):
+                
+        
+                logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+                indexes = pred.label_ids
+                logits = torch.tensor(logits); indexes = torch.tensor(indexes); 
+                
+                cfg = self.custom_cfg.exp
+                
+                # Get is_constraint, response_mask, input_ids from complete dataset and index
+                samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
+                collated = self.data_collator(samples)
+                input_ids = collated['input_ids'].to(logits.device)
+                response_mask = collated['response_mask'].to(logits.device)
+                is_constraint = collated['safe'].long().to(logits.device)  # size
+                precomputed_answer_log_probs = collated['baseline_logprob'].to(logits.device)
+                is_not_constraint = ~is_constraint
+                
+                
+                log_probs = F.log_softmax(logits, dim=-1)[:, :-1]  # size = (B, L-1, Vocab)
+                answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
+                answer_log_probs = answer_log_probs * response_mask[:, 1:]
+                answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
+                denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                avg_answer_log_probs = answer_log_probs / denom
+
+                avg_answer_log_ratios = avg_answer_log_probs - precomputed_answer_log_probs
+                
+                avg_answer_log_ratios_objective = avg_answer_log_ratios[is_not_constraint]
+                avg_answer_log_ratios_constraint = avg_answer_log_ratios[is_constraint]
+                
+                objective = -1 * avg_answer_log_ratios_objective.mean().item()
+                constraint_mean = avg_answer_log_ratios_constraint.mean().item()
+                constrain_min = avg_answer_log_ratios_constraint.min().item()
+                constrain_max = avg_answer_log_ratios_constraint.max().item()
+                contriant_cvar = avg_answer_log_ratios_constraint[avg_answer_log_ratios_constraint > np.quantile(avg_answer_log_ratios_constraint.cpu().numpy(), 0.9)].mean().item()
+                
+                slacks = cfg.tol - avg_answer_log_ratios_constraint
+                
+                self._last_constraint_slacks = slacks.detach().cpu()
+                self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
+                self._last_objective_ratios = avg_answer_log_ratios_objective.detach().cpu()
+                self.last_objective_indexes = indexes[is_not_constraint].detach().cpu()
+                
+                return {
+                    "objective": objective,
+                    "constraint_mean": constraint_mean,
+                    "constraint_min": constrain_min,
+                    "constraint_max": constrain_max,
+                    "constraint_cvar": contriant_cvar,
+                        }
         return CustomTrainer
+    

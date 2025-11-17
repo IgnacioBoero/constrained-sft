@@ -3,6 +3,8 @@ from copy import deepcopy
 import random
 
 
+from transformers import TrainerCallback
+
 class TrainSetEvalCallback(TrainerCallback):
     def __init__(self, trainer, sample_size: int | None = None, prefix="train"):
         super().__init__()
@@ -12,21 +14,36 @@ class TrainSetEvalCallback(TrainerCallback):
         self._inside = False
 
     def on_evaluate(self, args, state, control, **kwargs):
-        if self._inside:                      # second time → do nothing
+        if self._inside:
             return control
-        self._inside = True                    # unchanged control object
+        self._inside = True
 
         ds = self.trainer.train_dataset
         if self.sample_size and self.sample_size < len(ds):
             import random
             idx = random.sample(range(len(ds)), self.sample_size)
-            ds = ds.select(idx)                  # fast “mini-train” slice
+            ds = ds.select(idx)
 
+        # backup eval slacks/indexes (so outer eval can still see them)
+        prev_slacks = getattr(self.trainer, "_last_constraint_slacks", None)
+        prev_indexes = getattr(self.trainer, "_last_constraint_indexes", None)
+        prev_prefix = getattr(self.trainer, "_current_eval_prefix", "eval")
+
+        # tag as train and run nested eval
+        self.trainer._current_eval_prefix = self.prefix  # "train"
         self.trainer.evaluate(
             eval_dataset=ds,
-            metric_key_prefix=self.prefix       # results appear as train/…
-            
+            metric_key_prefix=self.prefix,
         )
+
+        # restore eval state for the outer on_evaluate
+        if prev_slacks is not None:
+            self.trainer._last_constraint_slacks = prev_slacks
+        if prev_indexes is not None:
+            self.trainer._last_constraint_indexes = prev_indexes
+        self.trainer._current_eval_prefix = prev_prefix
+
         self._inside = False
         return control
+
 

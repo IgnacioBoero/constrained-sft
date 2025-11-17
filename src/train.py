@@ -2,6 +2,7 @@
 from callbacks.trainer_eval import TrainSetEvalCallback
 from callbacks.profiler_callback import ProfilerCallback
 from callbacks.cache import SyncEmptyCacheCallback
+from callbacks.log_slack import ConstraintSlackWandbCallback
 import hydra
 import wandb
 import torch
@@ -41,12 +42,13 @@ def main(cfg: DictConfig):
     model,tok = exp.load_model_and_tok(cfg)
 
     # Data
-    train_ds, eval_ds = exp.load_datasets(cfg)
+    train_ds, eval_ds, complete_ds = exp.load_datasets(cfg)
     preprocess = exp.preprocessing_fn(tok, cfg)
     cols = train_ds.column_names
 
     train_ds = train_ds.map(preprocess, remove_columns=cols)
     eval_ds = eval_ds.map(preprocess, remove_columns=cols) 
+    complete_ds = complete_ds.map(preprocess, remove_columns=cols)
     
     collator = exp.get_collator(tok)
     metric_fn = exp.compute_metrics(tok, cfg)
@@ -64,12 +66,20 @@ def main(cfg: DictConfig):
         model=model, args=args,
         train_dataset=train_ds, eval_dataset=eval_ds,
         data_collator=collator, tokenizer=tok,
-        compute_metrics=metric_fn, experiment=exp
+        compute_metrics=metric_fn, experiment=exp,
+        custom_cfg=cfg, complete_dataset=complete_ds
     )
     
+    trainer._current_eval_prefix = "eval"  # default for normal evals
+    log_tables = getattr(cfg.train, "log_tables", False)
+    if log_tables:
+        trainer.add_callback(ConstraintSlackWandbCallback())
+        
     eval_on_train = getattr(cfg.train, "eval_on_train", False)
     if eval_on_train:
         trainer.add_callback(TrainSetEvalCallback(trainer))
+        
+
     
     sync_empty_cache = getattr(cfg.train, "sync_empty_cache", False)
     if sync_empty_cache:
@@ -93,8 +103,8 @@ def main(cfg: DictConfig):
                 with_modules=True,
             ) as prof:
                 trainer.add_callback(ProfilerCallback(prof))
-                # if cfg.train.do_initial_eval:
-                #     trainer.evaluate(metric_key_prefix="eval")
+                if cfg.train.do_initial_eval:
+                    trainer.evaluate(metric_key_prefix="eval")
                 trainer.train()
 
         else:
