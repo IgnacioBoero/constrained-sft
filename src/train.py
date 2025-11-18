@@ -21,6 +21,7 @@ def is_global_main_process() -> bool:
 @hydra.main(config_path="../configs", config_name="train/default", version_base=None)
 def main(cfg: DictConfig):
     set_seed(cfg.train.seed)
+    
 
     # Initialize wandb if enabled
     if cfg.train.use_wandb and is_global_main_process():

@@ -1,23 +1,41 @@
-# @package _global_
-
-# hydra:
-#   mode: MULTIRUN
-#   sweeper:
-#     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
-#     params:
-#       exp.tol: 0.02
-#       exp.loss_alpha: 3,100
-#       exp.loss_type: l2
-
-#   # Ensure sequential launching (no parallel launcher)
-#   launcher:
-#     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
-
-#   # Optional: get deterministic per-job folders 0,1,2,...
-#   sweep:
-#     dir: ./multirun
-#     subdir: ${hydra.job.num}  # 0,1,2,... in the iteration order
-
+defaults:
+  - _self_
+  - override hydra/sweeper: list  # use hydra-list-sweeper plugin
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    # no grid_params, no list_params: just ablative (explicit) jobs
+    ablative_params:
+      - exp.loss_type: penalty
+        exp.loss_alpha: 1
+      - exp.loss_type: penalty
+        exp.loss_alpha: 10
+      - exp.loss_type: penalty
+        exp.loss_alpha: 100
+      - exp.loss_type: l2
+        exp.loss_alpha: 1
+        exp.tol: 0.5
+      - exp.loss_type: l2
+        exp.loss_alpha: 10
+        exp.tol: 0.5
+      - exp.loss_type: l2
+        exp.loss_alpha: 100
+        exp.tol: 0.5
+      - exp.loss_type: l2
+        exp.loss_alpha: 1
+        exp.tol: 5
+      - exp.loss_type: l2
+        exp.loss_alpha: 10
+        exp.tol: 5
+      - exp.loss_type: l2
+        exp.loss_alpha: 100
+        exp.tol: 5
+      - exp.loss_type: dual
+        exp.dual_lr: 1
+      - exp.loss_type: dual
+        exp.dual_lr: 10
+      - exp.loss_type: dual
+        exp.dual_lr: 100
 train:
   seed: 42
   output_dir: "./outputs/safe/run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.tol}"
@@ -65,3 +83,4 @@ exp:
   loss_type: penalty
   tol: 0.0
   loss_alpha: 1
+  dual_lr: 1e-2

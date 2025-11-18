@@ -308,7 +308,7 @@ class SAFETY(Experiment):
                         * torch.clamp(slack, min=0.0) ** 2
                     ).sum()
                 elif cfg.loss_type == "dual":                   
-                    dual_var = torch.clamp(dual_var + 2 * cfg.loss_alpha * slack, min=0.0)
+                    dual_var = torch.clamp(dual_var + 2 * cfg.dual_lr * slack, min=0.0)
                     self.dual_vars[index_constraints] = dual_var.detach()  
                     loss += (
                         dual_var.detach()
