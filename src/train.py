@@ -73,7 +73,7 @@ def main(cfg: DictConfig):
     trainer._current_eval_prefix = "eval"  # default for normal evals
     log_tables = getattr(cfg.train, "log_tables", False)
     if log_tables:
-        trainer.add_callback(ConstraintSlackWandbCallback())
+        trainer.add_callback(ConstraintSlackWandbCallback(trainer))
         
     eval_on_train = getattr(cfg.train, "eval_on_train", False)
     if eval_on_train:

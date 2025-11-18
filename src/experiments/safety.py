@@ -21,9 +21,9 @@ class SAFETY(Experiment):
     
     def load_model_and_tok(self, cfg):
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
+        tok.model_max_length = cfg.train.max_length
         tok.pad_token = tok.eos_token  # Ensure pad token is defined
         model = AutoModelForCausalLM.from_pretrained(cfg.exp.model_name, low_cpu_mem_usage=True, torch_dtype=torch.float16)
-
         model = get_peft_model(
                     model,
                     LoraConfig(
@@ -65,6 +65,7 @@ class SAFETY(Experiment):
         return tr, ev, complete_dl
 
     def preprocessing_fn(self, tok, cfg):
+        max_length = cfg.train.max_length
         def fn(sample):
             input_text = ' '.join((sample['instruction'], sample['input'])) if sample['input'] else sample['instruction']
             if not isinstance(input_text, str):
@@ -74,10 +75,10 @@ class SAFETY(Experiment):
 
             text = prompt + answer
             
-            prompt_ids = tok(prompt, return_tensors='pt', truncation=True)['input_ids'][0]
+            prompt_ids = tok(prompt, return_tensors='pt', truncation=True, max_length=max_length-1)['input_ids'][0]
             len_prompt_ids = len(prompt_ids)
         
-            input_ids = tok(text,  return_tensors='pt', truncation=True)['input_ids'][0]
+            input_ids = tok(text,  return_tensors='pt', truncation=True, max_length=max_length-1)['input_ids'][0]
             if input_ids[-1].item() != tok.eos_token_id:
                 input_ids = torch.cat(
                     [input_ids, torch.tensor([tok.eos_token_id], dtype=input_ids.dtype)]
@@ -186,7 +187,7 @@ class SAFETY(Experiment):
                 # local tensor: full size, but this rank only writes its own indices
                 all_probs_local = torch.zeros(n_total, dtype=dtype, device=device)
 
-                # Decide sampler: DistributedSampler if DDP, else SequentialSampler
+                # # Decide sampler: DistributedSampler if DDP, else SequentialSampler
                 if dist.is_available() and dist.is_initialized():
                     world_size = dist.get_world_size()
                     rank = dist.get_rank()
@@ -242,12 +243,14 @@ class SAFETY(Experiment):
                     # sum across ranks to get full vector on all ranks
                     dist.all_reduce(all_probs_local, op=dist.ReduceOp.SUM)
 
-                all_probs_local = all_probs_local.detach().cpu()
+                all_probs_cpu = all_probs_local.detach().cpu()
+                del all_probs_local
+                torch.cuda.empty_cache()
+                
                 def add_baseline(example):
                     idx = example["index"]             # global index
-                    example["baseline_logprob"] = float(all_probs_local[idx])
+                    example["baseline_logprob"] = float(all_probs_cpu[idx])
                     return example
-                print("Adding baseline logprobs to datasets...")
                 self.complete_ds = self.complete_ds.map(add_baseline)
                 self.train_dataset = self.train_dataset.map(add_baseline)
                 self.eval_dataset  = self.eval_dataset.map(add_baseline)
@@ -270,12 +273,11 @@ class SAFETY(Experiment):
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
                 response_mask = inputs['response_mask']  # size = (B, 2, L)
                 precomputed_answer_log_probs = inputs['baseline_logprob']  # size = (B,)
-                is_constraint = inputs['safe'].long()  # size = (B,)                
+                is_constraint = inputs['safe']  # size = (B,)                
                 is_not_constraint = ~is_constraint
                 index = inputs['index']  # size = (B,)
                 index_constraints = index[is_constraint]
                 dual_var = self.dual_vars[index_constraints].clone()  # Get dual variable for the current batch
-                                
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -335,10 +337,11 @@ class SAFETY(Experiment):
                 collated = self.data_collator(samples)
                 input_ids = collated['input_ids'].to(logits.device)
                 response_mask = collated['response_mask'].to(logits.device)
-                is_constraint = collated['safe'].long().to(logits.device)  # size
+                is_constraint = collated['safe'].to(logits.device)  # size
                 precomputed_answer_log_probs = collated['baseline_logprob'].to(logits.device)
                 is_not_constraint = ~is_constraint
-                
+                self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
+                self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
                 
                 log_probs = F.log_softmax(logits, dim=-1)[:, :-1]  # size = (B, L-1, Vocab)
                 answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
@@ -352,6 +355,11 @@ class SAFETY(Experiment):
                 avg_answer_log_ratios_objective = avg_answer_log_ratios[is_not_constraint]
                 avg_answer_log_ratios_constraint = avg_answer_log_ratios[is_constraint]
                 
+                if is_constraint.sum() == 0:
+                    avg_answer_log_ratios_constraint = torch.tensor([0.0], device=avg_answer_log_ratios.device)
+                    self._last_constraint_indexes = torch.tensor([0], dtype=torch.long)
+                    
+                
                 objective = -1 * avg_answer_log_ratios_objective.mean().item()
                 constraint_mean = avg_answer_log_ratios_constraint.mean().item()
                 constrain_min = avg_answer_log_ratios_constraint.min().item()
@@ -361,9 +369,7 @@ class SAFETY(Experiment):
                 slacks = cfg.tol - avg_answer_log_ratios_constraint
                 
                 self._last_constraint_slacks = slacks.detach().cpu()
-                self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
                 self._last_objective_ratios = avg_answer_log_ratios_objective.detach().cpu()
-                self.last_objective_indexes = indexes[is_not_constraint].detach().cpu()
                 
                 return {
                     "objective": objective,

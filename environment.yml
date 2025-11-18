@@ -1,0 +1,24 @@
+name: pda
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - datasets
+  - matplotlib-base
+  - nvidia/label/cuda-12.4.0::cuda-toolkit=12.4
+  - nvitop
+  - optree
+  - pip
+  - python=3.11
+  - pytorch::pytorch-mutex[build=*cuda*]
+  - rich
+  - scipy
+  - sentencepiece
+  - tensorboard
+  - tokenizers[version='>=0.13.3']
+  - tqdm
+  - transformers[version='>=4.37']
+  - typing-extensions
+  - wandb
+  - ipykernel
+prefix: /home/panda/miniconda3/envs/pda
