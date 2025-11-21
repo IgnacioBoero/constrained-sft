@@ -40,17 +40,17 @@
 #         exp.dual_lr: 100
 train:
   seed: 42
-  output_dir: "./outputs/safe/run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.tol}"
+  output_dir: "./outputs/safe/${exp.loss_type}/alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_lr}"
   do_train: true
   do_initial_eval: true
   log_tables: true
   use_wandb: true
   wandb_project: "SAFE-cl-v1"
-  run_name: "run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.tol}"
+  run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_lr}"
   data_proportion: 1.0
   eval_on_train: true
   enable_profiler: false
-  max_length: 512
+  max_length: 1024
   lora:
     r: 8
     lora_alpha: 16
@@ -62,11 +62,11 @@ train:
     repeat: 1
     output_dir: "log/safe/profiler"
   hf_args:
-    per_device_train_batch_size: 4
-    per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 8
-    eval_accumulation_steps: 8
-    num_train_epochs: 4
+    per_device_train_batch_size: 64
+    per_device_eval_batch_size: 64
+    gradient_accumulation_steps: 1
+    eval_accumulation_steps: 1
+    num_train_epochs: 6
     learning_rate: 5e-6
     lr_scheduler_type: "linear"
     warmup_ratio: 0.1
