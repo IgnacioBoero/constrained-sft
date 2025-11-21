@@ -51,15 +51,18 @@ class SAFETY(Experiment):
         ev_raw = ds["validation"]
         tr_raw = tr_raw.add_column("split", ["train"] * len(tr_raw))
         ev_raw = ev_raw.add_column("split", ["validation"] * len(ev_raw))
+        
+        
+        tr_size = int(cfg.train.data_proportion * len(tr_raw))
+        tr_raw = tr_raw.select(range(tr_size))
+        
+        ev_size = int(cfg.train.data_proportion * len(ev_raw))
+        ev_raw = ev_raw.select(range(ev_size))
 
+        # Add one common index for both
         complete_dl = concatenate_datasets([tr_raw, ev_raw])
         complete_dl = complete_dl.add_column("index", list(range(len(complete_dl))))
-
-        # Optional subsample while keeping global indices consistent
-        complete_dl = complete_dl.shuffle(seed=cfg.train.seed)
-        complete_size = int(cfg.train.data_proportion * len(complete_dl))
-        complete_dl = complete_dl.select(range(complete_size))
-
+        
         # Recover splits from the "split" tag
         tr = complete_dl.filter(lambda x: x["split"] == "train")
         ev = complete_dl.filter(lambda x: x["split"] == "validation")
@@ -94,11 +97,10 @@ class SAFETY(Experiment):
   
             response_mask = torch.zeros_like(input_ids, dtype=torch.bool)
             response_mask[len_prompt_ids:] = True
-    
 
             return {
                 'input_ids': input_ids,
-                'safe': sample["safe"],
+                'safe': sample["safety_label"],
                 'response_mask': response_mask,
                 'index': index,
                 'labels': index, # AS LABELS ARE UNUSED, STORE INDEX HERE FOR METRICS COMPUTATION
