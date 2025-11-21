@@ -1,0 +1,29 @@
+name: pda
+channels:
+  - pytorch
+  - nvidia/label/cuda-12.4.0
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+
+  # PyTorch + CUDA from conda (Option A)
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.4
+
+  # core libs you wanted from conda
+  - datasets
+  - matplotlib-base
+  - scipy
+  - sentencepiece
+  - tensorboard
+  - tokenizers>=0.13.3
+  - transformers>=4.37
+  - tqdm
+  - rich
+  - wandb
+  - nvitop
+  - optree
+  - ipykernel
