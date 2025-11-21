@@ -323,7 +323,12 @@ class SAFETY(Experiment):
                         dual_var.detach()
                         * slack
                     ).sum()
-
+                elif cfg.loss_type == "aug_dual":                   
+                    dual_var += 1/2 * torch.clamp(2*slack + (dual_var / cfg.loss_alpha), min=0) - 1/2 * (dual_var / cfg.loss_alpha)
+                    self.dual_vars[index_constraints] = dual_var.detach()  
+                    loss += cfg.loss_alpha * (
+                        (torch.clamp(2*slack + (dual_var / cfg.loss_alpha), min=0)**2 - (dual_var / cfg.loss_alpha)**2) / 4
+                    ).sum()
                 loss = loss.mean()
                 
                 if return_outputs:
