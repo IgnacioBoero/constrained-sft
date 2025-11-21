@@ -1,6 +1,6 @@
 # src/your_proj/experiments/sft_cekl.py
 import torch, torch.nn.functional as F
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer, DataCollatorWithPadding, AutoModelForMultipleChoice,RobertaForMultipleChoice, AutoConfig
 from .base import Experiment
 from transformers import Trainer, AutoModelForCausalLM
@@ -45,22 +45,29 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        # Load and shuffle the full datasets first
-        complete_dl = load_dataset("iboero16/SAFE-ALPACA", split="safe_alpaca_100").shuffle(seed=cfg.train.seed)
-        # Keep a pure bool copy
-        complete_dl = complete_dl.map(lambda ex: {"safe": ex["safety_label"]})
-        # Encode only `safety_label` for stratification
-        complete_dl = complete_dl.class_encode_column("safety_label")
-        complete_dl = complete_dl.add_column("index", list(range(len(complete_dl))))
-        
-        complete_dl_size = int(cfg.train.data_proportion * len(complete_dl))
-        complete_dl = complete_dl.select(range(complete_dl_size))
+        ds = load_dataset("iboero16/SAFE-ALPACA-2")
 
-        split = complete_dl.train_test_split(test_size=0.1, seed=cfg.train.seed, stratify_by_column="safety_label")
-        ev = split['test'].shuffle(seed=cfg.train.seed)
-        tr = split['train'].shuffle(seed=cfg.train.seed)
-        
-        
+        tr_raw = ds["train"]
+        ev_raw = ds["validation"]
+        tr_raw = tr_raw.add_column("split", ["train"] * len(tr_raw))
+        ev_raw = ev_raw.add_column("split", ["validation"] * len(ev_raw))
+
+        complete_dl = concatenate_datasets([tr_raw, ev_raw])
+        complete_dl = complete_dl.add_column("index", list(range(len(complete_dl))))
+
+        # Optional subsample while keeping global indices consistent
+        complete_dl = complete_dl.shuffle(seed=cfg.train.seed)
+        complete_size = int(cfg.train.data_proportion * len(complete_dl))
+        complete_dl = complete_dl.select(range(complete_size))
+
+        # Recover splits from the "split" tag
+        tr = complete_dl.filter(lambda x: x["split"] == "train")
+        ev = complete_dl.filter(lambda x: x["split"] == "validation")
+
+        # If you want each split shuffled for training/eval order:
+        tr = tr.shuffle(seed=cfg.train.seed)
+        ev = ev.shuffle(seed=cfg.train.seed)
+
         print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
         return tr, ev, complete_dl
 

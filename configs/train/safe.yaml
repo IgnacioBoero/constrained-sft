@@ -1,41 +1,43 @@
-defaults:
-  - _self_
-  - override hydra/sweeper: list  # use hydra-list-sweeper plugin
-hydra:
-  mode: MULTIRUN
-  sweeper:
-    # no grid_params, no list_params: just ablative (explicit) jobs
-    ablative_params:
-      - exp.loss_type: penalty
-        exp.loss_alpha: 1
-      - exp.loss_type: penalty
-        exp.loss_alpha: 10
-      - exp.loss_type: penalty
-        exp.loss_alpha: 100
-      - exp.loss_type: l2
-        exp.loss_alpha: 1
-        exp.tol: 0.5
-      - exp.loss_type: l2
-        exp.loss_alpha: 10
-        exp.tol: 0.5
-      - exp.loss_type: l2
-        exp.loss_alpha: 100
-        exp.tol: 0.5
-      - exp.loss_type: l2
-        exp.loss_alpha: 1
-        exp.tol: 5
-      - exp.loss_type: l2
-        exp.loss_alpha: 10
-        exp.tol: 5
-      - exp.loss_type: l2
-        exp.loss_alpha: 100
-        exp.tol: 5
-      - exp.loss_type: dual
-        exp.dual_lr: 1
-      - exp.loss_type: dual
-        exp.dual_lr: 10
-      - exp.loss_type: dual
-        exp.dual_lr: 100
+# @package _global_
+
+# defaults:
+#   - _self_
+#   - override hydra/sweeper: list  # use hydra-list-sweeper plugin
+# hydra:
+#   mode: MULTIRUN
+#   sweeper:
+#     # no grid_params, no list_params: just ablative (explicit) jobs
+#     ablative_params:
+#       - exp.loss_type: penalty
+#         exp.loss_alpha: 1
+#       - exp.loss_type: penalty
+#         exp.loss_alpha: 10
+#       - exp.loss_type: penalty
+#         exp.loss_alpha: 100
+#       - exp.loss_type: l2
+#         exp.loss_alpha: 1
+#         exp.tol: 0.5
+#       - exp.loss_type: l2
+#         exp.loss_alpha: 10
+#         exp.tol: 0.5
+#       - exp.loss_type: l2
+#         exp.loss_alpha: 100
+#         exp.tol: 0.5
+#       - exp.loss_type: l2
+#         exp.loss_alpha: 1
+#         exp.tol: 5
+#       - exp.loss_type: l2
+#         exp.loss_alpha: 10
+#         exp.tol: 5
+#       - exp.loss_type: l2
+#         exp.loss_alpha: 100
+#         exp.tol: 5
+#       - exp.loss_type: dual
+#         exp.dual_lr: 1
+#       - exp.loss_type: dual
+#         exp.dual_lr: 10
+#       - exp.loss_type: dual
+#         exp.dual_lr: 100
 train:
   seed: 42
   output_dir: "./outputs/safe/run-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.tol}"
@@ -60,11 +62,11 @@ train:
     repeat: 1
     output_dir: "log/safe/profiler"
   hf_args:
-    per_device_train_batch_size: 64
-    per_device_eval_batch_size: 64
-    gradient_accumulation_steps: 1
-    eval_accumulation_steps: 1
-    num_train_epochs: 6
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 8
+    eval_accumulation_steps: 8
+    num_train_epochs: 4
     learning_rate: 5e-6
     lr_scheduler_type: "linear"
     warmup_ratio: 0.1
