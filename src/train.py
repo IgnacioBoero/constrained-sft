@@ -22,7 +22,14 @@ def is_global_main_process() -> bool:
 def main(cfg: DictConfig):
     set_seed(cfg.train.seed)
     
-
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    
+    print("RANK", os.environ.get("RANK"),
+      "LOCAL_RANK", os.environ.get("LOCAL_RANK"),
+      "CUDA", torch.cuda.current_device())
+    
     # Initialize wandb if enabled
     if cfg.train.use_wandb and is_global_main_process():
         wandb.init(
