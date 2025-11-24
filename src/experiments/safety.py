@@ -174,6 +174,7 @@ class SAFETY(Experiment):
                 self.init_dual_vars()
                 self.precompute_answer_logprobs()
                 self.compute_metrics = self._compute_metrics ## OVERRIDE COMPUTE METRICS SO I CAN USE SELF. 
+                self.preprocess_logits_for_metrics = self._preprocess_logits_for_metrics
 
                 
             def init_dual_vars(self):
@@ -334,13 +335,22 @@ class SAFETY(Experiment):
                     return loss, outputs
                 else:
                     return loss
-                
+            
+            # REDUCE SIZE OF LOGITS AND LABELS FOR METRICS COMPUTATION
+            def _preprocess_logits_for_metrics(self, logits, labels):
+                indexes = labels  # indexes are stored in labels for metrics computation
+                samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
+                collated = self.data_collator(samples)
+                input_ids = collated['input_ids'].to(logits.device)
+                log_probs = F.log_softmax(logits, dim=-1)[:, :-1]  # size = (B, L-1, Vocab)
+                answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
+                return answer_log_probs
+            
 
             def _compute_metrics(self, pred):
-                            
+
                 logits_chunks = pred.predictions
                 idx_chunks = pred.label_ids
-
                 # ---- flatten indexes to 1D ----
                 if isinstance(idx_chunks, (list, tuple)):
                     indexes = np.concatenate([np.asarray(x) for x in idx_chunks], axis=0)
@@ -357,30 +367,28 @@ class SAFETY(Experiment):
                         x = np.asarray(x)  # (B, Lb, V)
                         Lb = x.shape[1]
                         if Lb < max_L:
-                            pad_width = ((0, 0), (0, max_L - Lb), (0, 0))
+                            pad_width = ((0, 0), (0, max_L - Lb))
                             x = np.pad(x, pad_width, mode="constant", constant_values=0.0)
                         padded.append(x)
 
                     logits = np.concatenate(padded, axis=0)  # (N, max_L, V)
                 else:
                     logits = np.asarray(logits_chunks)
-                logits = torch.tensor(logits); indexes = torch.tensor(indexes); 
+                    
+                answer_log_probs = torch.tensor(logits); indexes = torch.tensor(indexes); 
                 cfg = self.custom_cfg.exp
                 
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
                 collated = self.data_collator(samples)
-                input_ids = collated['input_ids'].to(logits.device)
-                response_mask = collated['response_mask'].to(logits.device)
-                is_constraint = collated['safe'].to(logits.device)  # size
-                precomputed_answer_log_probs = collated['baseline_logprob'].to(logits.device)
+                response_mask = collated['response_mask'].to(answer_log_probs.device)
+                is_constraint = collated['safe'].to(answer_log_probs.device)  # size
+                precomputed_answer_log_probs = collated['baseline_logprob'].to(answer_log_probs.device)
 
                 is_not_constraint = ~is_constraint
                 self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
                 self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
                 
-                log_probs = F.log_softmax(logits, dim=-1)[:, :-1]  # size = (B, L-1, Vocab)
-                answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
