@@ -27,7 +27,7 @@ train:
   wandb_project: "SAFE-cl-v1"
   run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_lr}"
   data_proportion: 1.0
-  eval_on_train: true
+  eval_on_train: false
   enable_profiler: false
   max_length: 1024
   lora:
@@ -42,7 +42,7 @@ train:
     output_dir: "log/safe/profiler"
   hf_args:
     per_device_train_batch_size: 8
-    per_device_eval_batch_size: 8
+    per_device_eval_batch_size: 32
     gradient_accumulation_steps: 8
     eval_accumulation_steps: 8
     num_train_epochs: 6
