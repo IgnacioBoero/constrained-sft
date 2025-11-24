@@ -76,37 +76,82 @@ class SAFETY(Experiment):
 
     def preprocessing_fn(self, tok, cfg):
         max_length = cfg.train.max_length
+
+        # make sure pad token exists
+        if tok.pad_token_id is None:
+            # common choice for causal LM if pad doesn't exist
+            tok.pad_token = tok.eos_token
+
+        pad_id = tok.pad_token_id
+        eos_id = tok.eos_token_id
+
         def fn(sample):
-            input_text = ' '.join((sample['instruction'], sample['input'])) if sample['input'] else sample['instruction']
+            input_text = (
+                " ".join((sample["instruction"], sample["input"]))
+                if sample["input"] else sample["instruction"]
+            )
             if not isinstance(input_text, str):
-                raise ValueError(f'Unsupported type of `input`: {type(input_text)}. Expected: str.')
+                raise ValueError(
+                    f"Unsupported type of `input`: {type(input_text)}. Expected: str."
+                )
+
             answer = sample["output"]
             prompt = format_prompt(input=input_text, eos_token=tok.eos_token)
-
             text = prompt + answer
-            
-            prompt_ids = tok(prompt, return_tensors='pt', truncation=True, max_length=max_length-1)['input_ids'][0]
-            len_prompt_ids = len(prompt_ids)
-        
-            input_ids = tok(text,  return_tensors='pt', truncation=True, max_length=max_length-1)['input_ids'][0]
-            if input_ids[-1].item() != tok.eos_token_id:
-                input_ids = torch.cat(
-                    [input_ids, torch.tensor([tok.eos_token_id], dtype=input_ids.dtype)]
-                )   
-            index = sample['index']  # Get the index for dual variable updates
-  
-            response_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-            response_mask[len_prompt_ids:] = True
 
+            # 1) tokenize prompt (no padding) to get boundary for response_mask
+            prompt_ids = tok(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                padding=False,
+                max_length=max_length - 1,   # reserve room for EOS
+            )["input_ids"][0]
+            len_prompt_ids = len(prompt_ids)
+
+            # 2) tokenize full text (no padding), truncating to max_length-1
+            input_ids = tok(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                padding=False,
+                max_length=max_length - 1,   # reserve room for EOS
+            )["input_ids"][0]
+
+            # 3) append EOS if needed (now length <= max_length)
+            if input_ids.numel() == 0 or input_ids[-1].item() != eos_id:
+                input_ids = torch.cat(
+                    [input_ids, torch.tensor([eos_id], dtype=input_ids.dtype)]
+                )
+
+
+            seq_len = input_ids.shape[0]  # length before padding (includes EOS)
+
+            # 4) pad to fixed max_length
+            if seq_len < max_length:
+                pad_len = max_length - seq_len
+                input_ids = torch.cat(
+                    [input_ids, torch.full((pad_len,), pad_id, dtype=input_ids.dtype)]
+                )
+            else:
+                input_ids = input_ids[:max_length]
+                seq_len = max_length  # for safety
+
+            # 5) response mask: True only on answer+EOS, not on prompt or padding
+            response_mask = torch.zeros(max_length, dtype=torch.bool)
+            start = min(len_prompt_ids, seq_len)   # guard if prompt got heavily truncated
+            response_mask[start:seq_len] = True    # excludes padding automatically
+
+            index = sample["index"]
+            
             return {
-                'input_ids': input_ids,
-                'safe': sample["safety_label"],
-                'response_mask': response_mask,
-                'index': index,
-                'labels': index, # AS LABELS ARE UNUSED, STORE INDEX HERE FOR METRICS COMPUTATION
+                "input_ids": input_ids,
+                "safe": sample["safety_label"],
+                "response_mask": response_mask,
+                "index": index,
+                "labels": index,  # unused, keep your trick
             }
         return fn
-
     def get_collator(self, tok):
         class SafetyCollator():
             

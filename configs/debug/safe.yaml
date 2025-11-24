@@ -12,7 +12,7 @@ train:
   data_proportion: 0.01
   eval_on_train: true
   enable_profiler: true
-  max_length: 256
+  max_length: 512
   lora:
     r: 8
     lora_alpha: 16
