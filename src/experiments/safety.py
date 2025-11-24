@@ -195,7 +195,7 @@ class SAFETY(Experiment):
                 # local tensor: full size, but this rank only writes its own indices
                 all_probs_local = torch.zeros(n_total, dtype=dtype, device=device)
 
-                # # Decide sampler: DistributedSampler if DDP, else SequentialSampler
+                # # # Decide sampler: DistributedSampler if DDP, else SequentialSampler
                 if dist.is_available() and dist.is_initialized():
                     world_size = dist.get_world_size()
                     rank = dist.get_rank()
@@ -337,12 +337,34 @@ class SAFETY(Experiment):
                 
 
             def _compute_metrics(self, pred):
-                
-        
-                logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
-                indexes = pred.label_ids
+                            
+                logits_chunks = pred.predictions
+                idx_chunks = pred.label_ids
+
+                # ---- flatten indexes to 1D ----
+                if isinstance(idx_chunks, (list, tuple)):
+                    indexes = np.concatenate([np.asarray(x) for x in idx_chunks], axis=0)
+                else:
+                    indexes = np.asarray(idx_chunks)
+
+                # ---- flatten logits to (N, L, V) with single L ----
+                if isinstance(logits_chunks, (list, tuple)):
+                    # global max length across batches (or use cfg.train.max_length)
+                    max_L = max(x.shape[1] for x in logits_chunks)
+
+                    padded = []
+                    for x in logits_chunks:
+                        x = np.asarray(x)  # (B, Lb, V)
+                        Lb = x.shape[1]
+                        if Lb < max_L:
+                            pad_width = ((0, 0), (0, max_L - Lb), (0, 0))
+                            x = np.pad(x, pad_width, mode="constant", constant_values=0.0)
+                        padded.append(x)
+
+                    logits = np.concatenate(padded, axis=0)  # (N, max_L, V)
+                else:
+                    logits = np.asarray(logits_chunks)
                 logits = torch.tensor(logits); indexes = torch.tensor(indexes); 
-                
                 cfg = self.custom_cfg.exp
                 
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
@@ -352,6 +374,7 @@ class SAFETY(Experiment):
                 response_mask = collated['response_mask'].to(logits.device)
                 is_constraint = collated['safe'].to(logits.device)  # size
                 precomputed_answer_log_probs = collated['baseline_logprob'].to(logits.device)
+
                 is_not_constraint = ~is_constraint
                 self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
                 self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
@@ -362,7 +385,6 @@ class SAFETY(Experiment):
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
                 avg_answer_log_probs = answer_log_probs / denom
-
                 avg_answer_log_ratios = avg_answer_log_probs - precomputed_answer_log_probs
                 
                 avg_answer_log_ratios_objective = avg_answer_log_ratios[is_not_constraint]
