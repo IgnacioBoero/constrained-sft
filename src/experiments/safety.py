@@ -156,7 +156,6 @@ class SAFETY(Experiment):
                         dtype=torch.float,
                     )
                     batch["baseline_logprob"] = baseline_logprob  # (B,)
-
                 return batch
         return SafetyCollator(tok.pad_token_id)
 
