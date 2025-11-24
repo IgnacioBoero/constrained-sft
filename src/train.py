@@ -63,7 +63,7 @@ def main(cfg: DictConfig):
     args = TrainingArguments(
         output_dir=cfg.train.output_dir,
         **cfg.train.hf_args,
-        include_for_metrics=['inputs','loss'],
+        # include_for_metrics=['inputs','loss'],
         report_to=["wandb"] if cfg.train.use_wandb else [],
         run_name=cfg.train.run_name if cfg.train.use_wandb else None,
         remove_unused_columns=False,
