@@ -56,3 +56,35 @@ def format_prompt(
             buffer.extend((line, eos_token))
 
     return ''.join(buffer)
+
+import math
+
+def ndcg_at_k(rank: int, k: int = 10) -> float:
+    if rank <= 0 or rank > k:
+        return 0.0
+    # IDCG for a single relevant item is 1 / log2(1 + 1) == 1
+    return 1.0 / math.log2(rank + 1)
+
+def compute_passage_lengths_from_tokens(input_ids, tok):
+    """Compute actual passage lengths from tokenized input_ids"""
+    # input_ids shape: (N*G, L) where G = 1 + num_negatives
+    # We need to compute the length of the second part (passage) for each pair
+    lengths = []
+    for i in range(input_ids.shape[0]):
+        tokens = input_ids[i]
+        
+        
+        # Find the separator token (usually [SEP] or equivalent)
+        sep_token_id = tok.sep_token_id if tok.sep_token_id is not None else tok.eos_token_id
+        
+        # Find positions of separator tokens
+        mask = (tokens == sep_token_id)
+        first_pos = mask.argmax(axis=1)
+        second_pos = (mask.cumsum(axis=1) == 2).argmax(axis=1)
+        
+        if len(first_pos) != tokens.shape[0] or len(second_pos) != tokens.shape[0]:
+            raise ValueError("Could not find two separator tokens in the input sequence.")
+    
+        passage_length = second_pos - first_pos
+        lengths += list(passage_length)
+    return lengths

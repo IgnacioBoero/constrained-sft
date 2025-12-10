@@ -2,14 +2,26 @@
 
 hydra:
   mode: MULTIRUN
+
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_tol: 0
-      exp.alpha: 0.1,0.3
+      exp.loss_type: dual,avg
+      exp.loss_tol: 0,0.3,1,3
+      exp.dual_step_size: 1,0.1,10,0.01
 
+  # This 'launcher' section is now interpreted by submitit_slurm, not BasicLauncher
   launcher:
-    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+    timeout_min: 1200           # job wall time in minutes
+    nodes: 1
+    gpus_per_node: 1           # 1 GPU per experiment
+    tasks_per_node: 1
+    cpus_per_task: 8
+    mem_gb: 128
+    partition: gpu             # your GPU partition name
+    array_parallelism: 32      # max number of concurrent jobs
+    additional_parameters:
+      gres: gpu:1              # standard Slurm way to request 1 GPU
 
   sweep:
     dir: ./multirun
@@ -21,7 +33,7 @@ train:
   do_train: true
   do_initial_eval: true
   use_wandb: true
-  wandb_project: "RERANKER-final"
+  wandb_project: "RERANKER-final-v2"
   run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   eval_on_train: true
   enable_profiler: false
@@ -29,10 +41,10 @@ train:
   data_proportion: 1.0
   size: small
   hf_args:
-    per_device_train_batch_size: 2          # ST recipe
-    per_device_eval_batch_size: 1
-    gradient_accumulation_steps: 16
-    num_train_epochs: 3                      # ST example uses 1 epoch
+    per_device_train_batch_size: 32          # ST recipe
+    per_device_eval_batch_size: 32
+    gradient_accumulation_steps: 2
+    num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 2e-5
     warmup_ratio: 0.1
     weight_decay: 0.0
@@ -42,15 +54,14 @@ train:
     save_total_limit: 1
     bf16: true
     fp16: false
-
 exp:
   name: "reranker"           # must match the key in your experiments.registry
   model_name: "answerdotai/ModernBERT-large"
   num_negatives: 9                 # Use 4 negatives to match our dataset
   max_length: 512
-  loss_type: ls                 # Options: "erm", "l2", "l1", "dual"
+  loss_type: ern                 # Options: "erm", "l2", "l1", "dual"
   loss_tol: 0.0
-  alpha: 1                       # Only used for dual loss
+  alpha: 10                       # Only used for dual loss
   dual_step_size: 0.1             # Only used for dual loss
   length_constraint: true
   ls_clamp: false

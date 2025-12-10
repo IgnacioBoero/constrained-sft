@@ -204,8 +204,7 @@ class SAFETY(Experiment):
                 return batch
         return SafetyCollator(tok.pad_token_id)
 
-    def compute_metrics(self, tok, cfg):
-        return None
+
 
 
     def get_trainer_class(self):

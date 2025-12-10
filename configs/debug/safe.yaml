@@ -46,6 +46,7 @@ train:
 exp:
   name: "safety"
   model_name: huggyllama/llama-7b
-  loss_type: penalty
+  loss_type: dual
   tol: 0.0
   loss_alpha: 1
+  dual_lr: 1e-2

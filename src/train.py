@@ -55,15 +55,18 @@ def main(cfg: DictConfig):
     cols = train_ds.column_names
 
     train_ds = train_ds.map(preprocess, remove_columns=cols)
-    eval_ds = eval_ds.map(preprocess, remove_columns=cols) 
-    complete_ds = complete_ds.map(preprocess, remove_columns=cols)
+    eval_ds = eval_ds.map(preprocess, remove_columns=cols)
+    if complete_ds is not None:
+        complete_ds = complete_ds.map(preprocess, remove_columns=cols)
     
     collator = exp.get_collator(tok)
-    metric_fn = exp.compute_metrics(tok, cfg)
+    include_for_metrics = []
+    if getattr(cfg.train, "include_inputs_for_metrics", False):
+        include_for_metrics = ['inputs','loss']
     args = TrainingArguments(
         output_dir=cfg.train.output_dir,
         **cfg.train.hf_args,
-        # include_for_metrics=['inputs','loss'],
+        include_for_metrics=include_for_metrics,
         report_to=["wandb"] if cfg.train.use_wandb else [],
         run_name=cfg.train.run_name if cfg.train.use_wandb else None,
         remove_unused_columns=False,
@@ -73,8 +76,7 @@ def main(cfg: DictConfig):
     trainer = exp.get_trainer_class()(
         model=model, args=args,
         train_dataset=train_ds, eval_dataset=eval_ds,
-        data_collator=collator, tokenizer=tok,
-        compute_metrics=metric_fn, experiment=exp,
+        data_collator=collator, tokenizer=tok, experiment=exp,
         custom_cfg=cfg, complete_dataset=complete_ds
     )
     
