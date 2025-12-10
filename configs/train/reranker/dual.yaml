@@ -1,20 +1,20 @@
 # @package _global_
 
-hydra:
-  mode: MULTIRUN
-  sweeper:
-    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
-    params:
-      exp.loss_type: dual
-      exp.loss_tol: 0, 1
-      exp.dual_step_size:  1, 10, 0.1
+# hydra:
+#   mode: MULTIRUN
+#   sweeper:
+#     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+#     params:
+#       exp.loss_type: dual
+#       exp.loss_tol: 0, 1
+#       exp.dual_step_size:  1, 10, 0.1
 
-  launcher:
-    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+#   launcher:
+#     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
 
-  sweep:
-    dir: ./multirun
-    subdir: ${hydra.job.num}
+#   sweep:
+#     dir: ./multirun
+#     subdir: ${hydra.job.num}
 
 train:
   seed: 42
@@ -26,13 +26,14 @@ train:
   run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   eval_on_train: true
   enable_profiler: false
+  include_inputs_for_metrics: true
   dropout: 0.0
   data_proportion: 1.0
   size: small
   hf_args:
-    per_device_train_batch_size: 32          # ST recipe
-    per_device_eval_batch_size: 32
-    gradient_accumulation_steps: 2
+    per_device_train_batch_size: 2          # ST recipe
+    per_device_eval_batch_size: 2
+    gradient_accumulation_steps: 32
     num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 2e-5
     warmup_ratio: 0.1
@@ -52,7 +53,7 @@ exp:
   loss_type: dual                 # Options: "erm", "l2", "l1", "dual"
   loss_tol: 0.0
   alpha: 1                       # Only used for dual loss
-  dual_step_size: 0.1             # Only used for dual loss
+  dual_step_size: 1             # Only used for dual loss
   length_constraint: true
   ls_clamp: false
   obj_type: lambda_loss        # Options: "pearson_corr", "rank_weighted_length", "spearman_corr", "top_k_length", "exp_length_penalty", "kendall_tau"

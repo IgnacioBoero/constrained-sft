@@ -23,6 +23,7 @@ train:
   do_train: true
   do_initial_eval: true
   use_wandb: true
+  include_inputs_for_metrics: true
   wandb_project: "RERANKER-final-v2"
   run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   eval_on_train: true
