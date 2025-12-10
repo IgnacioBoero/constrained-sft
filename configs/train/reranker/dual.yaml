@@ -1,20 +1,20 @@
 # @package _global_
 
-# hydra:
-#   mode: MULTIRUN
-#   sweeper:
-#     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
-#     params:
-#       exp.loss_type: dual
-#       exp.loss_tol: 0, 1
-#       exp.dual_step_size:  1, 10, 0.1
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: dual
+      exp.loss_tol: 0, 1
+      exp.dual_step_size:  1, 10, 0.1
 
-#   launcher:
-#     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
 
-#   sweep:
-#     dir: ./multirun
-#     subdir: ${hydra.job.num}
+  sweep:
+    dir: ./multirun
+    subdir: ${hydra.job.num}
 
 train:
   seed: 42

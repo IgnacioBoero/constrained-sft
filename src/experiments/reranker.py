@@ -300,7 +300,7 @@ class RERANKER(Experiment):
                     self.avg_dual = dual_avg.detach()
                     loss += (
                         dual_avg.detach()
-                        * slack.mean(dim=1)
+                        * slack
                     ).mean(dim=1)
                     # log the avg dual
                     self.log({"avg_dual_var": dual_avg.detach()})           
