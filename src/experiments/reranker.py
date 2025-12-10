@@ -372,6 +372,7 @@ class RERANKER(Experiment):
                 constraint_slacks = cfg.exp.loss_tol - (s_pos[:, None] - s_neg)  # (N, K)
                 constraint_slacks = constraint_slacks.flatten()
                 
+                epoch = self.state.epoch
                 # Flatten slacks and output table to wandb
                 if cfg.train.use_wandb:
                     import wandb
@@ -379,7 +380,7 @@ class RERANKER(Experiment):
                         table = wandb.Table(columns=["constraint_slack"])
                         for slack in constraint_slacks.tolist():
                             table.add_data(slack)
-                        wandb.log({"constraint_slacks": table})
+                        wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table})
 
                 ranks = []
                 length_weighted_scores = []
