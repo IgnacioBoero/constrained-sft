@@ -296,18 +296,18 @@ class RERANKER(Experiment):
 
                 elif cfg.loss_type == "avg":
                     dual_avg = self.avg_dual.clone()
-                    dual_avg += torch.clamp(slack.mean(), min=0.0)
+                    dual_avg = torch.clamp(dual_avg + cfg.dual_step_size * slack.mean(), min=0.0)
                     self.avg_dual = dual_avg.detach()
                     loss += (
                         dual_avg.detach()
                         * slack
                     ).mean(dim=1)
                     # log the avg dual
-                    self.log({"avg_dual_var": dual_avg.detach()})           
+                    #self.log({"avg_dual_var": dual_avg.detach()})           
 
                 elif cfg.loss_type == "dual":
                     dual_var = self.dual_vars[index].clone()
-                    dual_var += torch.clamp(2 * cfg.dual_step_size * slack, min=0.0)
+                    dual_var = torch.clamp(dual_var + cfg.dual_step_size * slack, min=0.0)
                     self.dual_vars[index] = dual_var.detach()
                     loss += (
                         dual_var.detach()
