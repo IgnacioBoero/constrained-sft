@@ -6,7 +6,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: aug_dual
-      exp.alpha: 10, 100, 1
+      exp.alpha: 1,10
       exp.loss_tol: 0, 1
       exp.dual_step_size:  1, 10, 0.1
 
@@ -33,7 +33,7 @@ train:
   size: small
   hf_args:
     per_device_train_batch_size: 8          # ST recipe
-    per_device_eval_batch_size: 2
+    per_device_eval_batch_size: 1
     gradient_accumulation_steps: 8
     num_train_epochs: 20                      # ST example uses 1 epoch
     learning_rate: 2e-5

@@ -521,7 +521,7 @@ class RERANKER(Experiment):
                     "NanoBEIR_R100_mean_ndcg@10": float(mean_ndcg10),
                     "mrr@10": float(mrr10),
                     "acc@3": float(acc_at_3),
-                    "mean_constraint_violation": abs(constraint_slacks).mean().item(),
+                    "mean_constraint_violation": constraint_slacks.mean().item(),
                     "cvar_constraint_violation": float(torch.tensor(constraint_slacks).float().kthvalue(int(0.9 * len(constraint_slacks))).values.item()),
                     "objective_value": float(obj.mean().item()),
                 }
