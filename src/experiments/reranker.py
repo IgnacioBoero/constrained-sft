@@ -290,10 +290,25 @@ class RERANKER(Experiment):
                 s_neg = logits[:, 1:]                # (B, K) 
                 slack = cfg.loss_tol -(s_pos[:, None] - s_neg)  # (B, K)
 
-                # Loss squeemes
+                # Loss schemes
+                
+                ## BASELINES
                 if cfg.loss_type == "erm":
-                    loss += (-1 * F.logsigmoid(10 * (s_pos[:, None] - s_neg) )).mean(dim=1)
+                    # Pairwise logistic (your current ERM baseline)
+                    loss += (-1 * F.logsigmoid(10 * (s_pos[:, None] - s_neg))).mean(dim=1)
 
+                elif cfg.loss_type == "hinge":
+                    # Pairwise hinge loss: max(0, margin - (s_pos - s_neg))
+                    # i.e. max(0, slack)
+                    margin_violation = F.relu(slack)          # (B, K)
+                    loss += margin_violation.mean(dim=1)      # (B,)
+
+                elif cfg.loss_type == "sq_hinge":
+                    # Squared hinge: max(0, margin - (s_pos - s_neg))^2
+                    margin_violation = F.relu(slack)          # (B, K)
+                    loss += (margin_violation ** 2).mean(dim=1)
+
+                ## DUALS METHODS
                 elif cfg.loss_type == "avg":
                     dual_avg = self.avg_dual.clone()
                     dual_avg = torch.clamp(dual_avg + cfg.dual_step_size * slack.mean(), min=0.0)
