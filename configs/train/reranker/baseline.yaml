@@ -6,9 +6,9 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.length_constraint: true
-      exp.loss_type: erm, hinge, sq_hinge
-      exp.loss_tol: 0, 1, 5, 10
-      train.dropout: 0.0,0.1,0.2
+      exp.loss_type: hinge, sq_hinge
+      exp.loss_tol: 0, 1, 10
+      train.dropout: 0.0,0.1
 
 
   launcher:

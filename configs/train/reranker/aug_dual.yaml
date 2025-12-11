@@ -28,7 +28,7 @@ train:
   run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   eval_on_train: true
   enable_profiler: false
-  dropout: 0.1
+  dropout: 0.0
   data_proportion: 1.0
   size: small
   hf_args:
