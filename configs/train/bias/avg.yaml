@@ -8,8 +8,8 @@ hydra:
       exp.loss_type: avg
       exp.model_name: FacebookAI/roberta-large, answerdotai/ModernBERT-large
       exp.ratio: fair, ones, reverse
-      exp.dual_step_size: 0.1, 1.0, 10.0
-      exp.tol: 0.02, 0.002, 0.0002
+      exp.dual_step_size: 0.1, 1.0
+      exp.tol: 0.02, 0.0002
       train.dropout: 0.0,0.05,0.1
 
   # Ensure sequential launching (no parallel launcher)
