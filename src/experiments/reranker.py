@@ -546,6 +546,9 @@ class RERANKER(Experiment):
                     out["length_weighted_mrr"] = float(np.mean(length_weighted_scores))
                     out["avg_top3_length"] = float(np.mean(top3_avg_lengths))
                 
+                # add dual if using avg
+                if cfg.exp.loss_type == "avg":
+                    out["avg_dual_var"] = float(self.avg_dual.detach().item())
                     
                 return out
         return CustomTrainer
