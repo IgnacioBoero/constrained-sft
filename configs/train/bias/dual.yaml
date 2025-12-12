@@ -1,0 +1,62 @@
+# @package _global_
+
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: dual
+      exp.model_name: FacebookAI/roberta-large, answerdotai/ModernBERT-large
+      exp.ratio: fair, ones, reverse
+      exp.dual_step_size: 0.1, 1.0, 10.0
+      exp.tol: 0.02, 0.002, 0.0002
+      train.dropout: 0.0,0.05,0.1
+
+  # Ensure sequential launching (no parallel launcher)
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  # Optional: get deterministic per-job folders 0,1,2,...
+  sweep:
+    dir: ./multirun
+    subdir: ${hydra.job.num}  # 0,1,2,... in the iteration order
+
+
+train:
+  seed: 42
+  output_dir: "outputs/bias/${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
+  do_train: true
+  do_initial_eval: true
+  use_wandb: true
+  include_inputs_for_metrics: true
+  wandb_project: "BIAS-final-v2"
+  run_name: "bias-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
+  eval_on_train: true
+  enable_profiler: false
+  dropout: 0.0
+  data_proportion: 1.0
+  size: small
+  hf_args:
+    per_device_train_batch_size: 16          # ST recipe
+    per_device_eval_batch_size: 16
+    gradient_accumulation_steps: 4
+    num_train_epochs: 20                      # ST example uses 1 epoch
+    learning_rate: 2e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.0
+    lr_scheduler_type: "linear"
+    eval_strategy: "epoch"
+    save_strategy: "epoch"
+    save_total_limit: 1
+    bf16: true
+    fp16: false
+
+exp:
+  name: "bias"
+  loss_alpha: 10
+  loss_type: dual
+  model_name: FacebookAI/roberta-large
+  ratio: reverse # Options: "fair", "ones"
+  tol: 0.0
+  dual_step_size: 0.1

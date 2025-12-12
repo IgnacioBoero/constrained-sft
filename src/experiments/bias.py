@@ -24,9 +24,7 @@ class BIAS(Experiment):
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
-        model.config.loss_alpha = cfg.exp.loss_alpha
-        model.config.loss_type = cfg.exp.loss_type
-        model.config.tol = cfg.exp.tol
+
         model.main_input_name = 'probs'
         return model, tok
 
@@ -34,10 +32,7 @@ class BIAS(Experiment):
         # Load and shuffle the full datasets first
         tr = load_dataset("iboero16/winogrande_bias", split="train").shuffle(seed=cfg.train.seed)
         ev = load_dataset("iboero16/winogrande_bias", split="eval").shuffle(seed=cfg.train.seed)
-        
-        # if cfg.exp.loss_type == "erm":
-        #     tr = tr.filter(lambda s: not s["gender_bias"])
-        #     ev = ev.filter(lambda s: not s["gender_bias"])
+
         # Take the required proportion after shuffling
         tr_size = int(cfg.train.data_proportion * len(tr))
         ev_size = int(cfg.train.data_proportion * len(ev))
@@ -48,7 +43,7 @@ class BIAS(Experiment):
         tr = tr.add_column("index", list(range(len(tr))))
         ev = ev.add_column("index", list(range(len(ev))))
         print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
-        return tr, ev
+        return tr, ev, None
 
     def preprocessing_fn(self, tok, cfg):
         def fn(sample):
@@ -140,63 +135,23 @@ class BIAS(Experiment):
                 }
         return ClassificationBiasCollator(tok.pad_token_id)
 
-    def compute_metrics(self, tok, cfg):
-        def metric_fn(pred):
-            logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
-            labels = pred.label_ids
-            loss = pred.losses
-            probs = pred.inputs
-            logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); probs = torch.tensor(probs)
-            is_constraint = probs != -1.0
-            log_probs = F.log_softmax(logits, dim=-1)
-            correct_log_probs = log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)
-            incorrect_log_probs = log_probs.gather(1, (1 - labels).reshape(-1, 1)).squeeze(1)
-
-            constraint_slacks = probs * (torch.log(probs) - correct_log_probs) + (1 - probs) * (torch.log(1 - probs) - incorrect_log_probs)  # KL divergence
-            constraint_slacks = constraint_slacks[is_constraint]  # Only keep constraint samples
-            metric_constraints = torch.abs(probs - torch.exp(correct_log_probs))[is_constraint]
-            objective = -1 * log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)[~is_constraint]
-            acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
-            bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
-
-            # Log table with constraint slacks for wandb
-            rank = int(os.environ.get("RANK", "0"))
-            if cfg.train.use_wandb and rank == 0:
-                import wandb
-                if wandb.run is not None:
-                    table_metrics = wandb.Table(columns=["constraint_slack", "metric_constraint"])
-                    for slack, metric in zip(constraint_slacks.tolist(), metric_constraints.tolist()):
-                        table_metrics.add_data(slack, metric)
-                    wandb.log({"constraint_slacks_metrics": table_metrics})
-                # Add histogram of constraint slacks
-                wandb.log({"constraint_slacks_histogram": wandb.Histogram(constraint_slacks.cpu().numpy())})
-                wandb.log({"metric_constraints_histogram": wandb.Histogram(metric_constraints.cpu().numpy())})
-
-            return {"accuracy": acc,
-                    "bias_accuracy": bias,
-                    "loss": loss.mean().item(),
-                    "objective": objective.mean().item(), 
-                    "mean_dkl_violation": constraint_slacks.mean().item(),
-                    "min_dkl_violation": constraint_slacks.min().item(),
-                    "max_dkl_violation": constraint_slacks.max().item(),
-                    "mean_metric_constraint": metric_constraints.mean().item(),
-                    "min_metric_constraint": metric_constraints.min().item(),
-                    "max_metric_constraint": metric_constraints.max().item()
-                    }
-        return metric_fn
 
 
     def get_trainer_class(self):
         class CustomTrainer(Trainer):
-            def __init__(self, *args, experiment=None, dual_vars=None, **kwargs):
+            def __init__(self, *args, experiment=None,complete_dataset=None, tokenizer=None, custom_cfg=None, eval=False, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.experiment = experiment
+                self.tok = tokenizer
                 self.init_dual_vars()
-                
+                self.compute_metrics = self._compute_metrics
+                self.custom_cfg = custom_cfg
+
         
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros(len(self.train_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
+                self.avg_dual = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
 
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 """Loss function for the bias classification algorithm using Multiple Choice.
@@ -210,7 +165,7 @@ class BIAS(Experiment):
                     dict[str, torch.Tensor]: loss, objective, constraint_value
                 """
                 core_model = extract_model_from_parallel(model)
-                cfg = core_model.config
+                cfg = self.custom_cfg.exp
                 
                 input_ids = inputs['input_ids']  # size = (B, 2, L)
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
@@ -222,8 +177,7 @@ class BIAS(Experiment):
                 is_not_constraint = ~is_constraint
                 index = inputs['index']  # size = (B,)
                 dual_var = self.dual_vars[index].clone()  # Get dual variable for the current batch
-                epoch = self.state.epoch if self.state.epoch is not None else 0.0
-                epoch_idx = int(epoch + 1e-9) + 1 # integer epoch index
+
                 # Get model outputs - for multiple choice, input shape should be (B, 2, L)
                 outputs = model(
                     input_ids=input_ids,
@@ -243,87 +197,91 @@ class BIAS(Experiment):
                 # For constraint samples, we want the probabilities to be equal (difference = 0)
                 # For non-constraint samples, we want correct to have higher probability
                 slack = (dkl - cfg.tol) * is_constraint.float()  # constraint violation
+                loss = -1 * correct_log_probs * is_not_constraint.float() # objective
 
-                if is_not_constraint.any():
-                    loss = -correct_log_probs[is_not_constraint]
-                else:
-                    loss = torch.tensor(0.0, device=correct_log_probs.device, requires_grad=True)
                 
                 # Add constraint penalization
                 if cfg.loss_type == "erm":
                     pass
-                elif cfg.loss_type == "l2":
-                    loss += (
-                        cfg.loss_alpha
-                        / 2
-                        * slack ** 2
-                    ).sum()
+                
+                elif cfg.loss_type == "avg":
+                        dual_avg = self.avg_dual.clone()
+                        dual_avg = torch.clamp(dual_avg + cfg.dual_step_size * slack.mean(), min=0.0)
+                        self.avg_dual = dual_avg.detach()
+                        loss += (
+                            dual_avg.detach()
+                            * slack
+                        )
+                        # log the avg dual
 
-                elif cfg.loss_type == "l1":
-                    loss += (
-                        cfg.loss_alpha
-                        / 2
-                        * slack.abs()
-                    ).sum()
-                elif cfg.loss_type == "dual_res":
-                    # Update duals before computing the loss
-                    dual_var += -1 * dual_var + 2 * cfg.loss_alpha * (slack)
-                    self.dual_vars[index] = dual_var
-                    loss += (
-                        dual_var
-                        * slack
-                    ).sum()
-                elif cfg.loss_type == "dual":                   
-                    dual_var += 2 * cfg.loss_alpha * slack
-                    dual_var = torch.clamp(dual_var, min=0.0)
-                    self.dual_vars[index] = dual_var.detach()  
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                    ).sum()
-                elif cfg.loss_type == "dual_aug_l2":
-                    dual_var += cfg.loss_alpha * slack
-                    dual_var = torch.clamp(dual_var, min=0.0)
-                    self.dual_vars[index] = dual_var.detach()  
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                        + (cfg.loss_alpha / 2) * slack ** 2
-                    ).sum()
-                elif cfg.loss_type == "dual_aug_l1":
-                    dual_var += cfg.loss_alpha * slack
-                    dual_var = torch.clamp(dual_var, min=0.0)
-                    self.dual_vars[index] = dual_var.detach()  
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                        + (cfg.loss_alpha / 2) * slack.abs()
-                    ).sum()         
-                elif cfg.loss_type == "dual_aug_l2_increase":
-                    loss_alpha = cfg.loss_alpha * 2 ** epoch_idx
-                    dual_var += loss_alpha * slack
-                    dual_var = torch.clamp(dual_var, min=0.0)
+                elif cfg.loss_type == "dual":
+                    dual_var = self.dual_vars[index].clone()
+                    dual_var = torch.clamp(dual_var + cfg.dual_step_size * slack, min=0.0)
                     self.dual_vars[index] = dual_var.detach()
                     loss += (
                         dual_var.detach()
                         * slack
-                        + (loss_alpha / 2) * slack ** 2
-                    ).sum()
-                elif cfg.loss_type == "dual_aug_l1_increase":
-                    loss_alpha = cfg.loss_alpha * 2 ** epoch_idx
-                    dual_var += loss_alpha * slack
-                    dual_var = torch.clamp(dual_var, min=0.0)
+                    )
+
+                elif cfg.loss_type == "aug_dual":
+                    dual_var = self.dual_vars[index].clone()
+                    a = slack
+                    b = dual_var / (cfg.loss_alpha)
+                    z = 2 * a + b
+                    dual_grad = torch.where(z > 0, a, -0.5 * b)
+                    dual_var += cfg.dual_step_size * dual_grad
                     self.dual_vars[index] = dual_var.detach()
-                    loss += (
-                        dual_var.detach()
-                        * slack
-                        + (loss_alpha / 2) * slack.abs()
-                    ).sum()
-                    
+                    loss += cfg.loss_alpha / 4 * (
+                        torch.clamp(z, min=0.0)**2 - b**2
+                    )
+                                  
                 loss = loss.mean()
                 
                 if return_outputs:
                     return loss, outputs
                 else:
                     return loss
+                
+            def _compute_metrics(self,pred):
+                cfg = self.custom_cfg
+                logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+                labels = pred.label_ids
+                loss = pred.losses
+                probs = pred.inputs
+                logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); probs = torch.tensor(probs)
+                is_constraint = probs != -1.0
+                log_probs = F.log_softmax(logits, dim=-1)
+                correct_log_probs = log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)
+                incorrect_log_probs = log_probs.gather(1, (1 - labels).reshape(-1, 1)).squeeze(1)
+                epoch = self.state.epoch
+
+                constraint_slacks = probs * (torch.log(probs) - correct_log_probs) + (1 - probs) * (torch.log(1 - probs) - incorrect_log_probs)  # KL divergence
+                constraint_slacks = constraint_slacks[is_constraint]  # Only keep constraint samples
+                metric_constraints = torch.abs(probs - torch.exp(correct_log_probs))[is_constraint]
+                objective = -1 * log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)[~is_constraint]
+                acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
+                bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
+
+                # Log table with constraint slacks for wandb
+                rank = int(os.environ.get("RANK", "0"))
+                if cfg.train.use_wandb and rank == 0:
+                    import wandb
+                    if wandb.run is not None:
+                        table_metrics = wandb.Table(columns=["constraint_slack", "metric_constraint"])
+                        for slack, metric in zip(constraint_slacks.tolist(), metric_constraints.tolist()):
+                            table_metrics.add_data(slack, metric)
+                        wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table_metrics})
+                    # Add histogram of constraint slacks
+                    wandb.log({f"constraint_slacks_histogram_epoch_{epoch}_{self._current_eval_prefix}": wandb.Histogram(constraint_slacks.cpu().numpy())})
+                    wandb.log({f"metric_constraints_histogram_epoch_{epoch}_{self._current_eval_prefix}": wandb.Histogram(metric_constraints.cpu().numpy())})
+
+                return {"accuracy": acc,
+                        "bias_accuracy": bias,
+                        "loss": loss.mean().item(),
+                        "objective": objective.mean().item(), 
+                        "mean_dkl_violation": constraint_slacks.mean().item(),
+                        "cvar_dkl_violation": constraint_slacks[constraint_slacks > 0].mean().item() if (constraint_slacks > 0).any() else 0.0,
+                        "mean_metric_constraint": metric_constraints.mean().item(),
+                        "cvar_metric_constraint": metric_constraints[metric_constraints > 0].mean().item() if (metric_constraints > 0).any() else 0.0
+                        }
         return CustomTrainer
