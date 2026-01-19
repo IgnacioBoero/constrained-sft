@@ -345,34 +345,45 @@ class SAFETY(Experiment):
                 
                 avg_answer_log_ratios = avg_answer_log_probs - precomputed_answer_log_probs
                 
-                avg_answer_log_ratios_objective = avg_answer_log_ratios[is_not_constraint]
-                avg_answer_log_ratios_constraint = avg_answer_log_ratios[is_constraint]
+
                 
-                loss = -1 * avg_answer_log_ratios_objective.mean()
-                slack = cfg.tol - avg_answer_log_ratios_constraint
+                loss = -1 * avg_answer_log_ratios * is_not_constraint.float()
+                slack = cfg.tol - avg_answer_log_ratios * is_constraint.float()
 
                 if cfg.loss_type == "erm":
                     pass
-                elif cfg.loss_type == "penalty":
-                    loss += cfg.loss_alpha * slack.sum()
-                elif cfg.loss_type == "l2":
-                    loss += (
-                        cfg.loss_alpha / 2
-                        * torch.clamp(slack, min=0.0) ** 2
-                    ).sum()
-                elif cfg.loss_type == "dual":                   
-                    dual_var = torch.clamp(dual_var + 2 * cfg.dual_lr * slack, min=0.0)
-                    self.dual_vars[index_constraints] = dual_var.detach()  
+                elif cfg.loss_type == "avg":
+                        dual_avg = self.avg_dual.clone()
+                        dual_avg = torch.clamp(dual_avg + cfg.dual_step_size * slack.mean(), min=0.0)
+                        self.avg_dual = dual_avg.detach()
+                        loss += (
+                            dual_avg.detach()
+                            * slack
+                        )
+                        # log the avg dual
+
+                elif cfg.loss_type == "dual":
+                    dual_var = self.dual_vars[index].clone()
+                    dual_var = torch.clamp(dual_var + cfg.dual_step_size * slack, min=0.0)
+                    self.dual_vars[index] = dual_var.detach()
                     loss += (
                         dual_var.detach()
                         * slack
-                    ).sum()
-                elif cfg.loss_type == "aug_dual":                   
-                    dual_var += 1/2 * torch.clamp(2*slack + (dual_var / cfg.loss_alpha), min=0) - 1/2 * (dual_var / cfg.loss_alpha)
-                    self.dual_vars[index_constraints] = dual_var.detach()  
-                    loss += cfg.loss_alpha * (
-                        (torch.clamp(2*slack + (dual_var / cfg.loss_alpha), min=0)**2 - (dual_var / cfg.loss_alpha)**2) / 4
-                    ).sum()
+                    )
+
+                elif cfg.loss_type == "aug_dual":
+                    dual_var = self.dual_vars[index].clone()
+                    a = slack
+                    b = dual_var / (cfg.loss_alpha)
+                    z = 2 * a + b
+                    dual_grad = torch.where(z > 0, a, -0.5 * b)
+                    dual_var += cfg.dual_step_size * dual_grad
+                    self.dual_vars[index] = dual_var.detach()
+                    loss += cfg.loss_alpha / 4 * (
+                        torch.clamp(z, min=0.0)**2 - b**2
+                    )
+                    
+                    
                 loss = loss.mean()
                 
                 if return_outputs:
