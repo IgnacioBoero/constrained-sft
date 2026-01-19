@@ -297,16 +297,16 @@ class RERANKER(Experiment):
                     # Pairwise logistic (your current ERM baseline)
                     loss += (-1 * F.logsigmoid(10 * (s_pos[:, None] - s_neg))).mean(dim=1)
 
-                elif cfg.loss_type == "hinge":
-                    # Pairwise hinge loss: max(0, margin - (s_pos - s_neg))
-                    # i.e. max(0, slack)
-                    margin_violation = F.relu(slack)          # (B, K)
-                    loss += margin_violation.mean(dim=1)      # (B,)
+                # elif cfg.loss_type == "hinge":
+                #     # Pairwise hinge loss: max(0, margin - (s_pos - s_neg))
+                #     # i.e. max(0, slack)
+                #     margin_violation = F.relu(slack)          # (B, K)
+                #     loss += margin_violation.mean(dim=1)      # (B,)
 
-                elif cfg.loss_type == "sq_hinge":
-                    # Squared hinge: max(0, margin - (s_pos - s_neg))^2
-                    margin_violation = F.relu(slack)          # (B, K)
-                    loss += (margin_violation ** 2).mean(dim=1)
+                # elif cfg.loss_type == "sq_hinge":
+                #     # Squared hinge: max(0, margin - (s_pos - s_neg))^2
+                #     margin_violation = F.relu(slack)          # (B, K)
+                #     loss += (margin_violation ** 2).mean(dim=1)
 
                 ## DUALS METHODS
                 elif cfg.loss_type == "avg":
@@ -341,6 +341,13 @@ class RERANKER(Experiment):
                         torch.clamp(z, min=0.0)**2 - b**2
                     ).mean(dim=1)
                 
+                
+                elif cfg.loss_type == "l2":
+                    loss += cfg.loss_alpha / 2 * (torch.clamp(slack,min=0.0) ** 2)
+                    
+                elif cfg.loss_type == "penalty":
+                    loss += cfg.loss_alpha * slack 
+                    
                 loss = loss.mean()
                 
                 if return_outputs:

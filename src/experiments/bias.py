@@ -234,6 +234,12 @@ class BIAS(Experiment):
                     loss += cfg.loss_alpha / 4 * (
                         torch.clamp(z, min=0.0)**2 - b**2
                     )
+                
+                elif cfg.loss_type == "l2":
+                    loss += cfg.loss_alpha / 2 * (torch.clamp(slack,min=0.0) ** 2)
+                    
+                elif cfg.loss_type == "penalty":
+                    loss += cfg.loss_alpha * slack 
                                   
                 loss = loss.mean()
                 
