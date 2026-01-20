@@ -343,10 +343,10 @@ class RERANKER(Experiment):
                 
                 
                 elif cfg.loss_type == "l2":
-                    loss += cfg.alpha / 2 * (torch.clamp(slack,min=0.0) ** 2)
+                    loss += cfg.alpha / 2 * (torch.clamp(slack,min=0.0) ** 2).mean(dim=1)
                     
                 elif cfg.loss_type == "penalty":
-                    loss += cfg.alpha * slack 
+                    loss += cfg.alpha * slack.mean(dim=1)
                     
                 loss = loss.mean()
                 
