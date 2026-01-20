@@ -9,9 +9,8 @@ hydra:
       exp.model_name: FacebookAI/roberta-large
       exp.ratio: fair
       exp.loss_alpha: 10, 100, 1
+      train.dropout: 0.05,0.1, 0.0
       exp.tol: 0.02, 0.0002
-      train.dropout: 0.0,0.05,0.1
-
 
   # Ensure sequential launching (no parallel launcher)
   launcher:
