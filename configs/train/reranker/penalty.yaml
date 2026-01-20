@@ -6,7 +6,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: penalty
-      exp.loss_tol: 1,5,10,0
+      exp.alpha: 1,10, 100, 1000
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -26,7 +26,7 @@ train:
   run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   eval_on_train: true
   enable_profiler: false
-  dropout: 0.0
+  dropout: 0.05
   data_proportion: 1.0
   size: small
   hf_args:

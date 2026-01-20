@@ -6,9 +6,8 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: aug_dual
-      exp.alpha: 1,10
-      exp.loss_tol: 0, 1
-      exp.dual_step_size:  1, 10, 0.1
+      exp.loss_tol: 1,5,0
+      exp.dual_step_size:  1, 0.1, 10
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
