@@ -285,8 +285,8 @@ class SAFETY(Experiment):
                         ).squeeze(-1)                                    # (B, L-1)
                         answer_log_probs = answer_log_probs * response_mask[:, 1:]
                         answer_log_probs = answer_log_probs.sum(dim=-1)  # (B,)
-                        denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                        answer_log_probs = answer_log_probs / denom      # average log-prob
+                        # denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                        # answer_log_probs = answer_log_probs / denom      # average log-prob
 
                         all_probs_local[index] = answer_log_probs
 
@@ -340,15 +340,15 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
-                denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                avg_answer_log_probs = answer_log_probs / denom
+                # denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                # avg_answer_log_probs = answer_log_probs / denom
                 
-                avg_answer_log_ratios = avg_answer_log_probs - precomputed_answer_log_probs
+                answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
                 
 
                 
-                loss = -1 * avg_answer_log_ratios * is_not_constraint.float()
-                slack = cfg.tol - avg_answer_log_ratios * is_constraint.float()
+                loss = -1 * answer_log_ratios * is_not_constraint.float()
+                slack = cfg.tol - answer_log_ratios * is_constraint.float()
 
                 if cfg.loss_type == "erm":
                     pass
@@ -451,28 +451,28 @@ class SAFETY(Experiment):
                 
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
-                denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                avg_answer_log_probs = answer_log_probs / denom
-                avg_answer_log_ratios = avg_answer_log_probs - precomputed_answer_log_probs
+                # denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                # avg_answer_log_probs = answer_log_probs / denom
+                answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
                 
-                avg_answer_log_ratios_objective = avg_answer_log_ratios[is_not_constraint]
-                avg_answer_log_ratios_constraint = avg_answer_log_ratios[is_constraint]
+                answer_log_ratios_objective = answer_log_ratios[is_not_constraint]
+                answer_log_ratios_constraint = answer_log_ratios[is_constraint]
                 
                 if is_constraint.sum() == 0:
-                    avg_answer_log_ratios_constraint = torch.tensor([0.0], device=avg_answer_log_ratios.device)
+                    answer_log_ratios_constraint = torch.tensor([0.0], device=answer_log_ratios.device)
                     self._last_constraint_indexes = torch.tensor([0], dtype=torch.long)
                     
                 
-                objective = -1 * avg_answer_log_ratios_objective.mean().item()
-                constraint_mean = avg_answer_log_ratios_constraint.mean().item()
-                constrain_min = avg_answer_log_ratios_constraint.min().item()
-                constrain_max = avg_answer_log_ratios_constraint.max().item()
-                contriant_cvar = avg_answer_log_ratios_constraint[avg_answer_log_ratios_constraint > np.quantile(avg_answer_log_ratios_constraint.cpu().numpy(), 0.9)].mean().item()
+                objective = -1 * answer_log_ratios_objective.mean().item()
+                constraint_mean = answer_log_ratios_constraint.mean().item()
+                constrain_min = answer_log_ratios_constraint.min().item()
+                constrain_max = answer_log_ratios_constraint.max().item()
+                contriant_cvar = answer_log_ratios_constraint[answer_log_ratios_constraint > np.quantile(answer_log_ratios_constraint.cpu().numpy(), 0.9)].mean().item()
                 
-                slacks = cfg.tol - avg_answer_log_ratios_constraint
+                slacks = cfg.tol - answer_log_ratios_constraint
                 
                 self._last_constraint_slacks = slacks.detach().cpu()
-                self._last_objective_ratios = avg_answer_log_ratios_objective.detach().cpu()
+                self._last_objective_ratios = answer_log_ratios_objective.detach().cpu()
                 
                 return {
                     "objective": objective,
