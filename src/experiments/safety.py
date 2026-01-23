@@ -347,7 +347,7 @@ class SAFETY(Experiment):
                 
 
                 
-                loss = -1 * answer_log_ratios * is_not_constraint.float()
+                loss = -1 * answer_log_probs * is_not_constraint.float()
                 slack = cfg.tol - answer_log_ratios * is_constraint.float()
 
                 if cfg.loss_type == "erm":
