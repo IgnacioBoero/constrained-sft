@@ -351,7 +351,7 @@ class SAFETY(Experiment):
                 slack = cfg.tol - answer_log_ratios * is_constraint.float()
 
                 if cfg.loss_type == "erm":
-                    pass
+                    loss = -1 * answer_log_probs
                 elif cfg.loss_type == "avg":
                         dual_avg = self.avg_dual.clone()
                         dual_avg = torch.clamp(dual_avg + cfg.dual_step_size * slack.mean(), min=0.0)
