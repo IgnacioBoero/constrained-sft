@@ -30,7 +30,7 @@ train:
   enable_profiler: false
   dropout: 0.0
   data_proportion: 1.0
-  size: small
+  size: large
   hf_args:
     per_device_train_batch_size: 8          # ST recipe
     per_device_eval_batch_size: 1
