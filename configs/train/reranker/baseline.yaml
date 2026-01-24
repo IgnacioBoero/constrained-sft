@@ -54,7 +54,7 @@ exp:
   max_length: 512
   loss_type: dual                 # Options: "erm", "l2", "l1", "dual"
   loss_tol: 0.0
-  alpha: 1                       # Only used for dual loss
+  loss_alpha: 1                       # Only used for dual loss
   dual_step_size: 0.1             # Only used for dual loss
   length_constraint: true
   ls_clamp: false

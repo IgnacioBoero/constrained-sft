@@ -235,8 +235,19 @@ class BIAS(Experiment):
                         torch.clamp(z, min=0.0)**2 - b**2
                     )
                 
-                elif cfg.loss_type == "l2":
-                    loss += cfg.loss_alpha / 2 * (torch.clamp(slack,min=0.0) ** 2)
+                elif cfg.loss_type == "resilient":
+                    dual_var = self.dual_vars[index].clone()
+                    a = slack
+                    a_resilient = slack - dual_var / 2 * (cfg.resilient_coef)
+                    b = dual_var / (cfg.loss_alpha)
+                    coef = (cfg.resilient_coef) / (cfg.loss_alpha + cfg.resilient_coef) 
+                    z = 2 * a + b
+                    dual_grad = torch.where(z > 0, coef * a_resilient , -0.5 * b)
+                    dual_var += cfg.dual_step_size * dual_grad
+                    self.dual_vars[index] = dual_var.detach()
+                    loss += cfg.loss_alpha / 4 * (
+                        coef * torch.clamp(z, min=0.0)**2 - b**2
+                    )   
                     
                 elif cfg.loss_type == "penalty":
                     loss += cfg.loss_alpha * slack 

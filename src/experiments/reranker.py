@@ -332,21 +332,31 @@ class RERANKER(Experiment):
                 elif cfg.loss_type == "aug_dual":
                     dual_var = self.dual_vars[index].clone()
                     a = slack
-                    b = dual_var / (cfg.alpha)
+                    b = dual_var / (cfg.loss_alpha)
                     z = 2 * a + b
                     dual_grad = torch.where(z > 0, a, -0.5 * b)
                     dual_var += cfg.dual_step_size * dual_grad
                     self.dual_vars[index] = dual_var.detach()
-                    loss += cfg.alpha / 4 * (
+                    loss += cfg.loss_alpha / 4 * (
                         torch.clamp(z, min=0.0)**2 - b**2
                     ).mean(dim=1)
                 
-                
-                elif cfg.loss_type == "l2":
-                    loss += cfg.alpha / 2 * (torch.clamp(slack,min=0.0) ** 2).mean(dim=1)
+                elif cfg.loss_type == "resilient":
+                    dual_var = self.dual_vars[index].clone()
+                    a = slack
+                    a_resilient = slack - dual_var / 2 * (cfg.resilient_coef)
+                    b = dual_var / (cfg.loss_alpha)
+                    coef = (cfg.resilient_coef) / (cfg.loss_alpha + cfg.resilient_coef) 
+                    z = 2 * a + b
+                    dual_grad = torch.where(z > 0, coef * a_resilient , -0.5 * b)
+                    dual_var += cfg.dual_step_size * dual_grad
+                    self.dual_vars[index] = dual_var.detach()
+                    loss += cfg.loss_alpha / 4 * (
+                        coef * torch.clamp(z, min=0.0)**2 - b**2
+                    ).mean(dim=1)
                     
                 elif cfg.loss_type == "penalty":
-                    loss += cfg.alpha * slack.mean(dim=1)
+                    loss += cfg.loss_alpha * slack.mean(dim=1)
                     
                 loss = loss.mean()
                 
