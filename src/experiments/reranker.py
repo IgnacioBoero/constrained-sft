@@ -36,12 +36,20 @@ class RERANKER(Experiment):
         else:
             name = cfg.exp.model_name
         configuration = AutoConfig.from_pretrained(name)
-        # Set a 1-dim regression head (score)
+        # # Set a 1-dim regression head (score)
         configuration.num_labels = 1
         configuration.problem_type = "regression"
-        configuration.attention_dropout = cfg.train.dropout
-        configuration.mlp_dropout = cfg.train.dropout
-        configuration.classifier_dropout = cfg.train.dropout
+        # configuration.attention_dropout = cfg.train.dropout
+        # configuration.mlp_dropout = cfg.train.dropout
+        # configuration.classifier_dropout = cfg.train.dropout
+        if cfg.exp.model_name == "answerdotai/ModernBERT-large":
+            configuration.attention_dropout = cfg.train.dropout
+            configuration.mlp_dropout = cfg.train.dropout
+            configuration.classifier_dropout = cfg.train.dropout
+        elif cfg.exp.model_name == "FacebookAI/roberta-large":
+            configuration.hidden_dropout_prob = cfg.train.dropout
+            configuration.attention_probs_dropout_prob = cfg.train.dropout
+            configuration.classifier_dropout = cfg.train.dropout
         model = AutoModelForSequenceClassification.from_pretrained(name, config=configuration)
         tok = AutoTokenizer.from_pretrained(name)
         
