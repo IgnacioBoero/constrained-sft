@@ -5,9 +5,9 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
+      exp.dual_step_size: 0.1
       exp.loss_type: avg
-      exp.loss_tol: 1,5,0
-      exp.dual_step_size:  1, 0.1, 10
+      exp.loss_tol: 10,100
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -21,20 +21,20 @@ train:
   output_dir: "outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   do_train: true
   do_initial_eval: true
-  include_inputs_for_metrics: true
   use_wandb: true
+  include_inputs_for_metrics: true
   wandb_project: "RERANKER-final-v2"
   run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   eval_on_train: true
   enable_profiler: false
   dropout: 0.05
   data_proportion: 1.0
-  size: small
+  size: large
   hf_args:
     per_device_train_batch_size: 8          # ST recipe
     per_device_eval_batch_size: 1
     gradient_accumulation_steps: 8
-    num_train_epochs: 20                      # ST example uses 1 epoch
+    num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 2e-5
     warmup_ratio: 0.1
     weight_decay: 0.0
@@ -47,11 +47,11 @@ train:
 
 exp:
   name: "reranker"           # must match the key in your experiments.registry
-  model_name: "answerdotai/ModernBERT-large"
+  model_name: "answerdotai/ModernBERT-base"
   num_negatives: 9                 # Use 4 negatives to match our dataset
   max_length: 512
   loss_type: avg                 # Options: "erm", "l2", "l1", "dual"
-  loss_tol: 1.0
+  loss_tol: 10.0
   loss_alpha: 1                       # Only used for dual loss
   dual_step_size: 0.1             # Only used for dual loss
   length_constraint: true
@@ -59,3 +59,4 @@ exp:
   obj_type: lambda_loss        # Options: "pearson_corr", "rank_weighted_length", "spearman_corr", "top_k_length", "exp_length_penalty", "kendall_tau"
   top_k: 3                      # Only used for top_k_length objective
   k_lambda: 3
+  resilient_coef: 1.0
