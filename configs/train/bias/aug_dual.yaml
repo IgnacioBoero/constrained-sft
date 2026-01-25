@@ -51,7 +51,7 @@ train:
 
 exp:
   name: "bias"
-  loss_alpha: 1
+  loss_alpha: 0.01
   loss_type: aug_dual
   model_name: FacebookAI/roberta-base
   ratio: fair # Options: "fair", "ones", "reverse"
