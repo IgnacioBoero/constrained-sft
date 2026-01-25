@@ -7,7 +7,7 @@ hydra:
     params:
       exp.dual_step_size: 0.1
       exp.loss_type: avg
-      exp.loss_tol: 0.1,0.01
+      exp.loss_tol: 100
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
