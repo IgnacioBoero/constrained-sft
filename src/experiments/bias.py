@@ -267,6 +267,7 @@ class BIAS(Experiment):
                 probs = pred.inputs
                 logits = torch.tensor(logits); labels = torch.tensor(labels).long();  loss = torch.tensor(loss); probs = torch.tensor(probs)
                 is_constraint = probs != -1.0
+                is_not_constraint = ~is_constraint
                 log_probs = F.log_softmax(logits, dim=-1)
                 correct_log_probs = log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)
                 incorrect_log_probs = log_probs.gather(1, (1 - labels).reshape(-1, 1)).squeeze(1)
@@ -275,7 +276,7 @@ class BIAS(Experiment):
                 constraint_slacks = probs * (torch.log(probs) - correct_log_probs) + (1 - probs) * (torch.log(1 - probs) - incorrect_log_probs)  # KL divergence
                 constraint_slacks = constraint_slacks[is_constraint]  # Only keep constraint samples
                 metric_constraints = torch.abs(probs - torch.exp(correct_log_probs))[is_constraint]
-                objective = -1 * log_probs.gather(1, labels.reshape(-1, 1)).squeeze(1)[~is_constraint]
+                objective = -1 * correct_log_probs * is_not_constraint.float()
                 acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
                 bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
 
