@@ -6,10 +6,10 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: aug_dual
-      train.weight_decay: 0.05, 0.2
+      exp.model_name: FacebookAI/roberta-base
       train.dropout: 0.05 0.1 0.2
-      exp.model_name: FacebookAI/roberta-base, FacebookAI/roberta-large
-
+      train.hf_args.weight_decay: 0.05, 0.2
+      
   # Ensure sequential launching (no parallel launcher)
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
