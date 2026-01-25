@@ -16,9 +16,7 @@ class BIAS(Experiment):
             configuration.attention_dropout = cfg.train.dropout
             configuration.mlp_dropout = cfg.train.dropout
             configuration.classifier_dropout = cfg.train.dropout
-        elif cfg.exp.model_name == "FacebookAI/roberta-large":
-            configuration.hidden_dropout_prob = cfg.train.dropout
-            configuration.attention_probs_dropout_prob = cfg.train.dropout
+        elif cfg.exp.model_name == "FacebookAI/roberta-large" or cfg.exp.model_name == "FacebookAI/roberta-base":
             configuration.classifier_dropout = cfg.train.dropout
         model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name, config=configuration)
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name)
