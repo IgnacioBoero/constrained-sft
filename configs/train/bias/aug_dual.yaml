@@ -7,7 +7,7 @@ hydra:
     params:
       exp.loss_type: aug_dual
       exp.model_name: FacebookAI/roberta-large
-      train.dropout: 0.05 0.1 0.2
+      train.dropout: 0.05, 0.1, 0.2
       train.hf_args.weight_decay: 0.05, 0.2
       
   # Ensure sequential launching (no parallel launcher)
