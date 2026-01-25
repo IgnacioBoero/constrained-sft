@@ -8,7 +8,7 @@ hydra:
       exp.loss_type: resilient
       exp.loss_tol: 1,5
       train.dropout: 0.05, 0.1
-      exp.model_name: FacebookAI/roberta-large, answerdotai/ModernBERT-large 
+      exp.model_name: answerdotai/ModernBERT-base
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -48,7 +48,7 @@ train:
 
 exp:
   name: "reranker"           # must match the key in your experiments.registry
-  model_name: "answerdotai/ModernBERT-large"
+  model_name: "answerdotai/ModernBERT-base"
   num_negatives: 9                 # Use 4 negatives to match our dataset
   max_length: 512
   loss_type: resilient                 # Options: "erm", "l2", "l1", "dual"

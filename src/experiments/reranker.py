@@ -42,7 +42,7 @@ class RERANKER(Experiment):
         # configuration.attention_dropout = cfg.train.dropout
         # configuration.mlp_dropout = cfg.train.dropout
         # configuration.classifier_dropout = cfg.train.dropout
-        if cfg.exp.model_name == "answerdotai/ModernBERT-large":
+        if cfg.exp.model_name == "answerdotai/ModernBERT-base" or cfg.exp.model_name == "answerdotai/ModernBERT-large":
             configuration.attention_dropout = cfg.train.dropout
             configuration.mlp_dropout = cfg.train.dropout
             configuration.classifier_dropout = cfg.train.dropout
