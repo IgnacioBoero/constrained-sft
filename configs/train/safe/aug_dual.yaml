@@ -6,8 +6,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: aug_dual
-      exp.tol: 10,50,100
-      train.lora.lora_dropout: 0.0, 0.1
+      exp.tol: 10,20,50
       
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher

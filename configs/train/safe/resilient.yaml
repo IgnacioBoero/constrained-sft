@@ -7,7 +7,6 @@ hydra:
     params:
       exp.loss_type: resilient
       exp.tol: 10,50,100
-      train.lora.lora_dropout: 0.0, 0.1
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -36,14 +35,14 @@ train:
     lora_dropout: 0.05
   hf_args:
     per_device_train_batch_size: 8          # ST recipe
-    per_device_eval_batch_size: 32
+    per_device_eval_batch_size: 8
     gradient_accumulation_steps: 8
     eval_accumulation_steps: 8
     num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 5e-6
     lr_scheduler_type: "linear"
     warmup_ratio: 0.1
-    weight_decay: 0.01
+    weight_decay: 0.013
     eval_strategy: "epoch"
     save_strategy: "epoch"
     gradient_checkpointing: true
@@ -61,5 +60,4 @@ exp:
   loss_type: resilient
   tol: 0.0
   loss_alpha: 10
-  dual_step_size: 1
-  resilient_coef: 1
+  dual_step_size: 1e-2
