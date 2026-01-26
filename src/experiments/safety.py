@@ -462,9 +462,16 @@ class SAFETY(Experiment):
                 
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
-                # denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                print("EL LARGO AVERAGE DE TOKENS ES: ", denom)
+                print("EL LARGO DE RESPOENSE MASK ES: ", response_mask.shape)
+
                 # avg_answer_log_probs = answer_log_probs / denom
                 answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
+                
+                
+                print(answer_log_probs)
+                print(precomputed_answer_log_probs)
                 
                 answer_log_ratios_objective = answer_log_ratios[is_not_constraint]
                 answer_log_ratios_constraint = answer_log_ratios[is_constraint]
@@ -484,7 +491,11 @@ class SAFETY(Experiment):
                 
                 self._last_constraint_slacks = slacks.detach().cpu()
                 self._last_objective_ratios = answer_log_ratios_objective.detach().cpu()
-                
+                # if epoch % 10 == 0:
+                epoch = self.state.epoch if self.state.epoch is not None else None
+                print(epoch)
+                if int(epoch) == 10:
+                    breakpoint()
                 return {
                     "objective": objective,
                     "constraint_mean": constraint_mean,
