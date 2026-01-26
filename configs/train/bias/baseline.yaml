@@ -5,9 +5,10 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.dual_step_size: 0.1,1.0
-      exp.tol: 0.02,0.002
-      exp.loss_type: resilient, aug_dual, avg
+      exp.dual_step_size: 0.1
+      exp.tol: 0.02
+      exp.model_name: FacebookAI/roberta-base, FacebookAI/roberta-large
+      exp.loss_type: resilient, aug_dual, avg, penalty
 
   # Ensure sequential launching (no parallel launcher)
   launcher:
@@ -30,7 +31,7 @@ train:
   run_name: "bias-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
   eval_on_train: true
   enable_profiler: false
-  dropout: 0.1
+  dropout: 0.3
   data_proportion: 1.0
   size: small
   hf_args:
@@ -40,7 +41,7 @@ train:
     num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 5e-5
     warmup_ratio: 0.1
-    weight_decay: 0.0
+    weight_decay: 0.03
     lr_scheduler_type: "linear"
     eval_strategy: "epoch"
     save_strategy: "epoch"
@@ -52,8 +53,8 @@ exp:
   name: "bias"
   loss_alpha: 10
   loss_type: resilient
-  model_name: answerdotai/ModernBERT-base
+  model_name: FacebookAI/roberta-base
   ratio: fair # Options: "fair", "ones"
   tol: 0.02
-  dual_step_size: 1
+  dual_step_size: 0.1
   resilient_coef: 1.0
