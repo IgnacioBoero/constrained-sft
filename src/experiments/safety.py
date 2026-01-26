@@ -1,5 +1,7 @@
 # src/your_proj/experiments/sft_cekl.py
 import torch, torch.nn.functional as F
+import json
+from pathlib import Path
 from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer, DataCollatorWithPadding, AutoModelForMultipleChoice,RobertaForMultipleChoice, AutoConfig
 from .base import Experiment
@@ -417,6 +419,80 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
                 return answer_log_probs
             
+            def _generate_small_eval_answers(self):
+                cfg = self.custom_cfg
+                if getattr(self, "_current_eval_prefix", "eval") != "eval":
+                    return None
+
+                rank = int(os.environ.get("RANK", "0"))
+                if rank != 0:
+                    return None
+
+                tag = (self._current_eval_prefix, self.state.global_step)
+                if getattr(self, "_last_small_eval_tag", None) == tag:
+                    return None
+                self._last_small_eval_tag = tag
+
+                small_eval_path = (
+                    Path(__file__).resolve().parents[1]
+                    / "datasets/safety/evaluation/small_eval.json"
+                )
+                if not small_eval_path.exists():
+                    print(f"[small-eval] Missing file: {small_eval_path}")
+                    return None
+
+                data = json.loads(small_eval_path.read_text(encoding="utf-8"))
+                instructions = data.get("instructions", [])
+                if not instructions:
+                    print("[small-eval] No instructions found.")
+                    return None
+
+                print(f"[small-eval] Generating answers for {len(instructions)} prompts...")
+                outputs = []
+                self.model.eval()
+                for instruction in tqdm(instructions, desc="[small-eval] Generating", leave=False):
+                    prompt = format_prompt(
+                        input=instruction,
+                        eos_token=self.tokenizer.eos_token,
+                    )
+                    tokenized = self.tokenizer(prompt, return_tensors="pt")
+                    tokenized = {k: v.to(self.model.device) for k, v in tokenized.items()}
+                    with torch.no_grad():
+                        output_ids = self.model.generate(
+                            **tokenized,
+                            max_length=self.tokenizer.model_max_length,
+                        )
+                    decoded = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                    outputs.append(decoded[len(prompt):])
+                print("[small-eval] Generation complete.")
+
+                result = {"instructions": instructions, "outputs": outputs}
+
+                if cfg.train.use_wandb:
+                    import wandb
+                    if wandb.run is not None:
+                        epoch = self.state.epoch
+                        epoch_tag = f"epoch_{int(epoch)}" if epoch is not None else "epoch_unknown"
+                        table = wandb.Table(columns=["instruction", "output"])
+                        for instruction, output in zip(instructions, outputs):
+                            table.add_data(instruction, output)
+                        wandb.log({f"small_eval_outputs_{epoch_tag}": table})
+
+                        out_dir = Path(cfg.train.output_dir)
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = out_dir / f"small_eval_outputs_{epoch_tag}.json"
+                        out_path.write_text(
+                            json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+                            encoding="utf-8",
+                        )
+                        artifact = wandb.Artifact(
+                            f"small_eval_outputs_{epoch_tag}",
+                            type="small_eval_outputs",
+                        )
+                        artifact.add_file(str(out_path))
+                        wandb.log_artifact(artifact)
+
+                return result
 
             def _compute_metrics(self, pred):
 
@@ -449,6 +525,8 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.tensor(logits); indexes = torch.tensor(indexes); 
                 cfg = self.custom_cfg.exp
                 
+                self._generate_small_eval_answers()
+
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
                 collated = self.data_collator(samples)
