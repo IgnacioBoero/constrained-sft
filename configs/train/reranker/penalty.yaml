@@ -10,6 +10,7 @@ hydra:
       exp.loss_tol: 1
       train.dropout: 0.0
       exp.dual_step_size: 0.1
+      exp.model_name: answerdotai/ModernBERT-large
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
