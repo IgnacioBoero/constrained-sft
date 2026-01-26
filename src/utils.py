@@ -88,3 +88,56 @@ def compute_passage_lengths_from_tokens(input_ids, tok):
         passage_length = second_pos - first_pos
         lengths += list(passage_length)
     return lengths
+
+
+def freeze_for_mc(model, *, unfreeze_last_n_layers: int = 0, train_classifier: bool = True):
+    """
+    Freeze all params, then optionally unfreeze:
+      - classifier head
+      - last N transformer layers of the base encoder
+    """
+    # 1) freeze everything
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # 2) unfreeze classifier head (HF uses different names across models, so be flexible)
+    if train_classifier:
+        for name, p in model.named_parameters():
+            # Common head names in MultipleChoice models
+            if any(k in name for k in ["classifier", "score", "out_proj"]):
+                p.requires_grad = True
+
+    # 3) find the base encoder module inside the MC wrapper
+    base = getattr(model, "roberta", None) or getattr(model, "bert", None) or getattr(model, "deberta", None) \
+           or getattr(model, "electra", None) or getattr(model, "backbone", None) or getattr(model, "model", None)
+
+    if base is None:
+        # As a fallback, try model.base_model (HF convention)
+        base = getattr(model, "base_model", None)
+
+    if base is None:
+        raise ValueError("Couldn't locate the base encoder module inside the MultipleChoice model.")
+
+    # 4) locate the transformer layer stack
+    # RoBERTa/BERT: base.encoder.layer
+    # DeBERTa: base.encoder.layer (often)
+    layers = None
+    if hasattr(base, "encoder") and hasattr(base.encoder, "layer"):
+        layers = base.encoder.layer
+    elif hasattr(base, "encoder") and hasattr(base.encoder, "layers"):
+        layers = base.encoder.layers
+    elif hasattr(base, "transformer") and hasattr(base.transformer, "layer"):
+        layers = base.transformer.layer
+    elif hasattr(base, "layers"):
+        layers = base.layers
+
+    if layers is None:
+        raise ValueError("Couldn't locate transformer layers (encoder.layer / encoder.layers / etc.).")
+
+    # 5) unfreeze last N layers
+    if unfreeze_last_n_layers > 0:
+        for layer in list(layers)[-unfreeze_last_n_layers:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+
+    return model

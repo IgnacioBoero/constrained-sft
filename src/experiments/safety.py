@@ -195,12 +195,12 @@ class SAFETY(Experiment):
                 }
 
                 # BASELINE IS COMPUTED AFTER PRECOMPUTE STEP
-                if "baseline_logprob" in samples[0]:
-                    baseline_logprob = torch.tensor(
-                        [sample["baseline_logprob"] for sample in samples],
-                        dtype=torch.float,
-                    )
-                    batch["baseline_logprob"] = baseline_logprob  # (B,)
+                # if "baseline_logprob" in samples[0]:
+                #     baseline_logprob = torch.tensor(
+                #         [sample["baseline_logprob"] for sample in samples],
+                #         dtype=torch.float,
+                #     )
+                #     batch["baseline_logprob"] = baseline_logprob  # (B,)
                 return batch
         return SafetyCollator(tok.pad_token_id)
 
@@ -216,7 +216,7 @@ class SAFETY(Experiment):
                 self.custom_cfg = custom_cfg
                 self.complete_ds = complete_dataset
                 self.init_dual_vars()
-                self.precompute_answer_logprobs()
+                # self.precompute_answer_logprobs()
                 self.compute_metrics = self._compute_metrics ## OVERRIDE COMPUTE METRICS SO I CAN USE SELF. 
                 self.preprocess_logits_for_metrics = self._preprocess_logits_for_metrics
 
@@ -225,89 +225,89 @@ class SAFETY(Experiment):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros(len(self.train_dataset) + len(self.eval_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
 
-            def precompute_answer_logprobs(self):
-                """
-                Precompute average answer log-probs for *all* samples in complete_ds
-                in a multi-GPU safe way.
-                """
-                model = self.model
-                model.eval()
+            # def precompute_answer_logprobs(self):
+            #     """
+            #     Precompute average answer log-probs for *all* samples in complete_ds
+            #     in a multi-GPU safe way.
+            #     """
+            #     model = self.model
+            #     model.eval()
 
-                device = model.device
-                dtype = model.dtype
-                n_total = len(self.complete_ds)
+            #     device = model.device
+            #     dtype = model.dtype
+            #     n_total = len(self.complete_ds)
 
-                # local tensor: full size, but this rank only writes its own indices
-                all_probs_local = torch.zeros(n_total, dtype=dtype, device=device)
+            #     # local tensor: full size, but this rank only writes its own indices
+            #     all_probs_local = torch.zeros(n_total, dtype=dtype, device=device)
 
-                # # # Decide sampler: DistributedSampler if DDP, else SequentialSampler
-                if dist.is_available() and dist.is_initialized():
-                    world_size = dist.get_world_size()
-                    rank = dist.get_rank()
-                    sampler = DistributedSampler(
-                        self.complete_ds,
-                        num_replicas=world_size,
-                        rank=rank,
-                        shuffle=False,   # for deterministic precompute
-                        drop_last=False,
-                    )
-                else:
-                    sampler = SequentialSampler(self.complete_ds)
+            #     # # # Decide sampler: DistributedSampler if DDP, else SequentialSampler
+            #     if dist.is_available() and dist.is_initialized():
+            #         world_size = dist.get_world_size()
+            #         rank = dist.get_rank()
+            #         sampler = DistributedSampler(
+            #             self.complete_ds,
+            #             num_replicas=world_size,
+            #             rank=rank,
+            #             shuffle=False,   # for deterministic precompute
+            #             drop_last=False,
+            #         )
+            #     else:
+            #         sampler = SequentialSampler(self.complete_ds)
 
-                # Build dataloader directly
-                dataloader = DataLoader(
-                    self.complete_ds,
-                    sampler=sampler,
-                    batch_size=self.args.per_device_train_batch_size,
-                    collate_fn=self.data_collator,
-                    pin_memory=self.args.dataloader_pin_memory,
-                )
+            #     # Build dataloader directly
+            #     dataloader = DataLoader(
+            #         self.complete_ds,
+            #         sampler=sampler,
+            #         batch_size=self.args.per_device_train_batch_size,
+            #         collate_fn=self.data_collator,
+            #         pin_memory=self.args.dataloader_pin_memory,
+            #     )
 
-                desc = "Precompute answer logprobs"
-                if dist.is_available() and dist.is_initialized():
-                    desc += f" [rank {dist.get_rank()}]"
+            #     desc = "Precompute answer logprobs"
+            #     if dist.is_available() and dist.is_initialized():
+            #         desc += f" [rank {dist.get_rank()}]"
 
-                with torch.no_grad():
-                    for batch in tqdm(dataloader, desc=desc, unit="batch"):
-                        input_ids = batch["input_ids"].to(device)
-                        attention_mask = batch["attention_mask"].to(device)
-                        response_mask = batch["response_mask"].to(device)
-                        index = batch["index"].to(device)   # global indices in [0, n_total)
+            #     with torch.no_grad():
+            #         for batch in tqdm(dataloader, desc=desc, unit="batch"):
+            #             input_ids = batch["input_ids"].to(device)
+            #             attention_mask = batch["attention_mask"].to(device)
+            #             response_mask = batch["response_mask"].to(device)
+            #             index = batch["index"].to(device)   # global indices in [0, n_total)
 
-                        outputs = model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                        )
-                        logits = outputs.logits[:, :-1]                  # (B, L-1, V)
-                        log_probs = F.log_softmax(logits, dim=-1)        # (B, L-1, V)
-                        answer_log_probs = torch.gather(
-                            log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)
-                        ).squeeze(-1)                                    # (B, L-1)
-                        answer_log_probs = answer_log_probs * response_mask[:, 1:]
-                        answer_log_probs = answer_log_probs.sum(dim=-1)  # (B,)
-                        # denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                        # answer_log_probs = answer_log_probs / denom      # average log-prob
+            #             outputs = model(
+            #                 input_ids=input_ids,
+            #                 attention_mask=attention_mask,
+            #             )
+            #             logits = outputs.logits[:, :-1]                  # (B, L-1, V)
+            #             log_probs = F.log_softmax(logits, dim=-1)        # (B, L-1, V)
+            #             answer_log_probs = torch.gather(
+            #                 log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)
+            #             ).squeeze(-1)                                    # (B, L-1)
+            #             answer_log_probs = answer_log_probs * response_mask[:, 1:]
+            #             answer_log_probs = answer_log_probs.sum(dim=-1)  # (B,)
+            #             # denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+            #             # answer_log_probs = answer_log_probs / denom      # average log-prob
 
-                        all_probs_local[index] = answer_log_probs
+            #             all_probs_local[index] = answer_log_probs
 
-                # Now combine results across ranks
-                if dist.is_available() and dist.is_initialized():
-                    # each rank has non-zero entries only for its shard;
-                    # sum across ranks to get full vector on all ranks
-                    dist.all_reduce(all_probs_local, op=dist.ReduceOp.SUM)
+            #     # Now combine results across ranks
+            #     if dist.is_available() and dist.is_initialized():
+            #         # each rank has non-zero entries only for its shard;
+            #         # sum across ranks to get full vector on all ranks
+            #         dist.all_reduce(all_probs_local, op=dist.ReduceOp.SUM)
 
-                all_probs_cpu = all_probs_local.detach().cpu()
-                del all_probs_local
-                torch.cuda.empty_cache()
+            #     all_probs_cpu = all_probs_local.detach().cpu()
+            #     del all_probs_local
+            #     torch.cuda.empty_cache()
                 
-                def add_baseline(example):
-                    idx = example["index"]             # global index
-                    example["baseline_logprob"] = float(all_probs_cpu[idx])
-                    return example
-                self.complete_ds = self.complete_ds.map(add_baseline)
-                self.train_dataset = self.train_dataset.map(add_baseline)
-                self.eval_dataset  = self.eval_dataset.map(add_baseline)
-                model.train()
+            #     def add_baseline(example):
+            #         idx = example["index"]             # global index
+            #         example["baseline_logprob"] = float(all_probs_cpu[idx])
+            #         return example
+            #     self.complete_ds = self.complete_ds.map(add_baseline)
+            #     self.train_dataset = self.train_dataset.map(add_baseline)
+            #     self.eval_dataset  = self.eval_dataset.map(add_baseline)
+            #     model.train()
 
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 """Loss function for the bias classification algorithm using Multiple Choice.
@@ -325,7 +325,7 @@ class SAFETY(Experiment):
                 input_ids = inputs['input_ids']  # size = (B, 2, L)
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
                 response_mask = inputs['response_mask']  # size = (B, 2, L)
-                precomputed_answer_log_probs = inputs['baseline_logprob']  # size = (B,)
+                # precomputed_answer_log_probs = inputs['baseline_logprob']  # size = (B,)
                 is_constraint = inputs['safe']  # size = (B,)                
                 is_not_constraint = ~is_constraint
                 index = inputs['index']  # size = (B,)
@@ -340,15 +340,15 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
-                # denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                # avg_answer_log_probs = answer_log_probs / denom
+                denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                answer_log_probs = answer_log_probs / denom
                 
-                answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
+                # answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
                 
 
                 
                 loss = -1 * answer_log_probs * is_not_constraint.float()
-                slack = cfg.tol - answer_log_ratios * is_constraint.float()
+                slack = cfg.tol - answer_log_probs * is_constraint.float()
 
                 if cfg.loss_type == "erm":
                     loss = -1 * answer_log_probs
@@ -454,7 +454,7 @@ class SAFETY(Experiment):
                 collated = self.data_collator(samples)
                 response_mask = collated['response_mask'].to(answer_log_probs.device)
                 is_constraint = collated['safe'].to(answer_log_probs.device)  # size
-                precomputed_answer_log_probs = collated['baseline_logprob'].to(answer_log_probs.device)
+                # precomputed_answer_log_probs = collated['baseline_logprob'].to(answer_log_probs.device)
 
                 is_not_constraint = ~is_constraint
                 self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
@@ -462,17 +462,17 @@ class SAFETY(Experiment):
                 
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
-                # denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-
-                # avg_answer_log_probs = answer_log_probs / denom
-                answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
+                denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                answer_log_probs = answer_log_probs / denom
+                
+                # answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
                 
                 
                 answer_log_ratios_objective = answer_log_probs[is_not_constraint]
-                answer_log_ratios_constraint = answer_log_ratios[is_constraint]
+                answer_log_ratios_constraint = answer_log_probs[is_constraint]
                 
                 if is_constraint.sum() == 0:
-                    answer_log_ratios_constraint = torch.tensor([0.0], device=answer_log_ratios.device)
+                    answer_log_ratios_constraint = torch.tensor([0.0], device=answer_log_probs.device)
                     self._last_constraint_indexes = torch.tensor([0], dtype=torch.long)
                     
                 

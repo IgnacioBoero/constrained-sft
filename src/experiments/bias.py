@@ -8,6 +8,9 @@ import torch, torch.nn.functional as F
 from accelerate.utils import extract_model_from_parallel
 import numpy as np
 import os
+from utils import freeze_for_mc
+
+
 class BIAS(Experiment):
     
     def load_model_and_tok(self, cfg):
@@ -17,6 +20,7 @@ class BIAS(Experiment):
             configuration.mlp_dropout = cfg.train.dropout
             configuration.classifier_dropout = cfg.train.dropout
         elif cfg.exp.model_name == "FacebookAI/roberta-large" or cfg.exp.model_name == "FacebookAI/roberta-base":
+            
             configuration.classifier_dropout = cfg.train.dropout
         model = AutoModelForMultipleChoice.from_pretrained(cfg.exp.model_name, config=configuration)
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name)
@@ -24,6 +28,7 @@ class BIAS(Experiment):
             tok.pad_token = tok.eos_token
 
         model.main_input_name = 'probs'
+        model = freeze_for_mc(model, train_classifier=True, unfreeze_last_n_layers=cfg.train.unfreeze_last_n_layers) if cfg.train.freeze_base_model else model
         return model, tok
 
     def load_datasets(self, cfg):

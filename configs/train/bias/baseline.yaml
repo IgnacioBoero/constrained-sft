@@ -5,10 +5,11 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.dual_step_size: 0.1
-      exp.tol: 0.02
-      exp.model_name: FacebookAI/roberta-base, FacebookAI/roberta-large
-      exp.loss_type: resilient, aug_dual, avg, penalty
+      exp.loss_type: erm
+      train.unfreeze_last_n_layers: 4,2,0
+      train.dropout: 0.2, 0.4
+      train.hf_args.weight_decay: 0.03, 0.05
+      exp.model_name: FacebookAI/roberta-base, microsoft/deberta-v3-base
 
   # Ensure sequential launching (no parallel launcher)
   launcher:
@@ -34,11 +35,13 @@ train:
   dropout: 0.3
   data_proportion: 1.0
   size: small
+  freeze_base_model: true
+  unfreeze_last_n_layers: 2
   hf_args:
     per_device_train_batch_size: 16          # ST recipe
     per_device_eval_batch_size: 16
     gradient_accumulation_steps: 4
-    num_train_epochs: 10                      # ST example uses 1 epoch
+    num_train_epochs: 4                      # ST example uses 1 epoch
     learning_rate: 5e-5
     warmup_ratio: 0.1
     weight_decay: 0.03
@@ -52,7 +55,7 @@ train:
 exp:
   name: "bias"
   loss_alpha: 10
-  loss_type: resilient
+  loss_type: erm
   model_name: FacebookAI/roberta-base
   ratio: fair # Options: "fair", "ones"
   tol: 0.02
