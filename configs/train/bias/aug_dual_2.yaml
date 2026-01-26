@@ -6,7 +6,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: aug_dual
-      exp.model_name: FacebookAI/roberta-base
+      exp.model_name: FacebookAI/roberta-large
       train.dropout:  0.2,0.05
       train.hf_args.weight_decay: 0.02, 0.01
       
