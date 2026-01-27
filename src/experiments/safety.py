@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader, SequentialSampler, DistributedSampler
 import torch.distributed as dist
 from utils import format_prompt, right_padding
+from utils import DistributedWeightedRandomSampler
 
 from peft import LoraConfig, get_peft_model
 
@@ -214,6 +215,15 @@ class SAFETY(Experiment):
             
             def __init__(self, *args, custom_cfg=None,complete_dataset=None, experiment=None, dual_vars=None, **kwargs):
                 super().__init__(*args, **kwargs)
+                # IMPORTANT: With `PeftModel`, HF `Trainer` can't infer label names and will default
+                # to `label_names=[]`. That makes `prediction_step()` bypass `compute_loss()` and
+                # call `model(**inputs)` directly, which breaks here because we intentionally store
+                # dataset indexes in `labels` for metrics.
+                #
+                # By forcing `label_names=["labels"]`, evaluation/training routes through our
+                # overridden `compute_loss()` while still passing `labels` through as the index
+                # tensor for metrics (see `_preprocess_logits_for_metrics` / `_compute_metrics`).
+                self.label_names = ["labels"]
                 self.experiment = experiment
                 self.custom_cfg = custom_cfg
                 self.complete_ds = complete_dataset
@@ -221,11 +231,67 @@ class SAFETY(Experiment):
                 # self.precompute_answer_logprobs()
                 self.compute_metrics = self._compute_metrics ## OVERRIDE COMPUTE METRICS SO I CAN USE SELF. 
                 self.preprocess_logits_for_metrics = self._preprocess_logits_for_metrics
+                self._constraint_sampler_weights = None
 
                 
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros(len(self.train_dataset) + len(self.eval_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
+
+            def _build_constraint_sampler_weights(self):
+                """
+                Build a 1D tensor of sampling weights for the *train* dataset.
+
+                - constraint examples (`safe == True`) get weight = cfg.train.constraint_weighted_sampler_weight
+                - non-constraint examples get weight = 1.0
+                """
+                w = float(getattr(self.custom_cfg.train, "constraint_weighted_sampler_weight", 1.0))
+                if w <= 0:
+                    raise ValueError("train.constraint_weighted_sampler_weight must be > 0")
+
+                n = len(self.train_dataset)
+                weights = torch.ones(n, dtype=torch.double)
+
+                # Fast path for HF datasets.Dataset (column access)
+                safe_col = None
+                try:
+                    safe_col = self.train_dataset["safe"]
+                except Exception:
+                    safe_col = [self.train_dataset[i]["safe"] for i in range(n)]
+
+                safe_mask = torch.as_tensor(safe_col, dtype=torch.bool)
+                if safe_mask.numel() != n:
+                    raise ValueError(
+                        f"Unexpected 'safe' column length: got {safe_mask.numel()} expected {n}"
+                    )
+                weights[safe_mask] = w
+                return weights
+
+            def _get_train_sampler(self):
+                """
+                Override HF Trainer sampler creation to enable constraint-aware resampling.
+
+                Controlled by: cfg.train.constraint_weighted_sampler_weight (default 1.0 => disabled)
+                """
+                w = float(getattr(self.custom_cfg.train, "constraint_weighted_sampler_weight", 1.0))
+                if w == 1.0:
+                    return super()._get_train_sampler()
+
+                if self._constraint_sampler_weights is None:
+                    self._constraint_sampler_weights = self._build_constraint_sampler_weights()
+
+                # Per-rank sampler length: match what HF would do (roughly len(dataset) / world_size).
+                if dist.is_available() and dist.is_initialized():
+                    world_size = dist.get_world_size()
+                else:
+                    world_size = 1
+                per_rank_num_samples = int(np.ceil(len(self.train_dataset) / world_size))
+
+                return DistributedWeightedRandomSampler(
+                    self._constraint_sampler_weights,
+                    num_samples=per_rank_num_samples,
+                    replacement=True,
+                )
 
             # def precompute_answer_logprobs(self):
             #     """
@@ -354,6 +420,8 @@ class SAFETY(Experiment):
 
                 
                 loss = -1 * answer_log_probs * is_not_constraint.float()
+                #print("*"*20)
+                #print(is_not_constraint.float())
                 slack = (cfg.tol - answer_log_probs) * is_constraint.float()
 
                 if cfg.loss_type == "erm":
