@@ -151,7 +151,6 @@ class SAFETY(Experiment):
                 "safe": sample["safety_label"],
                 "response_mask": response_mask,
                 "index": index,
-                "labels": index,  # unused, keep your trick
             }
         return fn
     def get_collator(self, tok):
@@ -182,10 +181,6 @@ class SAFETY(Experiment):
                     [sample['index'] for sample in samples],
                     dtype=torch.long,
                 )
-                labels = torch.tensor(
-                    [sample['labels'] for sample in samples],
-                    dtype=torch.long,
-                )
 
                 batch = {
                     "input_ids": input_ids,              # (B, L)
@@ -193,7 +188,6 @@ class SAFETY(Experiment):
                     "index": index,                      # (B,)
                     "safe": safe,                        # (B,)
                     "response_mask": response_masks.bool(),
-                    "labels": labels,
                 }
 
                 # BASELINE IS COMPUTED AFTER PRECOMPUTE STEP
@@ -214,6 +208,14 @@ class SAFETY(Experiment):
             
             def __init__(self, *args, custom_cfg=None,complete_dataset=None, experiment=None, dual_vars=None, **kwargs):
                 super().__init__(*args, **kwargs)
+                # IMPORTANT:
+                # - We want eval/train to always go through our custom `compute_loss`.
+                # - We also want to pass per-sample indices through the eval loop so
+                #   `preprocess_logits_for_metrics()` can map back into `complete_ds`.
+                # Setting `label_names=["index"]` makes HF Trainer treat `index` as the
+                # "labels" tensor for evaluation bookkeeping without feeding it into
+                # the CausalLM loss.
+                self.label_names = ["index"]
                 self.experiment = experiment
                 self.custom_cfg = custom_cfg
                 self.complete_ds = complete_dataset

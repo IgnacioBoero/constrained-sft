@@ -28,7 +28,7 @@ train:
   include_inputs_for_metrics: true
   dropout: 0.0
   data_proportion: 1.0
-  max_length: 1024
+  max_length: 512
   lora:
     r: 8
     lora_alpha: 16
@@ -56,7 +56,7 @@ train:
 
 exp:
   name: "safety"
-  model_name: allenai/open-instruct-stanford-alpaca-7b
+  model_name: meta-llama/Llama-2-7b-chat-hf
   loss_type: penalty
   tol: 1
   loss_alpha: 10

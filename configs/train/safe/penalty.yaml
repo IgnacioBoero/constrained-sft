@@ -60,5 +60,5 @@ exp:
   model_name: huggyllama/llama-7b
   loss_type: penalty
   tol: 0.0
-  loss_alpha: 100
-  dual_step_size: 1e-2
+  loss_alpha: 0
+  dual_step_size: 0
