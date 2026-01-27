@@ -60,6 +60,6 @@ exp:
   model_name: huggyllama/llama-7b
   loss_type: resilient
   tol: -1.0
-  loss_alpha: 1
+  loss_alpha: 100
   dual_step_size: 0.1
   resilient_coef: 1.0
