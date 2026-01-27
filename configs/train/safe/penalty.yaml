@@ -6,7 +6,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: penalty
-      exp.loss_alpha: 0
+      exp.loss_alpha: 100,10,1000
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -40,7 +40,7 @@ train:
     gradient_accumulation_steps: 1
     eval_accumulation_steps: 8
     num_train_epochs: 7                      # ST example uses 1 epoch
-    learning_rate: 1e-2
+    learning_rate: 3e-4
     lr_scheduler_type: "constant_with_warmup"
     warmup_ratio: 0.1
     weight_decay: 0.01
