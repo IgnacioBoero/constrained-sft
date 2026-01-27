@@ -28,7 +28,6 @@ class BIAS(Experiment):
             tok.pad_token = tok.eos_token
 
         model.main_input_name = 'probs'
-        model = freeze_for_mc(model, train_classifier=True, unfreeze_last_n_layers=cfg.train.unfreeze_last_n_layers) if cfg.train.freeze_base_model else model
         return model, tok
 
     def load_datasets(self, cfg):
@@ -290,7 +289,6 @@ class BIAS(Experiment):
 
                 acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
                 bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
-
                 # Log table with constraint slacks for wandb
                 rank = int(os.environ.get("RANK", "0"))
                 if cfg.train.use_wandb and rank == 0:
