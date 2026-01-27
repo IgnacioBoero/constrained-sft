@@ -23,11 +23,11 @@ train:
   use_wandb: true
   wandb_project: "SAFE-final-v2"
   run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
-  eval_on_train: true
+  eval_on_train: false
   enable_profiler: false
   include_inputs_for_metrics: true
   dropout: 0.0
-  data_proportion: 0.01
+  data_proportion: 1.0
   max_length: 1024
   lora:
     r: 8
