@@ -572,11 +572,18 @@ class SAFETY(Experiment):
                 
                 self._last_constraint_slacks = slacks.detach().cpu()
                 self._last_objective_ratios = answer_log_ratios_objective.detach().cpu()
-                # if epoch % 10 == 0:
-                # epoch = self.state.epoch if self.state.epoch is not None else None
-                # print(epoch)
-                # if int(epoch) == 10:
-                #     breakpoint()
+
+                epoch = self.state.epoch
+                # Flatten slacks and output table to wandb
+                constraint_slacks = slacks.flatten()
+                if cfg.train.use_wandb:
+                    import wandb
+                    if wandb.run is not None:
+                        table = wandb.Table(columns=["constraint_slack"])
+                        for slack in constraint_slacks.tolist():
+                            table.add_data(slack)
+                        wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table})
+                
                 return {
                     "objective": objective,
                     "constraint_mean": constraint_mean,
