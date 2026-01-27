@@ -41,7 +41,7 @@ train:
     gradient_accumulation_steps: 8
     eval_accumulation_steps: 8
     num_train_epochs: 2                      # ST example uses 1 epoch
-    learning_rate: 5e-6
+    learning_rate: 1e-4
     lr_scheduler_type: "linear"
     warmup_ratio: 0.1
     weight_decay: 0.01
