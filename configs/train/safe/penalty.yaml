@@ -40,17 +40,17 @@ train:
     gradient_accumulation_steps: 1
     eval_accumulation_steps: 8
     num_train_epochs: 15                      # ST example uses 1 epoch
-    learning_rate: 3e-4
+    learning_rate: 1e-3
     lr_scheduler_type: "cosine"
     warmup_ratio: 0.1
-    weight_decay: 0.1
-    eval_strategy: "epoch"
-    save_strategy: "epoch"
+    weight_decay: 0.01
+    eval_strategy: "no"
+    save_strategy: "no"
     gradient_checkpointing: true
-    load_best_model_at_end: true
-    metric_for_best_model: "objective"
-    greater_is_better: true
-    save_total_limit: 1
+    # load_best_model_at_end: true
+    # metric_for_best_model: "objective"
+    # greater_is_better: true
+    # save_total_limit: 1
     eval_do_concat_batches: false
     bf16: true
     fp16: false
