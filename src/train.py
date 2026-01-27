@@ -121,7 +121,8 @@ def main(cfg: DictConfig):
             if cfg.train.do_initial_eval:
                 trainer.evaluate(metric_key_prefix="eval")
             trainer.train()
-    if cfg.train.eval_at_end:
+    eval_at_end = getattr(cfg.train, "eval_at_end", False)
+    if eval_at_end:
         trainer._current_eval_prefix = "eval"
         trainer.evaluate(metric_key_prefix="eval")
     # Finish wandb run
