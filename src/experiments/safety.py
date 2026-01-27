@@ -47,7 +47,7 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("iboero16/SAFE-ALPACA-2")
+        ds = load_dataset("iboero16/SAFE-ALPACA-3")
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
@@ -568,7 +568,7 @@ class SAFETY(Experiment):
                 constrain_max = answer_log_ratios_constraint.max().item()
                 contriant_cvar = answer_log_ratios_constraint[answer_log_ratios_constraint > np.quantile(answer_log_ratios_constraint.cpu().numpy(), 0.9)].mean().item()
                 
-                slacks = cfg.tol - answer_log_ratios_constraint
+                slacks = answer_log_ratios_constraint
                 
                 self._last_constraint_slacks = slacks.detach().cpu()
                 self._last_objective_ratios = answer_log_ratios_objective.detach().cpu()
