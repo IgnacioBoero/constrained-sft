@@ -199,11 +199,8 @@ class BIAS(Experiment):
                 
                 # For constraint samples, we want the probabilities to be equal (difference = 0)
                 # For non-constraint samples, we want correct to have higher probability
-                # slack = (dkl - cfg.tol) * is_constraint.float()  # constraint violation
-                # loss = -1 * correct_log_probs * is_not_constraint.float() # objective
-                
-                loss = dkl * is_constraint.float()
-                slack = (cfg.tol - correct_log_probs) * is_not_constraint.float()
+                slack = (dkl - cfg.tol) * is_constraint.float()  # constraint violation
+                loss = -1 * correct_log_probs * is_not_constraint.float() # objective
 
                 
                 # Add constraint penalization
@@ -279,15 +276,10 @@ class BIAS(Experiment):
                 incorrect_log_probs = log_probs.gather(1, (1 - labels).reshape(-1, 1)).squeeze(1)
                 epoch = self.state.epoch
 
-                dkl = probs * (torch.log(probs) - correct_log_probs) + (1 - probs) * (torch.log(1 - probs) - incorrect_log_probs)  # KL divergence
-                dkl = dkl[is_constraint]  # Only keep constraint samples
-                
-                
-                # metric_constraints = torch.abs(probs - torch.exp(correct_log_probs))[is_constraint]
-                constraint_slacks = correct_log_probs * is_not_constraint.float()
-                
-                
-
+                constraint_slacks = probs * (torch.log(probs) - correct_log_probs) + (1 - probs) * (torch.log(1 - probs) - incorrect_log_probs)  # KL divergence
+                constraint_slacks = constraint_slacks[is_constraint]  # Only keep constraint samples
+                metric_constraints = torch.abs(probs - torch.exp(correct_log_probs))[is_constraint]
+                objective = -1 * correct_log_probs * is_not_constraint.float()
                 acc =  ((logits.argmax(dim=-1) == labels)[~is_constraint]).float().mean().item()
                 bias = ((logits.argmax(dim=-1) == labels)[is_constraint]).float().mean().item()
 
@@ -309,8 +301,8 @@ class BIAS(Experiment):
                         "loss": loss.mean().item(),
                         "objective": objective.mean().item(), 
                         "mean_dkl_violation": constraint_slacks.mean().item(),
-                        # "cvar_dkl_violation": constraint_slacks[constraint_slacks > 0].mean().item() if (constraint_slacks > 0).any() else 0.0,
-                        # "mean_metric_constraint": metric_constraints.mean().item(),
-                        # "cvar_metric_constraint": metric_constraints[metric_constraints > 0].mean().item() if (metric_constraints > 0).any() else 0.0
+                        "cvar_dkl_violation": constraint_slacks[constraint_slacks > 0].mean().item() if (constraint_slacks > 0).any() else 0.0,
+                        "mean_metric_constraint": metric_constraints.mean().item(),
+                        "cvar_metric_constraint": metric_constraints[metric_constraints > 0].mean().item() if (metric_constraints > 0).any() else 0.0
                         }
         return CustomTrainer

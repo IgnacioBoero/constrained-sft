@@ -336,7 +336,10 @@ class SAFETY(Experiment):
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    labels=input_ids[:, 1:].contiguous(),
                 )
+                # print if model is on train or eval
+                # print if inputs_ids requies grad
                 logits = outputs.logits[:, :-1]  # size = (B, L-1, Vocab)
                 log_probs = F.log_softmax(logits, dim=-1)  # size = (B, L-1, Vocab)
                 answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
@@ -401,9 +404,13 @@ class SAFETY(Experiment):
                                   
                 elif cfg.loss_type == "penalty":
                     loss += cfg.loss_alpha * slack 
-                    
-                loss = loss.mean()
                 
+                print(loss)
+                loss = loss.mean()
+                print(f"loss requires_grad: {loss.requires_grad}")
+                print(f"loss: {loss}")
+                print(f"loss_2: {outputs.loss}")
+
                 if return_outputs:
                     return loss, outputs
                 else:
