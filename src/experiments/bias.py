@@ -296,19 +296,20 @@ class BIAS(Experiment):
                 if cfg.train.use_wandb and rank == 0:
                     import wandb
                     if wandb.run is not None:
-                        table_metrics = wandb.Table(columns=["constraint_slack", "metric_constraint"])
-                        for slack, metric in zip(constraint_slacks.tolist(), metric_constraints.tolist()):
-                            table_metrics.add_data(slack, metric)
+                        table_metrics = wandb.Table(columns=["constraint_slack"])
+                        for slack in constraint_slacks.tolist():
+                            table_metrics.add_data(slack)
                         wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table_metrics})
                     # Add histogram of constraint slacks
                     wandb.log({f"constraint_slacks_histogram_epoch_{epoch}_{self._current_eval_prefix}": wandb.Histogram(constraint_slacks.cpu().numpy())})
-                    wandb.log({f"metric_constraints_histogram_epoch_{epoch}_{self._current_eval_prefix}": wandb.Histogram(metric_constraints.cpu().numpy())})
 
                 return {"accuracy": acc,
                         "bias_accuracy": bias,
                         "loss": loss.mean().item(),
-                        "objective": objective.mean().item(), 
-                        "mean_dkl_violation": constraint_slacks.mean().item(),
+                        "objective": dkl.mean().item(), 
+                        "mean_constraint_violation": constraint_slacks.mean().item(),
+                        "cvar_constraint_violation": float(torch.tensor(constraint_slacks).float().kthvalue(int(0.9 * len(constraint_slacks))).values.item()),
+                        # "mean_dkl_violation": constraint_slacks.mean().item(),
                         # "cvar_dkl_violation": constraint_slacks[constraint_slacks > 0].mean().item() if (constraint_slacks > 0).any() else 0.0,
                         # "mean_metric_constraint": metric_constraints.mean().item(),
                         # "cvar_metric_constraint": metric_constraints[metric_constraints > 0].mean().item() if (metric_constraints > 0).any() else 0.0
