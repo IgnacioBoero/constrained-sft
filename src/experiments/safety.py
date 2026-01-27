@@ -525,7 +525,7 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.tensor(logits); indexes = torch.tensor(indexes); 
                 cfg = self.custom_cfg.exp
                 
-                self._generate_small_eval_answers()
+                # self._generate_small_eval_answers()
 
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
