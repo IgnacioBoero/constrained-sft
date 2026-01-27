@@ -47,7 +47,7 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("iboero16/SAFE-ALPACA-2")
+        ds = load_dataset("ihounie/safe-lima")
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
@@ -576,14 +576,14 @@ class SAFETY(Experiment):
                 epoch = self.state.epoch
                 # Flatten slacks and output table to wandb
                 constraint_slacks = slacks.flatten()
-                if cfg.train.use_wandb:
-                    import wandb
-                    if wandb.run is not None:
-                        table = wandb.Table(columns=["constraint_slack"])
-                        for slack in constraint_slacks.tolist():
-                            table.add_data(slack)
-                        wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table})
-                
+
+                import wandb
+                if wandb.run is not None:
+                    table = wandb.Table(columns=["constraint_slack"])
+                    for slack in constraint_slacks.tolist():
+                        table.add_data(slack)
+                    wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table})
+            
                 return {
                     "objective": objective,
                     "constraint_mean": constraint_mean,
