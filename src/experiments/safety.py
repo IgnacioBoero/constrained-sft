@@ -48,10 +48,18 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("ihounie/safe-lima")
+        ds = load_dataset("ihounie/alpaca-1k-longest")
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
+
+        # Default safety behavior: if the dataset has no safety label column,
+        # assume all examples are non-constraints (False).
+        if "safety_label" not in tr_raw.column_names:
+            tr_raw = tr_raw.add_column("safety_label", [False] * len(tr_raw))
+        if "safety_label" not in ev_raw.column_names:
+            ev_raw = ev_raw.add_column("safety_label", [False] * len(ev_raw))
+
         tr_raw = tr_raw.add_column("split", ["train"] * len(tr_raw))
         ev_raw = ev_raw.add_column("split", ["validation"] * len(ev_raw))
         
@@ -146,10 +154,13 @@ class SAFETY(Experiment):
             response_mask[start:seq_len] = True    # excludes padding automatically
 
             index = sample["index"]
+
+            # If the dataset doesn't provide a safety label, default to False.
+            safety_label = sample["safety_label"] if "safety_label" in sample else False
             
             return {
                 "input_ids": input_ids,
-                "safe": sample["safety_label"],
+                "safe": safety_label,
                 "response_mask": response_mask,
                 "index": index,
                 "labels": index,  # unused, keep your trick
