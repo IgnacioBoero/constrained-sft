@@ -5,7 +5,7 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_type: penalty
+      exp.loss_type: aug_dual
       exp.tol: -1, -0.5, -1.4
 
   launcher:
