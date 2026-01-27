@@ -555,7 +555,7 @@ class SAFETY(Experiment):
                 
                 
                 answer_log_ratios_objective = answer_log_probs[is_not_constraint]
-                answer_log_ratios_constraint = answer_log_probs[is_constraint]
+                answer_log_ratios_constraint = -1 * answer_log_probs[is_constraint]
                 
                 if is_constraint.sum() == 0:
                     answer_log_ratios_constraint = torch.tensor([0.0], device=answer_log_probs.device)
