@@ -48,7 +48,7 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("iboero16/SAFE-ALPACA-2")
+        ds = load_dataset("ihounie/safe-lima")
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
@@ -422,7 +422,7 @@ class SAFETY(Experiment):
                 loss = -1 * answer_log_probs * is_not_constraint.float()
                 #print("*"*20)
                 #print(is_not_constraint.float())
-                slack = (cfg.tol - answer_log_probs) * is_constraint.float()
+                slack = 100*(cfg.tol - answer_log_probs) * is_constraint.float()
 
                 if cfg.loss_type == "erm":
                     loss = -1 * answer_log_probs

@@ -141,3 +141,59 @@ def freeze_for_mc(model, *, unfreeze_last_n_layers: int = 0, train_classifier: b
                 p.requires_grad = True
 
     return model
+
+
+# -----------------------------
+# Sampling utilities
+# -----------------------------
+from typing import Iterable, Iterator, Sequence
+from torch.utils.data import Sampler
+import torch.distributed as dist
+
+
+class DistributedWeightedRandomSampler(Sampler[int]):
+    """
+    Weighted sampling with replacement, with per-rank randomness when running under DDP.
+
+    This sampler does NOT guarantee a perfectly partitioned global sample stream across ranks,
+    but it avoids all ranks drawing identical indices (by seeding per-rank) and provides
+    a simple way to over/under-sample a subset of examples.
+    """
+
+    def __init__(
+        self,
+        weights: Sequence[float] | torch.Tensor,
+        *,
+        num_samples: int,
+        replacement: bool = True,
+    ) -> None:
+        if num_samples <= 0:
+            raise ValueError(f"num_samples must be > 0, got {num_samples}")
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        if self.weights.dim() != 1:
+            raise ValueError(f"weights must be 1D, got shape={tuple(self.weights.shape)}")
+        if torch.any(self.weights <= 0):
+            raise ValueError("All weights must be > 0 for WeightedRandom sampling.")
+
+        self.replacement = replacement
+        self.num_samples = int(num_samples)
+
+        if dist.is_available() and dist.is_initialized():
+            self.rank = dist.get_rank()
+        else:
+            self.rank = 0
+
+    def __iter__(self) -> Iterator[int]:
+        # Ensure different ranks don't produce identical draws even if the global seed matches.
+        g = torch.Generator()
+        g.manual_seed(torch.initial_seed() + self.rank)
+        idx = torch.multinomial(
+            self.weights,
+            self.num_samples,
+            replacement=self.replacement,
+            generator=g,
+        )
+        return iter(idx.tolist())
+
+    def __len__(self) -> int:
+        return self.num_samples

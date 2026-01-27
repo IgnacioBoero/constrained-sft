@@ -3,6 +3,7 @@ from callbacks.trainer_eval import TrainSetEvalCallback
 from callbacks.profiler_callback import ProfilerCallback
 from callbacks.cache import SyncEmptyCacheCallback
 from callbacks.log_slack import ConstraintSlackWandbCallback
+from callbacks.eval_every_n_epochs import EvalEveryNEpochsCallback
 import hydra
 import wandb
 import torch
@@ -20,6 +21,12 @@ def is_global_main_process() -> bool:
 
 @hydra.main(config_path="../configs", config_name="train/default", version_base=None)
 def main(cfg: DictConfig):
+    # Optional: force only a subset of GPUs to be visible to this process.
+    # This must happen before any CUDA initialization / seeding logic.
+    cuda_visible_devices = getattr(cfg.train, "cuda_visible_devices", None)
+    if cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
+
     set_seed(cfg.train.seed)
     
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -88,6 +95,10 @@ def main(cfg: DictConfig):
     eval_on_train = getattr(cfg.train, "eval_on_train", False)
     if eval_on_train:
         trainer.add_callback(TrainSetEvalCallback(trainer))
+
+    eval_every_n_epochs = getattr(cfg.train, "eval_every_n_epochs", None)
+    if eval_every_n_epochs is not None:
+        trainer.add_callback(EvalEveryNEpochsCallback(int(eval_every_n_epochs)))
         
 
     

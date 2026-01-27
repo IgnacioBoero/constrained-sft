@@ -1,4 +1,5 @@
-name: pda
+name: pda2
+
 channels:
   - pytorch
   - nvidia/label/cuda-12.4.0
