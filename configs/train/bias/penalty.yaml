@@ -53,7 +53,7 @@ exp:
   name: "bias"
   loss_alpha: 10
   loss_type: penalty
-  model_name: FacebookAI/roberta-base
+  model_name: microsoft/deberta-v3-base
   ratio: fair # Options: "fair", "ones"
   tol: 0.02
   dual_step_size: 1

@@ -6,7 +6,8 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: aug_dual
-      exp.tol: -0.05
+      exp.tol: -0.1054
+      exp.model_name: microsoft/deberta-v3-base
       
   # Ensure sequential launching (no parallel launcher)
   launcher:
@@ -41,7 +42,7 @@ train:
     num_train_epochs: 5                      # ST example uses 1 epoch
     learning_rate: 2e-5
     warmup_ratio: 0.1
-    weight_decay: 0.01
+    weight_decay: 0.03
     lr_scheduler_type: "linear"
     eval_strategy: "no"
     save_strategy: "no"
@@ -53,7 +54,7 @@ exp:
   name: "bias"
   loss_alpha: 10
   loss_type: aug_dual
-  model_name: FacebookAI/roberta-base
+  model_name: microsoft/deberta-v3-base
   ratio: fair # Options: "fair", "ones", "reverse"
   tol:  0.02
   dual_step_size: 1.0
