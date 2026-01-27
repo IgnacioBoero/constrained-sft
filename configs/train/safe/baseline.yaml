@@ -19,38 +19,38 @@ train:
   seed: 42
   # Use only one GPU by restricting visible devices (e.g. "0" or "1").
   # If unset, Trainer may use all available GPUs on the machine.
-  cuda_visible_devices: "0"
+  #cuda_visible_devices: "0"
   output_dir: "./outputs/safe/${exp.loss_type}/alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
   do_train: true
   do_initial_eval: false
   use_wandb: true
-  wandb_project: "SAFE-final-v2"
+  wandb_project: "SAFE-1k"
   run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
   eval_on_train: false
   enable_profiler: false
   include_inputs_for_metrics: true
   # If != 1.0, enable constraint-aware resampling:
   # examples with safe==True (constraints) get this sampling weight, others get weight 1.0.
-  constraint_weighted_sampler_weight: 50.0
+  constraint_weighted_sampler_weight: 1.0
   dropout: 0.0
   data_proportion: 1.0
-  max_length: 512
+  max_length: 2048
   lora:
     r: 8
     lora_alpha: 16
     lora_dropout: 0.05
   hf_args:
-    per_device_train_batch_size: 2          # ST recipe
+    per_device_train_batch_size: 1          # ST recipe
     per_device_eval_batch_size: 2
-    gradient_accumulation_steps: 32
+    gradient_accumulation_steps: 16
     eval_accumulation_steps: 16
-    num_train_epochs: 4                      # ST example uses 1 epoch
-    learning_rate: 1e-4
-    lr_scheduler_type: "cosine"
+    num_train_epochs: 15                     # ST example uses 1 epoch
+    learning_rate: 1e-5
+    lr_scheduler_type: "linear"
     warmup_ratio: 0.01
-    weight_decay: 0.001
-    eval_strategy: "epoch"
-    save_strategy: "epoch"
+    weight_decay: 0.1
+    eval_strategy: "no"
+    save_strategy: "no"
     gradient_checkpointing: false
     load_best_model_at_end: true
     metric_for_best_model: "objective"
@@ -59,11 +59,15 @@ train:
     eval_do_concat_batches: false
     bf16: true
     fp16: false
+    neftune_noise_alpha: 15
+    adam_beta1: 0.9 
+    adam_beta2: 0.95 
+
 
 exp:
   name: "safety"
   model_name: huggyllama/llama-7b
   loss_type: penalty
   tol: -1
-  loss_alpha: 1
-  dual_step_size: 1e-1
+  loss_alpha: 0
+  dual_step_size: 0
