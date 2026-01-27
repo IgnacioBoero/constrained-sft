@@ -22,16 +22,17 @@ train:
   seed: 42
   output_dir: "outputs/bias/${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
   do_train: true
-  do_initial_eval: true
+  do_initial_eval: false
   use_wandb: true
   include_inputs_for_metrics: true
   wandb_project: "BIAS-final-v2"
   run_name: "bias-${exp.model_name}-${exp.loss_type}-alpha${exp.loss_alpha}-${exp.ratio}-${exp.tol}"
-  eval_on_train: true
+  eval_on_train: false
   enable_profiler: false
   dropout: 0.1
   data_proportion: 1.0
   size: small
+  eval_train_at_end: true
   hf_args:
     per_device_train_batch_size: 16          # ST recipe
     per_device_eval_batch_size: 16
@@ -41,9 +42,9 @@ train:
     warmup_ratio: 0.1
     weight_decay: 0.0
     lr_scheduler_type: "linear"
-    eval_strategy: "epoch"
-    save_strategy: "epoch"
-    save_total_limit: 1
+    eval_strategy: "no"
+    save_strategy: "no"
+    # save_total_limit: 1
     bf16: true
     fp16: false
 
