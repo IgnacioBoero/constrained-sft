@@ -39,7 +39,7 @@ train:
     per_device_eval_batch_size: 32
     gradient_accumulation_steps: 1
     eval_accumulation_steps: 8
-    num_train_epochs: 15                      # ST example uses 1 epoch
+    num_train_epochs: 7                      # ST example uses 1 epoch
     learning_rate: 1e-2
     lr_scheduler_type: "constant_with_warmup"
     warmup_ratio: 0.1

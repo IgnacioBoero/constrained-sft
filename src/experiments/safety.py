@@ -47,7 +47,7 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("ihounie/safe-lima")
+        ds = load_dataset("iboero16/SAFE-ALPACA-2")
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
