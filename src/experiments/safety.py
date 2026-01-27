@@ -336,7 +336,7 @@ class SAFETY(Experiment):
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    labels=input_ids[:, 1:].contiguous(),
+                    labels=input_ids.clone().masked_fill(response_mask == 0, -100),
                 )
                 # print if model is on train or eval
                 # print if inputs_ids requies grad
@@ -348,12 +348,13 @@ class SAFETY(Experiment):
                 denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
                 answer_log_probs = answer_log_probs / denom
                 
+
                 # answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
                 
 
                 
                 loss = -1 * answer_log_probs * is_not_constraint.float()
-                slack = cfg.tol - answer_log_probs * is_constraint.float()
+                slack = (cfg.tol - answer_log_probs) * is_constraint.float()
 
                 if cfg.loss_type == "erm":
                     loss = -1 * answer_log_probs
@@ -405,11 +406,11 @@ class SAFETY(Experiment):
                 elif cfg.loss_type == "penalty":
                     loss += cfg.loss_alpha * slack 
                 
-                print(loss)
+                # print(loss)
                 loss = loss.mean()
-                print(f"loss requires_grad: {loss.requires_grad}")
-                print(f"loss: {loss}")
-                print(f"loss_2: {outputs.loss}")
+                # print(f"loss requires_grad: {loss.requires_grad}")
+                # print(f"loss: {loss}")
+                # print(f"loss_2: {outputs.loss}")
 
                 if return_outputs:
                     return loss, outputs
