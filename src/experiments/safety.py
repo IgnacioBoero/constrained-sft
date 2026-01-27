@@ -468,7 +468,7 @@ class SAFETY(Experiment):
                     with torch.no_grad():
                         output_ids = self.model.generate(
                             **tokenized,
-                            max_length=self.tokenizer.model_max_length,
+                            max_length=256,
                         )
                     decoded = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
                     outputs.append(decoded[len(prompt):])
@@ -533,7 +533,7 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.tensor(logits); indexes = torch.tensor(indexes); 
                 cfg = self.custom_cfg.exp
                 
-                # self._generate_small_eval_answers()
+                self._generate_small_eval_answers()
 
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
