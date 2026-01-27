@@ -35,6 +35,7 @@ PROMPT_ASSISTANT: str = 'ASSISTANT:'  # should not have a space at the end
 def format_prompt(
     input: str | list[str],  # pylint: disable=redefined-builtin
     eos_token: str,
+    tokenizer=None,
 ) -> str:
     if isinstance(input, str):
         input = [input]
@@ -46,16 +47,39 @@ def format_prompt(
             'The length of `input` must be odd, while `input` must end at the user question.',
         )
 
+    # Auto-switch to "open-instruct" style if the tokenizer supports the special tokens.
+    # Expected format:
+    # <|user|>\n...user...\n<|assistant|>\n...assistant...<eos>
+    use_open_instruct = False
+    if tokenizer is not None:
+        try:
+            special = set(getattr(tokenizer, "all_special_tokens", []) or [])
+            # Some tokenizers only list these in additional_special_tokens
+            special |= set(getattr(tokenizer, "additional_special_tokens", []) or [])
+            use_open_instruct = ("<|user|>" in special) and ("<|assistant|>" in special)
+        except Exception:
+            use_open_instruct = False
+
+    buffer: list[str] = []
+    if use_open_instruct:
+        user_tok = "<|user|>"
+        assistant_tok = "<|assistant|>"
+        for i, line in enumerate(input):
+            if i % 2 == 0:
+                buffer.append(f"{user_tok}\n{line}\n{assistant_tok}\n")
+            else:
+                # Separate assistant turns with EOS; keep a trailing newline for cleanliness.
+                buffer.append(f"{line}{eos_token}\n")
+        return "".join(buffer)
+
+    # Legacy prompt format (kept for backwards compatibility)
     buffer = [PROMPT_BEGIN]
     for i, line in enumerate(input):
         if i % 2 == 0:
-            # User input
             buffer.extend((PROMPT_USER.format(input=line), PROMPT_ASSISTANT))
         else:
-            # Assistant response
             buffer.extend((line, eos_token))
-
-    return ''.join(buffer)
+    return "".join(buffer)
 
 import math
 

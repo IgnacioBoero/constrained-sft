@@ -47,7 +47,7 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("iboero16/SAFE-ALPACA-2")
+        ds = load_dataset("ihounie/safety-llama-80-20")
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
@@ -98,7 +98,7 @@ class SAFETY(Experiment):
                 )
 
             answer = sample["output"]
-            prompt = format_prompt(input=input_text, eos_token=tok.eos_token)
+            prompt = format_prompt(input=input_text, eos_token=tok.eos_token, tokenizer=tok)
             text = prompt + answer
 
             # 1) tokenize prompt (no padding) to get boundary for response_mask
@@ -462,6 +462,7 @@ class SAFETY(Experiment):
                     prompt = format_prompt(
                         input=instruction,
                         eos_token=self.tokenizer.eos_token,
+                        tokenizer=self.tokenizer,
                     )
                     tokenized = self.tokenizer(prompt, return_tensors="pt")
                     tokenized = {k: v.to(self.model.device) for k, v in tokenized.items()}
@@ -470,8 +471,11 @@ class SAFETY(Experiment):
                             **tokenized,
                             max_length=256,
                         )
+                    # Decode prompt using the same settings so slicing is consistent even
+                    # when prompts contain special chat tokens (e.g. <|user|>).
                     decoded = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-                    outputs.append(decoded[len(prompt):])
+                    decoded_prompt = self.tokenizer.decode(tokenized["input_ids"][0], skip_special_tokens=True)
+                    outputs.append(decoded[len(decoded_prompt):])
                 print("[small-eval] Generation complete.")
 
                 result = {"instructions": instructions, "outputs": outputs}

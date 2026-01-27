@@ -56,7 +56,7 @@ train:
 
 exp:
   name: "safety"
-  model_name: huggyllama/llama-7b
+  model_name: allenai/open-instruct-stanford-alpaca-7b
   loss_type: penalty
   tol: 1
   loss_alpha: 10
