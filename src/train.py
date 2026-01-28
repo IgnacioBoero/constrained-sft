@@ -128,6 +128,7 @@ def main(cfg: DictConfig):
     eval_train_at_end = getattr(cfg.train, "eval_train_at_end", False)
     if eval_train_at_end:
         ds = trainer.train_dataset
+        trainer._current_eval_prefix = "train"
         trainer.evaluate(
             eval_dataset=ds,
             metric_key_prefix="train",
