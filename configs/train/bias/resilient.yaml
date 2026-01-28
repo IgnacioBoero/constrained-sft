@@ -5,7 +5,7 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_type: avg
+      exp.loss_type: resilient
       exp.loss_alpha: 0.01,0.001
       exp.resilient_coef: 0.1,1.0,10
       exp.tol: -0.35, -0.1054
@@ -55,7 +55,7 @@ train:
 exp:
   name: "bias"
   loss_alpha: 1
-  loss_type: avg
+  loss_type: resilient
   model_name: microsoft/deberta-v3-base
   ratio: fair # Options: "fair", "ones", "reverse"
   tol:  0.02
