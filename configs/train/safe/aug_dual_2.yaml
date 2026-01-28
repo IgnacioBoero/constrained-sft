@@ -5,8 +5,10 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_type: penalty
-      exp.loss_alpha: 2
+      exp.loss_type: aug_dual
+      exp.tol: 0.0
+      exp.loss_alpha: 50
+      exp.dual_step_size: 0.1
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -29,7 +31,7 @@ train:
   include_inputs_for_metrics: true
   dropout: 0.0
   data_proportion: 1.0
-  max_length: 2048
+  max_length: 1024
   eval_at_end: true
   lora:
     r: 8
@@ -48,7 +50,7 @@ train:
     eval_strategy: "no"
     save_strategy: "no"
     gradient_checkpointing: true
-    # load_best_model_at_end: true
+    load_best_model_at_end: false
     # metric_for_best_model: "objective"
     # greater_is_better: true
     # save_total_limit: 1
@@ -59,7 +61,7 @@ train:
 exp:
   name: "safety"
   model_name: huggyllama/llama-7b
-  loss_type: penalty
-  tol: 0.0
+  loss_type: aug_dual
+  tol: -1.1
   loss_alpha: 100
-  dual_step_size: 1e-2
+  dual_step_size: 0.1
