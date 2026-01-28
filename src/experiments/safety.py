@@ -327,6 +327,7 @@ class SAFETY(Experiment):
                 input_ids = inputs['input_ids']  # size = (B, 2, L)
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
                 response_mask = inputs['response_mask']  # size = (B, 2, L)
+                
                 # precomputed_answer_log_probs = inputs['baseline_logprob']  # size = (B,)
                 is_constraint = inputs['safe']  # size = (B,)                
                 is_not_constraint = ~is_constraint
