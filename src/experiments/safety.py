@@ -14,13 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader, SequentialSampler, DistributedSampler
 import torch.distributed as dist
-from utils import (
-    format_prompt,
-    right_padding,
-    PROMPT_BEGIN,
-    PROMPT_USER,
-    PROMPT_ASSISTANT,
-)
+from utils import format_prompt, right_padding
 
 from peft import LoraConfig, get_peft_model
 
@@ -447,18 +441,9 @@ class SAFETY(Experiment):
                     return None
                 self._last_eval_tag = tag
 
-                eval_ds = self.eval_dataset
-                if eval_ds is None:
-                    print("[eval] Missing eval dataset.")
-                    return None
-
-                if len(eval_ds) == 0:
-                    print("[eval] No samples found.")
-                    return None
-
                 def _log_outputs(tag, rows):
                     result = {
-                        "instructions": [r["instruction"] for r in rows],
+                        "prompts": [r["prompt"] for r in rows],
                         "outputs": [r["output"] for r in rows],
                         "safe": [r["safe"] for r in rows],
                     }
@@ -467,9 +452,9 @@ class SAFETY(Experiment):
                         if wandb.run is not None:
                             epoch = self.state.epoch
                             epoch_tag = f"epoch_{int(epoch)}" if epoch is not None else "epoch_unknown"
-                            table = wandb.Table(columns=["instruction", "output", "safe"])
+                            table = wandb.Table(columns=["prompt", "answer", "safe"])
                             for r in rows:
-                                table.add_data(r["instruction"], r["output"], r["safe"])
+                                table.add_data(r["prompt"], r["output"], r["safe"])
                             wandb.log({f"{tag}_outputs_{epoch_tag}": table})
 
                             out_dir = Path(cfg.train.output_dir)
@@ -487,78 +472,20 @@ class SAFETY(Experiment):
                             wandb.log_artifact(artifact)
                     return result
 
-                print(f"[eval] Generating answers for {len(eval_ds)} prompts...")
+                try:
+                    gen_ds = load_dataset("iboero16/safe-generate-eval")["eval"]
+                except Exception as exc:
+                    print(f"[safe-generate-eval] Failed to load dataset: {exc}")
+                    return None
+
+                if len(gen_ds) == 0:
+                    print("[safe-generate-eval] No samples found.")
+                    return None
+
+                print(f"[safe-generate-eval] Generating answers for {len(gen_ds)} prompts...")
                 rows = []
                 self.model.eval()
-
-                user_prefix = PROMPT_USER.format(input="")
-                for sample in tqdm(eval_ds, desc="[eval] Generating", leave=False):
-                    input_ids = sample.get("input_ids")
-                    response_mask = sample.get("response_mask")
-                    if input_ids is None or response_mask is None:
-                        continue
-
-                    if isinstance(input_ids, torch.Tensor):
-                        input_ids = input_ids.tolist()
-                    if isinstance(response_mask, torch.Tensor):
-                        response_mask = response_mask.tolist()
-
-                    pad_id = self.tokenizer.pad_token_id
-                    if pad_id is None:
-                        pad_id = self.tokenizer.eos_token_id
-
-                    try:
-                        seq_len = input_ids.index(pad_id)
-                    except ValueError:
-                        seq_len = len(input_ids)
-
-                    try:
-                        start = response_mask.index(True)
-                    except ValueError:
-                        start = seq_len
-
-                    prompt_ids = input_ids[:start]
-                    prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
-
-                    instruction = prompt.strip()
-                    if prompt.startswith(PROMPT_BEGIN):
-                        remainder = prompt[len(PROMPT_BEGIN):]
-                        if remainder.startswith(user_prefix):
-                            remainder = remainder[len(user_prefix):]
-                            if remainder.endswith(PROMPT_ASSISTANT):
-                                remainder = remainder[: -len(PROMPT_ASSISTANT)]
-                            instruction = remainder.strip()
-
-                    prompt_ids = torch.tensor(prompt_ids, device=self.model.device).unsqueeze(0)
-                    attention_mask = torch.ones_like(prompt_ids)
-                    with torch.no_grad():
-                        output_ids = self.model.generate(
-                            input_ids=prompt_ids,
-                            attention_mask=attention_mask,
-                            max_new_tokens=64,
-                        )
-                    generated_ids = output_ids[0][prompt_ids.shape[1]:]
-                    decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                    safe_tag = "safe" if bool(sample.get("safe", False)) else "alpaca"
-                    rows.append({"instruction": instruction, "output": decoded, "safe": safe_tag})
-                print("[eval] Generation complete.")
-
-                result = _log_outputs("eval", rows)
-
-                # XSTest dataset (first 50 samples)
-                try:
-                    xs_ds = load_dataset("walledai/XSTest")["test"]
-                except Exception as exc:
-                    print(f"[xs-test] Failed to load dataset: {exc}")
-                    return result
-
-                if len(xs_ds) == 0:
-                    print("[xs-test] No samples found.")
-                    return result
-
-                xs_rows = []
-                print("[xs-test] Generating answers for 50 prompts...")
-                for sample in tqdm(xs_ds.select(range(min(50, len(xs_ds)))), desc="[xs-test] Generating", leave=False):
+                for sample in tqdm(gen_ds, desc="[safe-generate-eval] Generating", leave=False):
                     prompt_text = sample.get("prompt")
                     if not isinstance(prompt_text, str):
                         continue
@@ -575,12 +502,17 @@ class SAFETY(Experiment):
                         )
                     generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
                     decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                    xs_rows.append({"instruction": prompt_text, "output": decoded, "safe": "xsafe"})
-                print("[xs-test] Generation complete.")
+                    rows.append(
+                        {
+                            "prompt": prompt_text,
+                            "output": decoded,
+                            "safe": sample.get("safe"),
+                        }
+                    )
 
-                _log_outputs("xs_test", xs_rows)
+                print("[safe-generate-eval] Generation complete.")
 
-                return result
+                return _log_outputs("safe_generate_eval", rows)
 
             def _compute_metrics(self, pred):
 

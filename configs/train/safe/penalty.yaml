@@ -21,6 +21,7 @@ train:
   do_train: true
   do_initial_eval: false
   use_wandb: true
+  save_model: true
   wandb_project: "SAFE-final-v2"
   run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
   eval_on_train: true

@@ -12,6 +12,7 @@ from experiments.base import EXPERIMENTS
 from utils import dump_cuda_memory, trace_handler
 from transformers.integrations import HfDeepSpeedConfig
 import os
+from pathlib import Path
 import atexit, torch, torch.distributed as dist
 
 
@@ -134,6 +135,19 @@ def main(cfg: DictConfig):
             metric_key_prefix="train",
         )
 
+
+    if getattr(cfg.train, "save_model", False) and is_global_main_process():
+        out_dir = Path(cfg.train.output_dir) / "lora_adapters"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        model_to_save = trainer.model
+        if hasattr(model_to_save, "module"):
+            model_to_save = model_to_save.module
+        if hasattr(model_to_save, "save_pretrained"):
+            model_to_save.save_pretrained(out_dir)
+            if trainer.tokenizer is not None:
+                trainer.tokenizer.save_pretrained(out_dir)
+        else:
+            print("[save-model] Model does not support save_pretrained; skipping.")
 
     # Finish wandb run
     if cfg.train.use_wandb and is_global_main_process():
