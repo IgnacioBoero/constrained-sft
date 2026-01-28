@@ -7,7 +7,7 @@ hydra:
     params:
       exp.loss_type: aug_dual
       exp.tol: -0.35
-      exp.loss_alpha: 0.01,0.1,0.001
+      exp.loss_alpha: 1.0,0.01,0.1
       exp.model_name: microsoft/deberta-v3-base
       
   # Ensure sequential launching (no parallel launcher)
@@ -41,7 +41,7 @@ train:
     per_device_eval_batch_size: 16
     gradient_accumulation_steps: 4
     num_train_epochs: 5                      # ST example uses 1 epoch
-    learning_rate: 2e-5
+    learning_rate: 5e-5
     warmup_ratio: 0.1
     weight_decay: 0.03
     lr_scheduler_type: "linear"
@@ -53,9 +53,9 @@ train:
 
 exp:
   name: "bias"
-  loss_alpha: 1
+  loss_alpha: 1.0
   loss_type: aug_dual
   model_name: microsoft/deberta-v3-base
   ratio: fair # Options: "fair", "ones", "reverse"
-  tol:  0.02
+  tol:  -0.35
   dual_step_size: 1.0

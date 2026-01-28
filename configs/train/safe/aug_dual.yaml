@@ -6,9 +6,9 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: aug_dual
-      exp.tol: -1.2, -1.1, -1.0
-      exp.loss_alpha: 100,1000
-      exp.dual_step_size: 1.0,10.0
+      exp.dual_step_size: 0.1,1.0
+      exp.tol: -1.2
+      exp.loss_alpha: 3,1,5
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -62,6 +62,6 @@ exp:
   name: "safety"
   model_name: huggyllama/llama-7b
   loss_type: aug_dual
-  tol: -1.1
-  loss_alpha: 100
+  tol: -1.2
+  loss_alpha: 3
   dual_step_size: 0.1
