@@ -6,9 +6,9 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: resilient
-      exp.loss_alpha: 0.01,0.001
+      exp.loss_alpha: 1
       exp.resilient_coef: 0.1,1.0,10
-      exp.tol: -0.35, -0.1054
+      exp.tol: -0.35
       exp.model_name: microsoft/deberta-v3-base
       
   # Ensure sequential launching (no parallel launcher)
