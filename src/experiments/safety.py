@@ -226,6 +226,7 @@ class SAFETY(Experiment):
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros(len(self.train_dataset) + len(self.eval_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
+                self.avg_dual = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
 
             # def precompute_answer_logprobs(self):
             #     """

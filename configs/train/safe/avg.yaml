@@ -61,5 +61,5 @@ exp:
   model_name: huggyllama/llama-7b
   loss_type: aug_dual
   tol: -1.1
-  loss_alpha: 100
-  dual_step_size: 0.1
+  loss_alpha: 1
+  dual_step_size: 1.0
