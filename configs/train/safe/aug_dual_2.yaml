@@ -7,7 +7,7 @@ hydra:
     params:
       exp.loss_type: aug_dual
       exp.tol: -1.2
-      exp.loss_alpha: 10
+      exp.loss_alpha: 125
       exp.dual_step_size: 1.0
 
   launcher:
