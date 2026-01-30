@@ -155,19 +155,37 @@ class SAFETY(Experiment):
 
         pad_id = tok.pad_token_id
         eos_id = tok.eos_token_id
+        prompt_input = (
+            "Below is an instruction that describes a task, paired with an input that provides further context. "
+            "Write a response that appropriately completes the request.\n\n"
+            "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
+        )
+        prompt_no_input = (
+            "Below is an instruction that describes a task. "
+            "Write a response that appropriately completes the request.\n\n"
+            "### Instruction:\n{instruction}\n\n### Response:\n"
+        )
 
         def fn(sample):
-            input_text = (
-                " ".join((sample["instruction"], sample["input"]))
-                if sample["input"] else sample["instruction"]
-            )
-            if not isinstance(input_text, str):
+            instruction = sample.get("instruction", "")
+            input_field = sample.get("input", "")
+            if instruction is None:
+                instruction = ""
+            if input_field is None:
+                input_field = ""
+            if not isinstance(instruction, str):
                 raise ValueError(
-                    f"Unsupported type of `input`: {type(input_text)}. Expected: str."
+                    f"Unsupported type of `instruction`: {type(instruction)}. Expected: str."
                 )
+            if not isinstance(input_field, str):
+                input_field = str(input_field)
+
+            if input_field.strip():
+                prompt = prompt_input.format(instruction=instruction, input=input_field)
+            else:
+                prompt = prompt_no_input.format(instruction=instruction)
 
             answer = sample["output"]
-            prompt = format_prompt(input=input_text, eos_token=tok.eos_token)
             text = prompt + answer
 
             # 1) tokenize prompt (no padding) to get boundary for response_mask
@@ -550,6 +568,8 @@ class SAFETY(Experiment):
                     return result
 
                 try:
+                    # load local src/datasets/safety/evaluation/small_eval.json
+                    #gen_ds = load_dataset("json", data_files="src/datasets/safety/evaluation/small_eval.json")["train"]
                     gen_ds = load_dataset("iboero16/safe-generate-eval")["eval"]
                 except Exception as exc:
                     print(f"[safe-generate-eval] Failed to load dataset: {exc}")
@@ -562,30 +582,57 @@ class SAFETY(Experiment):
                 print(f"[safe-generate-eval] Generating answers for {len(gen_ds)} prompts...")
                 rows = []
                 self.model.eval()
+                prompt_input = (
+                    "Below is an instruction that describes a task, paired with an input that provides further context. "
+                    "Write a response that appropriately completes the request.\n\n"
+                    "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
+                )
+                prompt_no_input = (
+                    "Below is an instruction that describes a task. "
+                    "Write a response that appropriately completes the request.\n\n"
+                    "### Instruction:\n{instruction}\n\n### Response:\n"
+                )
                 for sample in tqdm(gen_ds, desc="[safe-generate-eval] Generating", leave=False):
                     prompt_text = sample.get("prompt")
-                    if not isinstance(prompt_text, str):
+                    instruction = sample.get("instruction")
+                    input_field = sample.get("input", "")
+                    raw_prompt = prompt_text if isinstance(prompt_text, str) else instruction
+                    print(f"prompt_text: {raw_prompt}")
+                    if instruction is None and prompt_text is None:
                         continue
-                    prompt = format_prompt(
-                        input=prompt_text,
-                        eos_token=self.processing_class.eos_token,
-                    )
+                    if instruction is None:
+                        instruction = prompt_text
+                    if instruction is None:
+                        continue
+                    if input_field is None:
+                        input_field = ""
+                    if not isinstance(instruction, str):
+                        instruction = str(instruction)
+                    if not isinstance(input_field, str):
+                        input_field = str(input_field)
+                    if input_field.strip():
+                        prompt = prompt_input.format(instruction=instruction, input=input_field)
+                    else:
+                        prompt = prompt_no_input.format(instruction=instruction)
                     tokenized = self.processing_class(prompt, return_tensors="pt")
                     tokenized = {k: v.to(self.model.device) for k, v in tokenized.items()}
                     with torch.no_grad():
                         output_ids = self.model.generate(
                             **tokenized,
-                            max_new_tokens=64,
+                            max_new_tokens=256,
                         )
                     generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
                     decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
                     rows.append(
                         {
-                            "prompt": prompt_text,
+                            "prompt": raw_prompt if raw_prompt is not None else instruction,
                             "output": decoded,
                             "safe": sample.get("safe"),
                         }
                     )
+                    print(f"prompt: {prompt}")
+                    print(f"output: {decoded}")
+                    print(f"safe: {sample.get('safe')}")
 
                 print("[safe-generate-eval] Generation complete.")
 
