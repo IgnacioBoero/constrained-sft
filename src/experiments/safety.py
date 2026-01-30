@@ -88,24 +88,23 @@ class SAFETY(Experiment):
             ev_keep = max(1, int(eval_frac * len(ev_raw)))
             ev_raw = ev_raw.select(range(ev_keep))
 
-        # Optional (TRAIN ONLY): keep the 1k longest unsafe prompts.
+        # Optional (TRAIN ONLY): keep the 1k longest unsafe responses.
         # If only_unsafe_train=False, we keep all safe rows + top-1k unsafe rows.
-        # "prompt length" is measured as character length of the formatted prompt (via utils.format_prompt).
+        # "response length" is measured as character length of the raw `output` field.
         filter_longest = getattr(cfg.train, "filter_longest", False)
         if filter_longest:
-            def _add_prompt_len(ex):
-                input_text = (
-                    " ".join((ex.get("instruction", ""), ex.get("input", ""))).strip()
-                    if ex.get("input") else (ex.get("instruction") or "")
-                )
-                # Match training prompt template as closely as possible, but don't require tokenizer.
-                prompt = format_prompt(input=input_text, eos_token="")
-                return {"prompt_len": len(prompt)}
+            def _add_response_len(ex):
+                answer = ex.get("output", "")
+                if answer is None:
+                    answer = ""
+                if not isinstance(answer, str):
+                    answer = str(answer)
+                return {"response_len": len(answer)}
 
-            tr_raw = tr_raw.map(_add_prompt_len)
+            tr_raw = tr_raw.map(_add_response_len)
 
             unsafe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
-            unsafe_ds = unsafe_ds.sort("prompt_len", reverse=True)
+            unsafe_ds = unsafe_ds.sort("response_len", reverse=True)
             unsafe_keep_n = min(1000, len(unsafe_ds))
             unsafe_ds = unsafe_ds.select(range(unsafe_keep_n))
 
@@ -115,9 +114,19 @@ class SAFETY(Experiment):
                 safe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is True)
                 tr_raw = concatenate_datasets([safe_ds, unsafe_ds])
 
+            # Report average response length (chars) of the final filtered training set.
+            if len(tr_raw) > 0 and "response_len" in tr_raw.column_names:
+                avg_response_len = float(np.mean(tr_raw["response_len"]))
+            else:
+                avg_response_len = 0.0
+            print(
+                f"[filter_longest] Final train avg response_len={avg_response_len:.2f} "
+                f"(chars) over n={len(tr_raw)}"
+            )
+
             # Avoid adding train-only columns that can break downstream remove_columns on eval.
-            if "prompt_len" in tr_raw.column_names:
-                tr_raw = tr_raw.remove_columns(["prompt_len"])
+            if "response_len" in tr_raw.column_names:
+                tr_raw = tr_raw.remove_columns(["response_len"])
 
         # Combine splits for consistent indexing (eval is never filtered)
         complete_dl = concatenate_datasets([tr_raw, ev_raw])
@@ -414,14 +423,16 @@ class SAFETY(Experiment):
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 num_tokens = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                total_tokens = num_tokens.sum()
-                if dist.is_initialized():
-                    dist.all_reduce(total_tokens, op=dist.ReduceOp.MEAN)
-
+                # if model is training, we need to reduce the number of tokens across all processes
+                if log_probs.requires_grad:
+                    # fixed normalization factor to account for gradient accumulation steps
+                    total_tokens = 250*answer_log_probs.shape[0]
+                else:
+                    total_tokens = num_tokens.sum()
+                    if dist.is_initialized():
+                        dist.all_reduce(total_tokens, op=dist.ReduceOp.MEAN)
                 loss = -1 * answer_log_probs.shape[0] * answer_log_probs / total_tokens # multiply by batch size to get tokenwise CE
-
                 answer_log_probs = answer_log_probs / num_tokens
-
                 slack = (cfg.tol - answer_log_probs) * is_constraint.float()
 
                 if cfg.loss_type == "avg":
