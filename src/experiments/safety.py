@@ -205,13 +205,17 @@ class SAFETY(Experiment):
             response_mask[start:seq_len] = True    # excludes padding automatically
 
             index = sample["index"]
+
+            # 6) token-level labels for CausalLM loss: -100 outside response tokens
+            #labels = input_ids.clone()
+            #labels = labels.masked_fill(~response_mask, -100)
             
             return {
                 "input_ids": input_ids,
                 "safe": sample["safety_label"],
                 "response_mask": response_mask,
                 "index": index,
-                "labels": index,  # unused, keep your trick
+                #"labels": labels,
             }
         return fn
     def get_collator(self, tok):
@@ -242,10 +246,10 @@ class SAFETY(Experiment):
                     [sample['index'] for sample in samples],
                     dtype=torch.long,
                 )
-                labels = torch.tensor(
-                    [sample['labels'] for sample in samples],
-                    dtype=torch.long,
-                )
+                #labels = right_padding(
+                #    [torch.tensor(sample["labels"], dtype=torch.long) for sample in samples],
+                #    padding_value=-100,
+                #)
 
                 batch = {
                     "input_ids": input_ids,              # (B, L)
@@ -253,7 +257,7 @@ class SAFETY(Experiment):
                     "index": index,                      # (B,)
                     "safe": safe,                        # (B,)
                     "response_mask": response_masks.bool(),
-                    "labels": labels,
+                    #"labels": labels,                    # (B, L) with -100 outside response
                 }
 
                 # BASELINE IS COMPUTED AFTER PRECOMPUTE STEP
@@ -281,6 +285,9 @@ class SAFETY(Experiment):
                 # self.precompute_answer_logprobs()
                 self.compute_metrics = self._compute_metrics ## OVERRIDE COMPUTE METRICS SO I CAN USE SELF. 
                 self.preprocess_logits_for_metrics = self._preprocess_logits_for_metrics
+                # Use per-example `index` as the label returned to metrics/prediction loops.
+                # (We keep token-level `labels` for the LM loss, but don't want them as `label_ids`.)
+                self.label_names = ["index"]
 
                 
             def init_dual_vars(self):
@@ -397,22 +404,25 @@ class SAFETY(Experiment):
                 dual_var = self.dual_vars[index_constraints].clone()  # Get dual variable for the current batch
                 outputs = model(
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=input_ids.clone().masked_fill(response_mask == 0, -100),
+                    attention_mask=attention_mask
                 )
                 # print if model is on train or eval
                 # print if inputs_ids requies grad
-                logits = outputs.logits[:, :-1]  # size = (B, L-1, Vocab)
+                logits = outputs.logits[:, :-1]   # size = (B, L-1, Vocab)
                 log_probs = F.log_softmax(logits, dim=-1)  # size = (B, L-1, Vocab)
                 answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
+                num_tokens = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                total_tokens = num_tokens.sum()
+                if dist.is_initialized():
+                    dist.all_reduce(total_tokens, op=dist.ReduceOp.MEAN)
 
-                loss = -1 * (answer_log_probs * is_not_constraint.float())
+                loss = -1 * answer_log_probs.shape[0] * answer_log_probs / total_tokens # multiply by batch size to get tokenwise CE
 
-                denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                
-                slack = (cfg.tol - answer_log_probs / denom) * is_constraint.float()
+                answer_log_probs = answer_log_probs / num_tokens
+
+                slack = (cfg.tol - answer_log_probs) * is_constraint.float()
 
                 if cfg.loss_type == "avg":
                         dual_avg = self.avg_dual.clone()
@@ -547,9 +557,9 @@ class SAFETY(Experiment):
                         continue
                     prompt = format_prompt(
                         input=prompt_text,
-                        eos_token=self.tokenizer.eos_token,
+                        eos_token=self.processing_class.eos_token,
                     )
-                    tokenized = self.tokenizer(prompt, return_tensors="pt")
+                    tokenized = self.processing_class(prompt, return_tensors="pt")
                     tokenized = {k: v.to(self.model.device) for k, v in tokenized.items()}
                     with torch.no_grad():
                         output_ids = self.model.generate(
@@ -557,7 +567,7 @@ class SAFETY(Experiment):
                             max_new_tokens=64,
                         )
                     generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
-                    decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                    decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
                     rows.append(
                         {
                             "prompt": prompt_text,
