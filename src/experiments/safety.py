@@ -61,8 +61,42 @@ class SAFETY(Experiment):
         ev_size = int(cfg.train.data_proportion * len(ev_raw))
         ev_raw = ev_raw.select(range(ev_size))
 
-        # Add one common index for both
+        # Optional (TRAIN ONLY): keep all safe==True rows; from safe==False keep only the 1k longest prompts.
+        # "prompt length" is measured as character length of the formatted prompt (via utils.format_prompt).
+        if getattr(cfg.train, "filter_longest", False):
+            def _to_bool(x):
+                # robust-ish conversion for HF datasets (bool / int / string)
+                if isinstance(x, bool):
+                    return x
+                if isinstance(x, (int, np.integer)):
+                    return bool(int(x))
+                if isinstance(x, str):
+                    return x.strip().lower() in {"true", "1", "yes", "y"}
+                return bool(x)
+
+            def _add_prompt_len(ex):
+                input_text = (
+                    " ".join((ex.get("instruction", ""), ex.get("input", ""))).strip()
+                    if ex.get("input") else (ex.get("instruction") or "")
+                )
+                # Match training prompt template as closely as possible, but don't require tokenizer.
+                prompt = format_prompt(input=input_text, eos_token="")
+                return {"prompt_len": len(prompt)}
+
+            tr_raw = tr_raw.map(_add_prompt_len)
+
+            safe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is True)
+            unsafe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
+            unsafe_ds = unsafe_ds.sort("prompt_len", reverse=True)
+            unsafe_keep_n = min(1000, len(unsafe_ds))
+            unsafe_ds = unsafe_ds.select(range(unsafe_keep_n))
+
+            tr_raw = concatenate_datasets([safe_ds, unsafe_ds])
+
+        # Combine splits for consistent indexing (eval is never filtered)
         complete_dl = concatenate_datasets([tr_raw, ev_raw])
+
+        # Add one common index for both (after any filtering)
         complete_dl = complete_dl.add_column("index", list(range(len(complete_dl))))
         
         # Recover splits from the "split" tag
