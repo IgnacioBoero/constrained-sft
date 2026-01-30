@@ -26,24 +26,21 @@ class SAFETY(Experiment):
         tok.model_max_length = cfg.train.max_length
         tok.pad_token = tok.eos_token  # Ensure pad token is defined
         model = AutoModelForCausalLM.from_pretrained(cfg.exp.model_name, low_cpu_mem_usage=True, torch_dtype=torch.float16)
-        model = get_peft_model(
-                    model,
-                    LoraConfig(
-                        r=cfg.train.lora.r,
-                        lora_alpha=cfg.train.lora.lora_alpha,
-                        lora_dropout=cfg.train.lora.lora_dropout,
-                        target_modules=[
-                            "q_proj",
-                            "k_proj",
-                            "v_proj",
-                            "o_proj",
-                            "gate_proj",
-                            "down_proj",
-                            "up_proj",
-                            "lm_head",
-                        ],
-                    ),
-                )
+        if getattr(cfg.train, 'lora', False):
+            model = get_peft_model(
+                        model,
+                        LoraConfig(
+                            r=cfg.train.lora.r,
+                            lora_alpha=cfg.train.lora.lora_alpha,
+                            lora_dropout=cfg.train.lora.lora_dropout,
+                            target_modules=[
+                                "q_proj",
+                                "k_proj",
+                                "v_proj",
+                                "o_proj",
+                            ],
+                        ),
+                    )
         return model, tok
 
     def load_datasets(self, cfg):
@@ -61,19 +58,41 @@ class SAFETY(Experiment):
         ev_size = int(cfg.train.data_proportion * len(ev_raw))
         ev_raw = ev_raw.select(range(ev_size))
 
-        # Optional (TRAIN ONLY): keep all safe==True rows; from safe==False keep only the 1k longest prompts.
-        # "prompt length" is measured as character length of the formatted prompt (via utils.format_prompt).
-        if getattr(cfg.train, "filter_longest", False):
-            def _to_bool(x):
-                # robust-ish conversion for HF datasets (bool / int / string)
-                if isinstance(x, bool):
-                    return x
-                if isinstance(x, (int, np.integer)):
-                    return bool(int(x))
-                if isinstance(x, str):
-                    return x.strip().lower() in {"true", "1", "yes", "y"}
-                return bool(x)
+        def _to_bool(x):
+            # robust-ish conversion for HF datasets (bool / int / string)
+            if isinstance(x, bool):
+                return x
+            if isinstance(x, (int, np.integer)):
+                return bool(int(x))
+            if isinstance(x, str):
+                return x.strip().lower() in {"true", "1", "yes", "y"}
+            return bool(x)
 
+        # Optional: keep only unsafe rows (safety_label == False) in train/eval splits.
+        only_unsafe_train = getattr(cfg.train, "only_unsafe_train", False)
+        if only_unsafe_train:
+            tr_raw = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
+
+        only_unsafe_eval = getattr(cfg.train, "only_unsafe_eval", False)
+        if only_unsafe_eval:
+            ev_raw = ev_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
+
+        # Optional (EVAL ONLY): evaluate on only a fraction of the eval split.
+        # This is applied after data_proportion and only_unsafe_eval filtering.
+        eval_frac = float(getattr(cfg.train, "eval_frac", 1.0))
+        if not (0.0 < eval_frac <= 1.0):
+            raise ValueError(f"cfg.train.eval_frac must be in (0, 1], got: {eval_frac}")
+        if eval_frac < 1.0:
+            # Deterministic subset selection: shuffle then take first K.
+            ev_raw = ev_raw.shuffle(seed=cfg.train.seed)
+            ev_keep = max(1, int(eval_frac * len(ev_raw)))
+            ev_raw = ev_raw.select(range(ev_keep))
+
+        # Optional (TRAIN ONLY): keep the 1k longest unsafe prompts.
+        # If only_unsafe_train=False, we keep all safe rows + top-1k unsafe rows.
+        # "prompt length" is measured as character length of the formatted prompt (via utils.format_prompt).
+        filter_longest = getattr(cfg.train, "filter_longest", False)
+        if filter_longest:
             def _add_prompt_len(ex):
                 input_text = (
                     " ".join((ex.get("instruction", ""), ex.get("input", ""))).strip()
@@ -85,13 +104,20 @@ class SAFETY(Experiment):
 
             tr_raw = tr_raw.map(_add_prompt_len)
 
-            safe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is True)
             unsafe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
             unsafe_ds = unsafe_ds.sort("prompt_len", reverse=True)
             unsafe_keep_n = min(1000, len(unsafe_ds))
             unsafe_ds = unsafe_ds.select(range(unsafe_keep_n))
 
-            tr_raw = concatenate_datasets([safe_ds, unsafe_ds])
+            if only_unsafe_train:
+                tr_raw = unsafe_ds
+            else:
+                safe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is True)
+                tr_raw = concatenate_datasets([safe_ds, unsafe_ds])
+
+            # Avoid adding train-only columns that can break downstream remove_columns on eval.
+            if "prompt_len" in tr_raw.column_names:
+                tr_raw = tr_raw.remove_columns(["prompt_len"])
 
         # Combine splits for consistent indexing (eval is never filtered)
         complete_dl = concatenate_datasets([tr_raw, ev_raw])
@@ -381,20 +407,14 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
+
+                loss = -1 * (answer_log_probs * is_not_constraint.float())
+
                 denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                answer_log_probs = answer_log_probs / denom
                 
+                slack = (cfg.tol - answer_log_probs / denom) * is_constraint.float()
 
-                # answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
-                
-
-                
-                loss = -1 * answer_log_probs * is_not_constraint.float()
-                slack = (cfg.tol - answer_log_probs) * is_constraint.float()
-
-                if cfg.loss_type == "erm":
-                    loss = -1 * answer_log_probs
-                elif cfg.loss_type == "avg":
+                if cfg.loss_type == "avg":
                         dual_avg = self.avg_dual.clone()
                         dual_avg = torch.clamp(dual_avg + cfg.dual_step_size * slack.mean(), min=0.0)
                         self.avg_dual = dual_avg.detach()
@@ -442,7 +462,7 @@ class SAFETY(Experiment):
                 elif cfg.loss_type == "penalty":
                     loss += cfg.loss_alpha * slack 
                 
-                # print(loss)
+                #print("loss: ", loss)
                 loss = loss.mean()
                 # print(f"loss requires_grad: {loss.requires_grad}")
                 # print(f"loss: {loss}")
