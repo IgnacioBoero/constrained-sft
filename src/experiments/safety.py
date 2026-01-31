@@ -25,7 +25,11 @@ class SAFETY(Experiment):
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
         tok.model_max_length = cfg.train.max_length
         tok.pad_token = tok.eos_token  # Ensure pad token is defined
-        model = AutoModelForCausalLM.from_pretrained(cfg.exp.model_name, low_cpu_mem_usage=True, torch_dtype=torch.float16)
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.exp.model_name,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
+        )
         if getattr(cfg.train, 'lora', False):
             model = get_peft_model(
                         model,
@@ -44,7 +48,7 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("iboero16/SAFE-ALPACA-3")
+        ds = load_dataset("ihounie/skillmix-safe-1k")
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
@@ -437,19 +441,49 @@ class SAFETY(Experiment):
                 # print if inputs_ids requies grad
                 logits = outputs.logits[:, :-1]   # size = (B, L-1, Vocab)
                 log_probs = F.log_softmax(logits, dim=-1)  # size = (B, L-1, Vocab)
-                answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
+                answer_log_probs = torch.gather(
+                    log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)
+                ).squeeze(-1)  # size = (B, L-1)
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 num_tokens = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                # Additional forward pass with adapters disabled (or base model) for KL objective.
+                device = input_ids.device
+                with torch.no_grad():
+                    if hasattr(model, "disable_adapter"):
+                        with model.disable_adapter():
+                            base_outputs = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                            )
+                    elif hasattr(model, "module") and hasattr(model.module, "disable_adapter"):
+                        with model.module.disable_adapter():
+                            base_outputs = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                            )
+                    else:
+                        raise RuntimeError(
+                            "KL objective requires PEFT LoRA adapters. "
+                            "Expected model to expose `.disable_adapter()` (PeftModel)."
+                        )
+                    base_logits = base_outputs.logits[:, :-1]
+                    base_log_probs = F.log_softmax(base_logits, dim=-1)
+                # Tokenwise KL divergence between current model and base model.
+                probs = log_probs.exp()
+                kl_token = (probs * (log_probs - base_log_probs)).sum(dim=-1)
+                kl_token = kl_token * response_mask[:, 1:]
+                kl_sum = kl_token.sum(dim=-1)
                 # if model is training, we need to reduce the number of tokens across all processes
                 if log_probs.requires_grad:
-                    # fixed normalization factor to account for gradient accumulation steps
+                    # fixed norm factor in the case of varying number of valid tokens in microbatches and grad acc
                     total_tokens = 250*answer_log_probs.shape[0]
                 else:
                     total_tokens = num_tokens.sum()
                     if dist.is_initialized():
                         dist.all_reduce(total_tokens, op=dist.ReduceOp.MEAN)
-                loss = -1 * answer_log_probs.shape[0] * answer_log_probs / total_tokens # multiply by batch size to get tokenwise CE
+                # main objective: tokenwise KL divergence vs. base model
+                loss = answer_log_probs.shape[0] * kl_sum / total_tokens
                 answer_log_probs = answer_log_probs / num_tokens
                 slack = (cfg.tol - answer_log_probs) * is_constraint.float()
 

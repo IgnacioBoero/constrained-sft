@@ -1,0 +1,70 @@
+# @package _global_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: penalty
+      exp.tol: -1.0
+      exp.loss_alpha: 1.0, 10.0, 100.0
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun
+    subdir: ${hydra.job.num}
+
+train:
+  seed: 42
+  output_dir: "./outputs/safe/${exp.loss_type}/alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
+  do_train: true
+  do_initial_eval: false
+  use_wandb: true
+  save_model: true
+  push_adapters_to_wandb: true
+  wandb_project: "SAFE-skill"
+  run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
+  eval_on_train: false
+  enable_profiler: false
+  include_inputs_for_metrics: true
+  dropout: 0.0
+  data_proportion: 1.0
+  eval_frac: 1.0
+  filter_longest: false
+  only_unsafe_train: false
+  only_unsafe_eval: false
+  max_length: 1024
+  eval_at_end: true
+  lora:
+    r: 64
+    lora_alpha: 128
+    lora_dropout: 0.05
+  hf_args:
+    per_device_train_batch_size: 4          # ST recipe
+    per_device_eval_batch_size: 16
+    gradient_accumulation_steps: 4
+    eval_accumulation_steps: 16
+    num_train_epochs: 15                      # ST example uses 1 epoch
+    learning_rate: 2e-5
+    lr_scheduler_type: "cosine"
+    warmup_ratio: 0.0
+    weight_decay: 0.0
+    gradient_checkpointing: false
+    load_best_model_at_end: false
+    eval_strategy: "no"
+    save_strategy: "no"
+    # metric_for_best_model: "objective"
+    # greater_is_better: true
+    # save_total_limit: 1
+    eval_do_concat_batches: false
+    bf16: true
+    fp16: false
+
+exp:
+  name: "safety"
+  model_name: PrincetonPLI/Llama-3-8B-Instruct-SkillMix
+  loss_type: penalty
+  tol: -1.2
+  loss_alpha: 3
