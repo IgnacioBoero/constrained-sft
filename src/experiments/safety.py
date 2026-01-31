@@ -473,17 +473,10 @@ class SAFETY(Experiment):
                 probs = log_probs.exp()
                 kl_token = (probs * (log_probs - base_log_probs)).sum(dim=-1)
                 kl_token = kl_token * response_mask[:, 1:]
-                kl_sum = kl_token.sum(dim=-1)
+                kl_sum = kl_token.sum(dim=-1) / num_tokens
                 # if model is training, we need to reduce the number of tokens across all processes
-                if log_probs.requires_grad:
-                    # fixed norm factor in the case of varying number of valid tokens in microbatches and grad acc
-                    total_tokens = 250*answer_log_probs.shape[0]
-                else:
-                    total_tokens = num_tokens.sum()
-                    if dist.is_initialized():
-                        dist.all_reduce(total_tokens, op=dist.ReduceOp.MEAN)
-                # main objective: tokenwise KL divergence vs. base model
-                loss = answer_log_probs.shape[0] * kl_sum / total_tokens
+                # main objective: avg KL divergence vs. base model
+                loss = kl_sum
                 answer_log_probs = answer_log_probs / num_tokens
                 slack = (cfg.tol - answer_log_probs) * is_constraint.float()
 
