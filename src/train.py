@@ -146,6 +146,27 @@ def main(cfg: DictConfig):
             model_to_save.save_pretrained(out_dir)
             if trainer.tokenizer is not None:
                 trainer.tokenizer.save_pretrained(out_dir)
+            # Optional: push adapters to W&B as an Artifact (rank 0 only).
+            push_adapters = getattr(cfg.train, "push_adapters_to_wandb", True)
+            if cfg.train.use_wandb and push_adapters and wandb.run is not None:
+                try:
+                    artifact_name = getattr(cfg.train, "adapters_artifact_name", None)
+                    if not artifact_name:
+                        artifact_name = f"{cfg.exp.name}-lora-adapters"
+                    artifact = wandb.Artifact(
+                        name=artifact_name,
+                        type="lora_adapters",
+                        metadata={
+                            "exp": cfg.exp.name,
+                            "model_name": getattr(cfg.exp, "model_name", None),
+                            "output_dir": str(cfg.train.output_dir),
+                            "global_step": int(getattr(trainer.state, "global_step", 0) or 0),
+                        },
+                    )
+                    artifact.add_dir(str(out_dir))
+                    wandb.log_artifact(artifact, aliases=["latest"])
+                except Exception as exc:
+                    print(f"[wandb] Failed to log LoRA adapters artifact: {exc}")
         else:
             print("[save-model] Model does not support save_pretrained; skipping.")
 
