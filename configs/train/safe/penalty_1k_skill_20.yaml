@@ -7,7 +7,7 @@ hydra:
     params:
       exp.loss_type: penalty
       exp.tol: -0.0
-      exp.loss_alpha: 10.0
+      exp.loss_alpha: 20.0
       exp.dual_step_size: 0.1
 
   launcher:
