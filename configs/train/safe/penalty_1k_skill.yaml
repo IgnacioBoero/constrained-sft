@@ -48,15 +48,13 @@ train:
     per_device_eval_batch_size: 2
     gradient_accumulation_steps: 4
     eval_accumulation_steps: 8
-    num_train_epochs: 15                      # ST example uses 1 epoch
+    num_train_epochs: 10                     # ST example uses 1 epoch
     learning_rate: 2e-5
     lr_scheduler_type: "cosine"
     warmup_ratio: 0.0
     weight_decay: 0.0
     gradient_checkpointing: false
     load_best_model_at_end: false
-    eval_strategy: "no"
-    save_strategy: "no"
     # metric_for_best_model: "loss"
     # greater_is_better: true
     # save_total_limit: 1
@@ -64,6 +62,7 @@ train:
     bf16: true
     fp16: false
     eval_strategy: "epoch"
+    save_strategy: "no"
 
 exp:
   name: "safety"
