@@ -25,6 +25,7 @@ train:
   use_wandb: true
   save_model: true
   push_adapters_to_wandb: true
+  generate_only_at_end: true
   wandb_project: "SAFE-skill"
   run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
   eval_on_train: true
