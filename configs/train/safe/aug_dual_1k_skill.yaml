@@ -21,7 +21,7 @@ train:
   seed: 42
   output_dir: "./outputs/safe/${exp.loss_type}/alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
   do_train: true
-  do_initial_eval: false
+  do_initial_eval: true
   use_wandb: true
   save_model: true
   push_adapters_to_wandb: true
@@ -48,7 +48,7 @@ train:
     per_device_eval_batch_size: 2
     gradient_accumulation_steps: 4
     eval_accumulation_steps: 8
-    num_train_epochs: 10                      # ST example uses 1 epoch
+    num_train_epochs: 1                     # ST example uses 1 epoch
     learning_rate: 2e-5
     lr_scheduler_type: "cosine"
     warmup_ratio: 0.0
