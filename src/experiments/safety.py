@@ -547,9 +547,37 @@ class SAFETY(Experiment):
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
                 collated = self.data_collator(samples)
                 input_ids = collated['input_ids'].to(logits.device)
-                log_probs = F.log_softmax(logits, dim=-1)[:, :-1]  # size = (B, L-1, Vocab)
-                answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
-                return answer_log_probs
+                attention_mask = collated["attention_mask"].to(logits.device)
+
+                # Current model token log-probs (for answer log-prob metrics)
+                log_probs = F.log_softmax(logits, dim=-1)[:, :-1]  # (B, L-1, V)
+                answer_log_probs = torch.gather(
+                    log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)
+                ).squeeze(-1)  # (B, L-1)
+
+                # Tokenwise KL(current || base) where "base" is the same model with PEFT adapters disabled.
+                # This mirrors the KL objective in `compute_loss`.
+                with torch.no_grad():
+                    model = self.model
+                    if hasattr(model, "disable_adapter"):
+                        with model.disable_adapter():
+                            base_outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    elif hasattr(model, "module") and hasattr(model.module, "disable_adapter"):
+                        with model.module.disable_adapter():
+                            base_outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    else:
+                        raise RuntimeError(
+                            "KL objective requires PEFT LoRA adapters. "
+                            "Expected model to expose `.disable_adapter()` (PeftModel)."
+                        )
+                    base_log_probs = F.log_softmax(base_outputs.logits[:, :-1], dim=-1)  # (B, L-1, V)
+
+                probs = log_probs.exp()
+                kl_token = (probs * (log_probs - base_log_probs)).sum(dim=-1)  # (B, L-1)
+
+                # Pack both metrics into a small tensor to avoid returning full vocab logits:
+                # [..., 0] = answer token log-prob; [..., 1] = tokenwise KL
+                return torch.stack([answer_log_probs, kl_token], dim=-1)  # (B, L-1, 2)
             
             def _generate_eval_answers(self, force: bool = False):
                 cfg = self.custom_cfg
@@ -692,25 +720,28 @@ class SAFETY(Experiment):
                 else:
                     indexes = np.asarray(idx_chunks)
 
-                # ---- flatten logits to (N, L, V) with single L ----
+                # ---- flatten reduced predictions to (N, L, D) with single L ----
                 if isinstance(logits_chunks, (list, tuple)):
                     # global max length across batches (or use cfg.train.max_length)
                     max_L = max(x.shape[1] for x in logits_chunks)
 
                     padded = []
                     for x in logits_chunks:
-                        x = np.asarray(x)  # (B, Lb, V)
+                        x = np.asarray(x)  # (B, Lb, D) where D=2
                         Lb = x.shape[1]
                         if Lb < max_L:
-                            pad_width = ((0, 0), (0, max_L - Lb))
+                            pad_width = ((0, 0), (0, max_L - Lb), (0, 0))
                             x = np.pad(x, pad_width, mode="constant", constant_values=0.0)
                         padded.append(x)
 
-                    logits = np.concatenate(padded, axis=0)  # (N, max_L, V)
+                    logits = np.concatenate(padded, axis=0)  # (N, max_L, D)
                 else:
                     logits = np.asarray(logits_chunks)
                     
-                answer_log_probs = torch.tensor(logits); indexes = torch.tensor(indexes); 
+                reduced = torch.tensor(logits)
+                token_answer_log_probs = reduced[..., 0]
+                token_kl = reduced[..., 1]
+                indexes = torch.tensor(indexes)
                 cfg = self.custom_cfg.exp
                 
                 # Optional side-effect: generate answers during eval (unless configured to only do this once at end).
@@ -719,18 +750,23 @@ class SAFETY(Experiment):
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
                 collated = self.data_collator(samples)
-                response_mask = collated['response_mask'].to(answer_log_probs.device)
-                is_constraint = collated['safe'].to(answer_log_probs.device)  # size
+                response_mask = collated["response_mask"].to(token_answer_log_probs.device)
+                is_constraint = collated["safe"].to(token_answer_log_probs.device)  # size
                 # precomputed_answer_log_probs = collated['baseline_logprob'].to(answer_log_probs.device)
 
                 is_not_constraint = ~is_constraint
                 self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
                 self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
                 
-                answer_log_probs = answer_log_probs * response_mask[:, 1:]
-                answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                answer_log_probs = answer_log_probs / denom
+
+                # Sequence-average answer log-prob (used for constraint stats)
+                answer_log_probs = token_answer_log_probs.to(response_mask.device) * response_mask[:, 1:]
+                answer_log_probs = answer_log_probs.sum(dim=-1) / denom  # (B,)
+
+                # Sequence-average KL(current || base) over response tokens (this matches `compute_loss`)
+                kl_sum = token_kl.to(response_mask.device) * response_mask[:, 1:]
+                kl_avg = kl_sum.sum(dim=-1) / denom  # (B,)
                 
                 # answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
                 
@@ -743,7 +779,8 @@ class SAFETY(Experiment):
                     self._last_constraint_indexes = torch.tensor([0], dtype=torch.long)
                     
                 
-                objective = -1 * answer_log_ratios_objective.mean().item()
+                # Report "objective" as the KL term (matches the training objective in `compute_loss`).
+                objective = kl_avg.mean().item()
                 constraint_mean = answer_log_ratios_constraint.mean().item()
                 constrain_min = answer_log_ratios_constraint.min().item()
                 constrain_max = answer_log_ratios_constraint.max().item()

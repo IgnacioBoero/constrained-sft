@@ -48,10 +48,12 @@ train:
     per_device_eval_batch_size: 2
     gradient_accumulation_steps: 4
     eval_accumulation_steps: 8
-    num_train_epochs: 1                     # ST example uses 1 epoch
+    num_train_epochs: 6                     # ST example uses 1 epoch
     learning_rate: 2e-5
-    lr_scheduler_type: "cosine"
-    warmup_ratio: 0.0
+    lr_scheduler_type: "cosine_with_min_lr"
+    lr_scheduler_kwargs:
+      min_lr: 1e-6
+    warmup_ratio: 0.1
     weight_decay: 0.0
     gradient_checkpointing: false
     load_best_model_at_end: false
