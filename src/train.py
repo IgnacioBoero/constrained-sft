@@ -122,6 +122,11 @@ def main(cfg: DictConfig):
             if cfg.train.do_initial_eval:
                 trainer.evaluate(metric_key_prefix="eval")
             trainer.train()
+
+        # Optional: generate answers for safe-generate-eval exactly once after training finishes.
+        if getattr(cfg.train, "generate_only_at_end", False) and hasattr(trainer, "generate_eval_answers_at_end"):
+            trainer._current_eval_prefix = "eval"
+            trainer.generate_eval_answers_at_end()
     eval_at_end = getattr(cfg.train, "eval_at_end", False)
     if eval_at_end:
         trainer._current_eval_prefix = "eval"

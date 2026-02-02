@@ -319,6 +319,8 @@ class SAFETY(Experiment):
                 # Use per-example `index` as the label returned to metrics/prediction loops.
                 # (We keep token-level `labels` for the LM loss, but don't want them as `label_ids`.)
                 self.label_names = ["index"]
+                # Track whether we've already run the optional generation-once-at-end hook.
+                self._did_generate_eval_answers_at_end = False
 
                 
             def init_dual_vars(self):
@@ -549,8 +551,19 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.gather(log_probs, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # size = (B, L-1)
                 return answer_log_probs
             
-            def _generate_eval_answers(self):
+            def _generate_eval_answers(self, force: bool = False):
                 cfg = self.custom_cfg
+
+                # If configured, skip generation during periodic eval calls and only run once at end.
+                if (not force) and getattr(cfg.train, "generate_only_at_end", False):
+                    return None
+
+                if force:
+                    # Idempotent: allow calling multiple times safely.
+                    if getattr(self, "_did_generate_eval_answers_at_end", False):
+                        return None
+                    self._did_generate_eval_answers_at_end = True
+
                 if getattr(self, "_current_eval_prefix", "eval") != "eval":
                     return None
 
@@ -665,6 +678,10 @@ class SAFETY(Experiment):
 
                 return _log_outputs("safe_generate_eval", rows)
 
+            def generate_eval_answers_at_end(self):
+                """Generate answers for the safe-generate-eval set once, after training finishes."""
+                return self._generate_eval_answers(force=True)
+
             def _compute_metrics(self, pred):
 
                 logits_chunks = pred.predictions
@@ -696,7 +713,8 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.tensor(logits); indexes = torch.tensor(indexes); 
                 cfg = self.custom_cfg.exp
                 
-                self._generate_eval_answers()
+                # Optional side-effect: generate answers during eval (unless configured to only do this once at end).
+                self._generate_eval_answers(force=False)
 
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
