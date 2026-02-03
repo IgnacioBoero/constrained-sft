@@ -21,7 +21,7 @@ train:
   seed: 42
   output_dir: "./outputs/safe/${exp.loss_type}/alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
   do_train: true
-  do_initial_eval: true
+  do_initial_eval: false
   use_wandb: true
   save_model: true
   push_adapters_to_wandb: true
