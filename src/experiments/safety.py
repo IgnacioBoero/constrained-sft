@@ -48,7 +48,24 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("ihounie/skillmix-safe-1k")
+        # Default to the HF dataset, but allow overriding with local JSON/JSONL files.
+        # Example:
+        #   train:
+        #     safe_dataset_files:
+        #       train: ./src/datasets/safety/skillmix-safe-1k-aug3/train.jsonl
+        #       validation: ./src/datasets/safety/skillmix-safe-1k-aug3/validation.jsonl
+        safe_files = getattr(cfg.train, "safe_dataset_files", None)
+        if safe_files and getattr(safe_files, "train", None) and getattr(safe_files, "validation", None):
+            ds = load_dataset(
+                "json",
+                data_files={
+                    "train": str(safe_files.train),
+                    "validation": str(safe_files.validation),
+                },
+            )
+        else:
+            safe_dataset_name = getattr(cfg.train, "safe_dataset_name", "ihounie/skillmix-safe-1k")
+            ds = load_dataset(safe_dataset_name)
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
@@ -152,6 +169,75 @@ class SAFETY(Experiment):
     def preprocessing_fn(self, tok, cfg):
         max_length = cfg.train.max_length
 
+        # Optional augmentation: synonym replacement for *safe* (safety_label=True) prompts.
+        # Note: `train.py` uses `Dataset.map(preprocess, ...)`, so this runs once during preprocessing
+        # (not per-epoch). We make it deterministic per example to keep DDP ranks consistent.
+        augment_safe = bool(getattr(cfg.train, "augment_safe", False))
+        augment_safe_on_eval = bool(getattr(cfg.train, "augment_safe_on_eval", False))
+        augment_safe_prob = float(getattr(cfg.train, "augment_safe_prob", 1.0))
+        augment_safe_fields = getattr(cfg.train, "augment_safe_fields", ["instruction", "input"])
+        augment_safe_min_words = int(getattr(cfg.train, "augment_safe_min_words", 3))
+        augment_safe_max_words = int(getattr(cfg.train, "augment_safe_max_words", 8))
+        base_seed = int(getattr(cfg.train, "seed", 42))
+
+        if augment_safe:
+            try:
+                import nlpaug.augmenter.word as naw
+            except Exception as exc:
+                raise RuntimeError(
+                    "cfg.train.augment_safe=True requires optional deps. Install with "
+                    "`pip install -e '.[augmentation]'` (needs `nlpaug` + `nltk`)."
+                ) from exc
+
+            # WordNet synonym augmenter (requires NLTK corpora: wordnet + omw-1.4).
+            # We keep aug_p conservative to avoid over-distorting prompts.
+            if augment_safe_max_words < 1:
+                raise ValueError("cfg.train.augment_safe_max_words must be >= 1")
+            safe_aug = naw.SynonymAug(aug_src="wordnet", aug_p=0.2, aug_max=augment_safe_max_words)
+        else:
+            safe_aug = None
+
+        def _maybe_augment_text(text: str, ex_index: int, field: str) -> str:
+            if safe_aug is None:
+                return text
+            if not text or not isinstance(text, str):
+                return text
+            # Skip very short strings (often just punctuation / single tokens).
+            if len(text.split()) < augment_safe_min_words:
+                return text
+
+            # Deterministic coin flip + deterministic augmentation randomness per (example, field)
+            import random
+            import numpy as np
+
+            # Mix seeds cheaply; keep within 32-bit for libraries that expect it.
+            mixed = (base_seed * 1_000_003 + int(ex_index) * 10_007 + (hash(field) & 0xFFFF)) & 0xFFFFFFFF
+            r = random.Random(mixed)
+            if r.random() >= augment_safe_prob:
+                return text
+
+            np.random.seed(mixed)
+            random.seed(mixed)
+
+            try:
+                out = safe_aug.augment(text)
+            except LookupError as exc:
+                raise RuntimeError(
+                    "Required NLTK data not found for synonym augmentation. Run:\n"
+                    "  python -c \"import nltk; "
+                    "nltk.download('wordnet'); nltk.download('omw-1.4'); "
+                    "nltk.download('averaged_perceptron_tagger'); nltk.download('averaged_perceptron_tagger_eng')\""
+                ) from exc
+            except Exception:
+                # Fail closed: keep original text if augmentation library errors unexpectedly.
+                return text
+
+            if isinstance(out, list):
+                return out[0] if out else text
+            if isinstance(out, str):
+                return out
+            return text
+
         # make sure pad token exists
         if tok.pad_token_id is None:
             # common choice for causal LM if pad doesn't exist
@@ -183,6 +269,20 @@ class SAFETY(Experiment):
                 )
             if not isinstance(input_field, str):
                 input_field = str(input_field)
+
+            # Apply augmentation only to safe-labeled prompts (safety_label == True).
+            # We augment instruction/input BEFORE prompt formatting.
+            if augment_safe:
+                is_safe = sample.get("safety_label", False)
+                split = sample.get("split", "train")
+                if (split != "train") and (not augment_safe_on_eval):
+                    is_safe = False
+                if bool(is_safe):
+                    ex_index = sample.get("index", 0)
+                    if "instruction" in augment_safe_fields:
+                        instruction = _maybe_augment_text(instruction, ex_index, "instruction")
+                    if "input" in augment_safe_fields and input_field.strip():
+                        input_field = _maybe_augment_text(input_field, ex_index, "input")
 
             if input_field.strip():
                 prompt = prompt_input.format(instruction=instruction, input=input_field)
