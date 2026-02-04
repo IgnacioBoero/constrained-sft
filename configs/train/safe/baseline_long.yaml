@@ -23,6 +23,7 @@ train:
   use_wandb: true
   save_model: true
   wandb_project: "SAFE-llama2-long1k"
+  safe_dataset_name: "iboero/SAFE-ALPACA-3"
   run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
   eval_on_train: true
   enable_profiler: false
@@ -30,11 +31,15 @@ train:
   dropout: 0.0
   data_proportion: 1.0
   filter_longest: true
+  eval_frac: 1.0
   max_length: 2048
   eval_at_end: true
+  generate_only_at_end: true
   only_unsafe_train: true
   only_unsafe_eval: false
   push_adapters_to_wandb: true
+  augment_safe: true
+  augment_safe_on_eval: false
   lora:
     r: 8
     lora_alpha: 16
