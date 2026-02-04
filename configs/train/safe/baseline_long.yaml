@@ -29,6 +29,7 @@ train:
   include_inputs_for_metrics: true
   dropout: 0.0
   filter_longest: true
+  data_proportion: 1.0
   eval_frac: 1.0
   # Optional: dataset path used for train-end answer generation. If unset, generates from
   # the validation split (safe=True only). Example to keep old behavior:
