@@ -430,7 +430,7 @@ class SAFETY(Experiment):
                 else:
                     total_tokens = num_tokens.sum()
                     if dist.is_initialized():
-                        dist.all_reduce(total_tokens, op=dist.ReduceOp.MEAN)
+                        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)/dist.get_world_size()
                 loss = -1 * answer_log_probs.shape[0] * answer_log_probs / total_tokens # multiply by batch size to get tokenwise CE
                 answer_log_probs = answer_log_probs / num_tokens
                 slack = (cfg.tol - answer_log_probs) * is_constraint.float()
