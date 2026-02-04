@@ -34,11 +34,14 @@ train:
   dropout: 0.0
   data_proportion: 1.0
   eval_frac: 1.0
-  filter_longest: true
-  only_unsafe_train: true
+  filter_longest: false
+  only_unsafe_train: false
   only_unsafe_eval: false
-  max_length: 2048
+  max_length: 1024
   eval_at_end: true
+  safe_dataset_files:
+    train: ./src/datasets/safety/skillmix-safe-1k-aug3/train.jsonl
+    validation: ./src/datasets/safety/skillmix-safe-1k-aug3/validation.jsonl
   lora:
     r: 64
     lora_alpha: 128
@@ -48,9 +51,9 @@ train:
     per_device_eval_batch_size: 8
     gradient_accumulation_steps: 4
     eval_accumulation_steps: 4
-    num_train_epochs: 8                    # ST example uses 1 epoch
+    num_train_epochs: 5                    # ST example uses 1 epoch
     learning_rate: 2e-5
-    lr_scheduler_type: "cosine"
+    lr_scheduler_type: "constant"
     #lr_scheduler_type: "cosine_with_min_lr"
     #lr_scheduler_kwargs:
     #  min_lr: 1e-6

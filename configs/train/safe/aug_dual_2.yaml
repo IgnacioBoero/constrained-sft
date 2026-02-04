@@ -31,6 +31,7 @@ train:
   include_inputs_for_metrics: true
   dropout: 0.0
   data_proportion: 1.0
+  filter_longest: true
   max_length: 1024
   eval_at_end: true
   lora:

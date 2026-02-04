@@ -5,9 +5,9 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_type: resilient
-      exp.resilient_coef: 0.1,1.0,10.0
-      exp.tol: -1.0,-1.2
+      exp.loss_type: penalty
+      exp.tol: -1.0
+      exp.loss_alpha: 5.0
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -23,33 +23,38 @@ train:
   do_initial_eval: false
   use_wandb: true
   save_model: true
-  wandb_project: "SAFE-final-v2"
+  push_adapters_to_wandb: true
+  wandb_project: "SAFE-skill"
   run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
-  eval_on_train: true
+  eval_on_train: false
   enable_profiler: false
   include_inputs_for_metrics: true
   dropout: 0.0
   data_proportion: 1.0
+  eval_frac: 1.0
+  filter_longest: false
+  only_unsafe_train: false
+  only_unsafe_eval: false
   max_length: 1024
   eval_at_end: true
   lora:
-    r: 8
-    lora_alpha: 16
+    r: 64
+    lora_alpha: 128
     lora_dropout: 0.05
   hf_args:
-    per_device_train_batch_size: 8          # ST recipe
-    per_device_eval_batch_size: 32
-    gradient_accumulation_steps: 2
-    eval_accumulation_steps: 8
-    num_train_epochs: 8                      # ST example uses 1 epoch
-    learning_rate: 3e-4
-    lr_scheduler_type: "cosine"
+    per_device_train_batch_size: 4          # ST recipe
+    per_device_eval_batch_size: 16
+    gradient_accumulation_steps: 4
+    eval_accumulation_steps: 16
+    num_train_epochs: 15                      # ST example uses 1 epoch
+    learning_rate: 2e-5
+    lr_scheduler_type: "constant"
     warmup_ratio: 0.1
-    weight_decay: 0.01
+    weight_decay: 0.0
+    gradient_checkpointing: false
+    load_best_model_at_end: false
     eval_strategy: "no"
     save_strategy: "no"
-    gradient_checkpointing: true
-    load_best_model_at_end: false
     # metric_for_best_model: "objective"
     # greater_is_better: true
     # save_total_limit: 1
@@ -59,9 +64,7 @@ train:
 
 exp:
   name: "safety"
-  model_name: huggyllama/llama-7b
-  loss_type: aug_dual
-  tol: -1.1
-  loss_alpha: 100
-  dual_step_size: 0.1
-  resilient_coef: 1.0
+  model_name: PrincetonPLI/Llama-3-8B-Instruct-SkillMix
+  loss_type: penalty
+  tol: -1.2
+  loss_alpha: 3

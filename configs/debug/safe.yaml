@@ -13,6 +13,20 @@ train:
   eval_on_train: true
   enable_profiler: true
   max_length: 512
+  # Optional synonym augmentation for SAFE (safety_label=True) prompts during preprocessing.
+  # This runs once in `Dataset.map(...)` (not per-epoch). Requires `pip install -e '.[augmentation]'`
+  # plus NLTK data:
+  # `python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4'); nltk.download('averaged_perceptron_tagger'); nltk.download('averaged_perceptron_tagger_eng')"`
+  augment_safe: false
+  augment_safe_on_eval: false
+  augment_safe_prob: 0.5
+  augment_safe_fields: ["instruction", "input"]
+  augment_safe_min_words: 3
+  augment_safe_max_words: 8
+  # If you generate an offline-augmented dataset, set these to train normally without online augmentation:
+  # safe_dataset_files:
+  #   train: ./src/datasets/safety/skillmix-safe-1k-aug3/train.jsonl
+  #   validation: ./src/datasets/safety/skillmix-safe-1k-aug3/validation.jsonl
   lora:
     r: 8
     lora_alpha: 16
