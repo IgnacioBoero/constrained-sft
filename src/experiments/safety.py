@@ -579,8 +579,9 @@ class SAFETY(Experiment):
                 # if model is training, we need to reduce the number of tokens across all processes
                 # main objective: avg KL divergence vs. base model
                 loss = kl_sum
-                answer_log_probs = answer_log_probs / num_tokens
-                slack = (cfg.tol - answer_log_probs) * is_constraint.float()
+                if cfg.loss_type != "erm":
+                    answer_log_probs = answer_log_probs / num_tokens
+                    slack = (cfg.tol - answer_log_probs) * is_constraint.float()
 
                 if cfg.loss_type == "avg":
                         dual_avg = self.avg_dual.clone()
