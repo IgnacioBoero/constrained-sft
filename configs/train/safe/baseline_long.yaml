@@ -28,9 +28,11 @@ train:
   enable_profiler: false
   include_inputs_for_metrics: true
   dropout: 0.0
-  data_proportion: 1.0
   filter_longest: true
   eval_frac: 1.0
+  # Optional: dataset path used for train-end answer generation. If unset, generates from
+  # the validation split (safe=True only). Example to keep old behavior:
+  # gen_data: "iboero16/safe-generate-eval"
   max_length: 2048
   eval_at_end: true
   only_unsafe_train: true
@@ -41,16 +43,16 @@ train:
     lora_alpha: 128
     lora_dropout: 0.05
   hf_args:
-    per_device_train_batch_size: 1          # ST recipe
-    per_device_eval_batch_size: 1
+    per_device_train_batch_size: 8          # ST recipe
+    per_device_eval_batch_size: 8
     gradient_accumulation_steps: 4
     eval_accumulation_steps: 8
-    num_train_epochs: 10                      # ST example uses 1 epoch
-    learning_rate: 3e-4
+    num_train_epochs: 15                      # ST example uses 1 epoch
+    learning_rate: 1e-3
     lr_scheduler_type: "linear"
     warmup_ratio: 0.0
     weight_decay: 0.0
-    eval_strategy: "no"
+    eval_strategy: "epoch"
     save_strategy: "no"
     gradient_checkpointing: false
     load_best_model_at_end: false

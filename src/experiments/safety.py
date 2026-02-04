@@ -297,12 +297,23 @@ class SAFETY(Experiment):
                 # Use per-example `index` as the label returned to metrics/prediction loops.
                 # (We keep token-level `labels` for the LM loss, but don't want them as `label_ids`.)
                 self.label_names = ["index"]
+                # Generate qualitative answers only once at the end of training.
+                self._generated_eval_answers = False
 
                 
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros(len(self.train_dataset) + len(self.eval_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
                 self.avg_dual = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+
+            def train(self, *args, **kwargs):
+                """
+                Run normal training, then (optionally) generate a qualitative set of answers
+                once at the end of training (instead of at every evaluation call).
+                """
+                train_output = super().train(*args, **kwargs)
+                self._generate_eval_answers_end_of_training()
+                return train_output
 
             # def precompute_answer_logprobs(self):
             #     """
@@ -591,6 +602,179 @@ class SAFETY(Experiment):
 
                 return _log_outputs("safe_generate_eval", rows)
 
+            def _generate_eval_answers_end_of_training(self):
+                """
+                Generate answers for a fixed evaluation prompt set once at the very end
+                of training (rank-0 only). This avoids doing generation during each eval.
+                """
+                if self._generated_eval_answers:
+                    return None
+                if not self.is_world_process_zero():
+                    return None
+
+                self._generated_eval_answers = True
+
+                cfg = self.custom_cfg
+
+                def _to_bool(x):
+                    if isinstance(x, bool):
+                        return x
+                    if isinstance(x, (int, np.integer)):
+                        return bool(int(x))
+                    if isinstance(x, str):
+                        return x.strip().lower() in {"true", "1", "yes", "y"}
+                    return bool(x)
+
+                def _log_outputs(tag, rows):
+                    result = {
+                        "prompts": [r["prompt"] for r in rows],
+                        "outputs": [r["output"] for r in rows],
+                        "safe": [r["safe"] for r in rows],
+                    }
+                    if cfg.train.use_wandb:
+                        import wandb
+                        if wandb.run is not None:
+                            epoch = self.state.epoch
+                            epoch_tag = f"epoch_{int(epoch)}" if epoch is not None else "epoch_unknown"
+                            table = wandb.Table(columns=["prompt", "answer", "safe"])
+                            for r in rows:
+                                table.add_data(r["prompt"], r["output"], r["safe"])
+                            wandb.log({f"{tag}_outputs_{epoch_tag}": table})
+
+                            out_dir = Path(cfg.train.output_dir)
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            out_path = out_dir / f"{tag}_outputs_{epoch_tag}.json"
+                            out_path.write_text(
+                                json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+                                encoding="utf-8",
+                            )
+                            artifact = wandb.Artifact(
+                                f"{tag}_outputs_{epoch_tag}",
+                                type=f"{tag}_outputs",
+                            )
+                            artifact.add_file(str(out_path))
+                            wandb.log_artifact(artifact)
+                    return result
+
+                # If provided, generate from an explicit dataset path (keeps old behavior).
+                gen_data = getattr(cfg.train, "gen_data", None)
+                if isinstance(gen_data, str) and not gen_data.strip():
+                    gen_data = None
+
+                rows = []
+                model = extract_model_from_parallel(self.model)
+                was_training = model.training
+                model.eval()
+                try:
+                    if gen_data is not None:
+                        def _select_split(ds_dict):
+                            for name in ("eval", "validation", "test", "train"):
+                                if name in ds_dict:
+                                    return ds_dict[name]
+                            return ds_dict[next(iter(ds_dict.keys()))]
+
+                        try:
+                            ds_dict = load_dataset(gen_data)
+                            gen_ds = _select_split(ds_dict) if hasattr(ds_dict, "keys") else ds_dict
+                        except Exception as exc:
+                            print(f"[gen_data] Failed to load dataset '{gen_data}': {exc}")
+                            return None
+
+                        if len(gen_ds) == 0:
+                            print(f"[gen_data] Dataset '{gen_data}' is empty.")
+                            return None
+
+                        print(f"[gen_data] (train end) Generating answers for {len(gen_ds)} prompts from '{gen_data}'...")
+                        for sample in tqdm(gen_ds, desc="[gen_data] (train end) Generating", leave=False):
+                            prompt_text = sample.get("prompt") if hasattr(sample, "get") else None
+                            if not isinstance(prompt_text, str):
+                                continue
+                            prompt = format_prompt(
+                                input=prompt_text,
+                                eos_token=self.processing_class.eos_token,
+                            )
+                            tokenized = self.processing_class(prompt, return_tensors="pt")
+                            tokenized = {k: v.to(model.device) for k, v in tokenized.items()}
+                            with torch.no_grad():
+                                output_ids = model.generate(
+                                    **tokenized,
+                                    max_new_tokens=64,
+                                )
+                            generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
+                            decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
+                            rows.append(
+                                {
+                                    "prompt": prompt_text,
+                                    "output": decoded,
+                                    "safe": sample.get("safe") if hasattr(sample, "get") else None,
+                                }
+                            )
+                    else:
+                        # Default: generate from the validation set used in normal eval,
+                        # but only for samples with safe=True.
+                        gen_ds = self.eval_dataset
+                        if hasattr(gen_ds, "filter"):
+                            gen_ds = gen_ds.filter(lambda x: _to_bool(x.get("safe", False)) is True)
+
+                        try:
+                            n_gen = len(gen_ds)
+                        except Exception:
+                            n_gen = None
+
+                        if n_gen == 0:
+                            print("[gen_data] (train end) No safe=True samples found in validation set.")
+                            return None
+
+                        n_str = str(n_gen) if n_gen is not None else "?"
+                        print(f"[gen_data] (train end) Generating answers for {n_str} safe=True validation prompts...")
+
+                        def _as_tensor(x):
+                            if isinstance(x, torch.Tensor):
+                                return x
+                            return torch.tensor(x)
+
+                        for i in tqdm(range(len(gen_ds)), desc="[gen_data] (train end) Generating (val safe=True)", leave=False):
+                            sample = gen_ds[i]
+                            if not _to_bool(sample.get("safe", False)):
+                                continue
+
+                            input_ids = _as_tensor(sample["input_ids"]).to(model.device)
+                            response_mask = _as_tensor(sample["response_mask"]).bool()
+                            # Prompt ends where response_mask turns True for the first time.
+                            true_pos = torch.where(response_mask)[0]
+                            if true_pos.numel() == 0:
+                                # Fallback: can't find boundary; skip.
+                                continue
+                            prompt_end = int(true_pos[0].item())
+                            if prompt_end <= 0:
+                                continue
+
+                            prompt_ids = input_ids[:prompt_end].unsqueeze(0)
+                            attn = torch.ones_like(prompt_ids, device=model.device)
+                            prompt_text = self.processing_class.decode(prompt_ids[0], skip_special_tokens=True)
+
+                            with torch.no_grad():
+                                output_ids = model.generate(
+                                    input_ids=prompt_ids,
+                                    attention_mask=attn,
+                                    max_new_tokens=64,
+                                )
+                            generated_ids = output_ids[0][prompt_ids.shape[1]:]
+                            decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
+                            rows.append(
+                                {
+                                    "prompt": prompt_text,
+                                    "output": decoded,
+                                    "safe": True,
+                                }
+                            )
+                finally:
+                    if was_training:
+                        model.train()
+
+                print("[gen_data] (train end) Generation complete.")
+                return _log_outputs("safe_generate_train_end", rows)
+
             def _compute_metrics(self, pred):
 
                 logits_chunks = pred.predictions
@@ -621,8 +805,6 @@ class SAFETY(Experiment):
                     
                 answer_log_probs = torch.tensor(logits); indexes = torch.tensor(indexes); 
                 cfg = self.custom_cfg.exp
-                
-                self._generate_eval_answers()
 
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
