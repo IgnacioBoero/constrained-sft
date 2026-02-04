@@ -51,8 +51,8 @@ train:
     num_train_epochs: 5                      # ST example uses 1 epoch
     learning_rate: 1e-3
     lr_scheduler_type: "linear"
-    warmup_ratio: 0.0
-    weight_decay: 0.0
+    warmup_ratio: 0.3
+    weight_decay: 0.05
     eval_strategy: "epoch"
     save_strategy: "no"
     gradient_checkpointing: false
