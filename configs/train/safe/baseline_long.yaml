@@ -6,7 +6,6 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: erm
-      exp.loss_alpha: 0
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -69,4 +68,4 @@ exp:
   name: "safety"
   model_name: huggyllama/llama-7b
   loss_type: erm
-  alpha: 0.0
+  loss_alpha: 0
