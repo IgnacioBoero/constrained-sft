@@ -751,7 +751,7 @@ class SAFETY(Experiment):
                                 output_ids = model.generate(
                                     input_ids=prompt_ids,
                                     attention_mask=attn,
-                                    max_new_tokens=64,
+                                    max_new_tokens=512,
                                 )
                             generated_ids = output_ids[0][prompt_ids.shape[1]:]
                             decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
