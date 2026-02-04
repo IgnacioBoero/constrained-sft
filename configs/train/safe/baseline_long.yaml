@@ -53,7 +53,7 @@ train:
     lr_scheduler_type: "linear"
     warmup_ratio: 0.3
     weight_decay: 0.05
-    eval_strategy: "epoch"
+    eval_strategy: "no"
     save_strategy: "no"
     gradient_checkpointing: false
     load_best_model_at_end: false
