@@ -434,14 +434,7 @@ class SAFETY(Experiment):
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 num_tokens = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                # if model is training, we need to reduce the number of tokens across all processes
-                if log_probs.requires_grad:
-                    # fixed normalization factor to account for gradient accumulation steps
-                    total_tokens = 250*answer_log_probs.shape[0]
-                else:
-                    total_tokens = num_tokens.sum()
-                    if dist.is_initialized():
-                        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)/dist.get_world_size()
+                total_tokens = 250*answer_log_probs.shape[0]
                 loss = -1 * answer_log_probs.shape[0] * answer_log_probs / total_tokens # multiply by batch size to get tokenwise CE
                 answer_log_probs = answer_log_probs / num_tokens
                 slack = (cfg.tol - answer_log_probs) * is_constraint.float()
