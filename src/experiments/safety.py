@@ -691,7 +691,8 @@ class SAFETY(Experiment):
                             with torch.no_grad():
                                 output_ids = model.generate(
                                     **tokenized,
-                                    max_new_tokens=64,
+                                    max_new_tokens=512,
+                                    no_repeat_ngram_size=5
                                 )
                             generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
                             decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
