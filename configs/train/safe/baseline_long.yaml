@@ -23,7 +23,7 @@ train:
   use_wandb: true
   save_model: true
   wandb_project: "SAFE-llama2-long1k"
-  safe_dataset_name: "iboero/SAFE-ALPACA-3"
+  safe_dataset_name: "iboero16/SAFE-ALPACA-3"
   run_name: "run-alpha:${exp.loss_alpha}-tol:${exp.tol}-lr:${exp.dual_step_size}"
   eval_on_train: true
   enable_profiler: false
@@ -45,8 +45,8 @@ train:
     lora_alpha: 16
     lora_dropout: 0.05
   hf_args:
-    per_device_train_batch_size: 8          # ST recipe
-    per_device_eval_batch_size: 8
+    per_device_train_batch_size: 1          # ST recipe
+    per_device_eval_batch_size: 1
     gradient_accumulation_steps: 4
     eval_accumulation_steps: 8
     num_train_epochs: 10                      # ST example uses 1 epoch

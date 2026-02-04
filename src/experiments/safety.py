@@ -64,7 +64,7 @@ class SAFETY(Experiment):
                 },
             )
         else:
-            safe_dataset_name = getattr(cfg.train, "safe_dataset_name", "iboero/SAFE-ALPACA-3") #"ihounie/skillmix-safe-1k"
+            safe_dataset_name = getattr(cfg.train, "safe_dataset_name", "iboero16/SAFE-ALPACA-3") #"ihounie/skillmix-safe-1k"
             ds = load_dataset(safe_dataset_name)
 
         tr_raw = ds["train"]
