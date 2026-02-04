@@ -136,18 +136,48 @@ def main(cfg: DictConfig):
         )
 
 
-    if getattr(cfg.train, "save_model", False) and is_global_main_process():
-        out_dir = Path(cfg.train.output_dir) / "lora_adapters"
-        out_dir.mkdir(parents=True, exist_ok=True)
+    push_adapters_to_wandb = getattr(cfg.train, "push_adapters_to_wandb", False)
+    should_save_adapters = bool(getattr(cfg.train, "save_model", False) or push_adapters_to_wandb)
+    adapters_out_dir = Path(cfg.train.output_dir) / "lora_adapters"
+
+    if should_save_adapters and is_global_main_process():
+        adapters_out_dir.mkdir(parents=True, exist_ok=True)
         model_to_save = trainer.model
         if hasattr(model_to_save, "module"):
             model_to_save = model_to_save.module
         if hasattr(model_to_save, "save_pretrained"):
-            model_to_save.save_pretrained(out_dir)
+            model_to_save.save_pretrained(adapters_out_dir)
             if trainer.tokenizer is not None:
-                trainer.tokenizer.save_pretrained(out_dir)
+                trainer.tokenizer.save_pretrained(adapters_out_dir)
         else:
-            print("[save-model] Model does not support save_pretrained; skipping.")
+            print("[save-model] Model does not support save_pretrained; skipping adapter save.")
+
+    if push_adapters_to_wandb and is_global_main_process():
+        if not cfg.train.use_wandb:
+            print("[wandb] push_adapters_to_wandb=true but train.use_wandb=false; skipping artifact upload.")
+        elif wandb.run is None:
+            print("[wandb] push_adapters_to_wandb=true but wandb.run is None; skipping artifact upload.")
+        else:
+            if not adapters_out_dir.exists():
+                print(f"[wandb] Adapter directory not found at {adapters_out_dir}; skipping artifact upload.")
+            else:
+                artifact_name = f"{wandb.run.id}-lora_adapters"
+                artifact = wandb.Artifact(
+                    name=artifact_name,
+                    type="lora_adapters",
+                    metadata={
+                        "output_dir": str(cfg.train.output_dir),
+                        "exp_name": str(getattr(cfg.exp, "name", "")),
+                        "model_name": str(getattr(cfg.exp, "model_name", "")),
+                        "global_step": int(getattr(trainer.state, "global_step", 0) or 0),
+                    },
+                )
+                artifact.add_dir(str(adapters_out_dir))
+                wandb.log_artifact(artifact, aliases=["latest"])
+                try:
+                    artifact.wait()
+                except Exception as exc:
+                    print(f"[wandb] Artifact upload did not complete cleanly: {exc}")
 
     # Finish wandb run
     if cfg.train.use_wandb and is_global_main_process():
