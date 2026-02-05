@@ -41,6 +41,10 @@ class SAFETY(Experiment):
                             ],
                         ),
                     )
+        # With gradient checkpointing + PEFT, inputs must require grads or loss has no grad_fn.
+        if getattr(cfg.train, "hf_args", None) is not None and getattr(cfg.train.hf_args, "gradient_checkpointing", False):
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
         return model, tok
 
     def load_datasets(self, cfg):

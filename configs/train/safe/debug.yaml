@@ -48,7 +48,7 @@ train:
     weight_decay: 0.01
     eval_strategy: "no"
     save_strategy: "no"
-    gradient_checkpointing: true
+    gradient_checkpointing: false
     # load_best_model_at_end: true
     # metric_for_best_model: "objective"
     # greater_is_better: true
