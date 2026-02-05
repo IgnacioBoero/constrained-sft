@@ -30,7 +30,7 @@ train:
   dropout: 0.0
   data_proportion: 1.0
   # Optional: cap number of prompts for train-end generation/logprob eval. Disabled by default.
-  max_gen: null
+  max_gen: 100
   max_length: 2048
   eval_at_end: true
   filter_longest: true
@@ -61,7 +61,7 @@ train:
 
 exp:
   name: "safety"
-  model_name: huggyllama/llama-7b
+  model_name: ihounie/Llama-2-7B-hf_lora_r_1_alpha_16
   loss_type: penalty
   tol: 0.0
   loss_alpha: 100
