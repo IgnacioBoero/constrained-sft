@@ -5,8 +5,10 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_type: penalty
+      exp.loss_type: aug_dual
       exp.loss_alpha: 10.0
+      exp.tol: -1.0
+      exp.dual_step_size: 0.1
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -43,8 +45,8 @@ train:
     lora_dropout: 0.05
   hf_args:
     per_device_train_batch_size: 8          # ST recipe
-    per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 4
+    per_device_eval_batch_size: 8
+    gradient_accumulation_steps: 8
     eval_accumulation_steps: 4
     num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 5e-4
@@ -54,10 +56,6 @@ train:
     eval_strategy: "no"
     save_strategy: "no"
     gradient_checkpointing: false
-    # load_best_model_at_end: true
-    # metric_for_best_model: "objective"
-    # greater_is_better: true
-    # save_total_limit: 1
     eval_do_concat_batches: false
     bf16: true
     fp16: false
@@ -65,7 +63,7 @@ train:
 exp:
   name: "safety"
   model_name: ihounie/huggy-2-1k-alpaca-f16
-  loss_type: penalty
-  tol: 0.0
-  loss_alpha: 10
-  dual_step_size: 0
+  loss_type: aug_dual
+  tol: -1.2
+  loss_alpha: 10.0  
+  dual_step_size: 0.1
