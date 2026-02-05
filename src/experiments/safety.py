@@ -171,9 +171,9 @@ class SAFETY(Experiment):
                 )
 
             # Keep raw reference outputs around for train-end logging/comparison.
-            # Some datasets also provide an `unsafe_output` column (assumed by train-end eval).
+            # Some datasets also provide an `unsafe_response` column (assumed by train-end eval).
             answer = sample.get("output", "")
-            unsafe_answer = sample.get("unsafe_output", "")
+            unsafe_answer = sample.get("unsafe_response", "")
             prompt = format_prompt(input=input_text, eos_token=tok.eos_token)
             text = prompt + answer
 
@@ -232,7 +232,7 @@ class SAFETY(Experiment):
                 "response_mask": response_mask,
                 "index": index,
                 "output": answer,
-                "unsafe_output": unsafe_answer,
+                "unsafe_response": unsafe_answer,
                 #"labels": labels,
             }
         return fn
@@ -592,7 +592,7 @@ class SAFETY(Experiment):
                     return result
 
                 try:
-                    gen_ds = load_dataset("ihounie/SAFE-ALPACA-4")["eval"]
+                    gen_ds = load_dataset("ihounie/SAFE-ALPACA-4")["validation"]
                 except Exception as exc:
                     print(f"[safe-generate-eval] Failed to load dataset: {exc}")
                     return None
@@ -716,11 +716,11 @@ class SAFETY(Experiment):
                         "outputs": [r.get("sampled_output") for r in rows],
                         # Additional reference answers provided by the dataset.
                         "ref_outputs": [r.get("output") for r in rows],
-                        "unsafe_outputs": [r.get("unsafe_output") for r in rows],
+                        "unsafe_responses": [r.get("unsafe_response") for r in rows],
                         "safe": [r["safe"] for r in rows],
-                        # Logprobs: dataset `output`, dataset `unsafe_output`, and sampled output.
+                        # Logprobs: dataset `output`, dataset `unsafe_response`, and sampled output.
                         "logprob_output": [r.get("logprob_output") for r in rows],
-                        "logprob_unsafe_output": [r.get("logprob_unsafe_output") for r in rows],
+                        "logprob_unsafe_response": [r.get("logprob_unsafe_response") for r in rows],
                         "logprob_sampled_output": [r.get("logprob_sampled_output") for r in rows],
                     }
                     if cfg.train.use_wandb:
@@ -733,10 +733,10 @@ class SAFETY(Experiment):
                                     "prompt",
                                     "sampled_output",
                                     "output",
-                                    "unsafe_output",
+                                    "unsafe_response",
                                     "safe",
                                     "logprob_output",
-                                    "logprob_unsafe_output",
+                                    "logprob_unsafe_response",
                                     "logprob_sampled_output",
                                 ]
                             )
@@ -745,10 +745,10 @@ class SAFETY(Experiment):
                                     r.get("prompt"),
                                     r.get("sampled_output"),
                                     r.get("output"),
-                                    r.get("unsafe_output"),
+                                    r.get("unsafe_response"),
                                     r.get("safe"),
                                     r.get("logprob_output"),
-                                    r.get("logprob_unsafe_output"),
+                                    r.get("logprob_unsafe_response"),
                                     r.get("logprob_sampled_output"),
                                 )
                             wandb.log({f"{tag}_outputs_{epoch_tag}": table})
@@ -778,6 +778,14 @@ class SAFETY(Experiment):
                 rank = dist.get_rank() if dist_on else 0
                 world_size = dist.get_world_size() if dist_on else 1
 
+                # Optional: cap number of prompts to generate/log at train end.
+                # Disabled by default (None) to preserve existing behavior.
+                max_gen = getattr(cfg.train, "max_gen", None)
+                if max_gen is not None:
+                    max_gen = int(max_gen)
+                    if max_gen <= 0:
+                        raise ValueError(f"cfg.train.max_gen must be a positive int or None, got: {max_gen}")
+
                 rows_local = []
                 model = extract_model_from_parallel(self.model)
                 was_training = model.training
@@ -804,6 +812,8 @@ class SAFETY(Experiment):
                             return None
 
                         n_total = len(gen_ds)
+                        if max_gen is not None:
+                            n_total = min(n_total, max_gen)
                         if rank == 0:
                             print(f"[gen_data] (train end) Generating answers for {n_total} prompts from '{gen_data}' across {world_size} ranks...")
 
@@ -831,7 +841,7 @@ class SAFETY(Experiment):
 
                             prompt_ids_1d = tokenized["input_ids"][0]
                             ref_out = sample.get("output") if hasattr(sample, "get") else None
-                            unsafe_out = sample.get("unsafe_output") if hasattr(sample, "get") else None
+                            unsafe_out = sample.get("unsafe_response") if hasattr(sample, "get") else None
                             lp_out, _ = _avg_logprob_answer(prompt_ids_1d, ref_out)
                             lp_unsafe, _ = _avg_logprob_answer(prompt_ids_1d, unsafe_out)
                             lp_sampled, _ = _avg_logprob_answer(prompt_ids_1d, decoded)
@@ -841,11 +851,11 @@ class SAFETY(Experiment):
                                     "i": int(i),
                                     "prompt": prompt_text,
                                     "output": ref_out,
-                                    "unsafe_output": unsafe_out,
+                                    "unsafe_response": unsafe_out,
                                     "sampled_output": decoded,
                                     "safe": sample.get("safe") if hasattr(sample, "get") else None,
                                     "logprob_output": lp_out,
-                                    "logprob_unsafe_output": lp_unsafe,
+                                    "logprob_unsafe_response": lp_unsafe,
                                     "logprob_sampled_output": lp_sampled,
                                 }
                             )
@@ -877,6 +887,8 @@ class SAFETY(Experiment):
 
                         # After filtering, all rows should be safe=True, but keep the guard.
                         n_total = len(gen_ds)
+                        if max_gen is not None:
+                            n_total = min(n_total, max_gen)
                         local_indices = list(range(rank, n_total, world_size))
                         for i in tqdm(local_indices, desc=f"[gen_data] (train end) Generating (val safe=True) [rank {rank}]", leave=False):
                             sample = gen_ds[i]
@@ -909,7 +921,7 @@ class SAFETY(Experiment):
 
                             # Reference answers are expected to be present on the (preprocessed) dataset.
                             ref_out = sample.get("output")
-                            unsafe_out = sample.get("unsafe_output")
+                            unsafe_out = sample.get("unsafe_response")
                             prompt_ids_1d = prompt_ids[0]
                             lp_out, _ = _avg_logprob_answer(prompt_ids_1d, ref_out)
                             lp_unsafe, _ = _avg_logprob_answer(prompt_ids_1d, unsafe_out)
@@ -920,11 +932,11 @@ class SAFETY(Experiment):
                                     "i": int(i),
                                     "prompt": prompt_text,
                                     "output": ref_out,
-                                    "unsafe_output": unsafe_out,
+                                    "unsafe_response": unsafe_out,
                                     "sampled_output": decoded,
                                     "safe": True,
                                     "logprob_output": lp_out,
-                                    "logprob_unsafe_output": lp_unsafe,
+                                    "logprob_unsafe_response": lp_unsafe,
                                     "logprob_sampled_output": lp_sampled,
                                 }
                             )

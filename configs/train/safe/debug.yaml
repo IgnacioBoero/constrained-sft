@@ -29,6 +29,8 @@ train:
   include_inputs_for_metrics: true
   dropout: 0.0
   data_proportion: 1.0
+  # Optional: cap number of prompts for train-end generation/logprob eval. Disabled by default.
+  max_gen: null
   max_length: 2048
   eval_at_end: true
   filter_longest: true
