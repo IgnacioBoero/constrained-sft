@@ -44,7 +44,7 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("iboero16/SAFE-ALPACA-3")
+        ds = load_dataset("ihounie/SAFE-ALPACA-4")
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
@@ -166,7 +166,10 @@ class SAFETY(Experiment):
                     f"Unsupported type of `input`: {type(input_text)}. Expected: str."
                 )
 
-            answer = sample["output"]
+            # Keep raw reference outputs around for train-end logging/comparison.
+            # Some datasets also provide an `unsafe_output` column (assumed by train-end eval).
+            answer = sample.get("output", "")
+            unsafe_answer = sample.get("unsafe_output", "")
             prompt = format_prompt(input=input_text, eos_token=tok.eos_token)
             text = prompt + answer
 
@@ -224,6 +227,8 @@ class SAFETY(Experiment):
                 "safe": sample["safety_label"],
                 "response_mask": response_mask,
                 "index": index,
+                "output": answer,
+                "unsafe_output": unsafe_answer,
                 #"labels": labels,
             }
         return fn
@@ -434,10 +439,39 @@ class SAFETY(Experiment):
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 num_tokens = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
-                total_tokens = 250*answer_log_probs.shape[0]
-                loss = -1 * answer_log_probs.shape[0] * answer_log_probs / total_tokens # multiply by batch size to get tokenwise CE
                 answer_log_probs = answer_log_probs / num_tokens
-                slack = (cfg.tol - answer_log_probs) * is_constraint.float()
+                # Additional forward pass with adapters disabled (or base model) for KL objective.
+                device = input_ids.device
+                with torch.no_grad():
+                    if hasattr(model, "disable_adapter"):
+                        with model.disable_adapter():
+                            base_outputs = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                            )
+                    elif hasattr(model, "module") and hasattr(model.module, "disable_adapter"):
+                        with model.module.disable_adapter():
+                            base_outputs = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                            )
+                    else:
+                        raise RuntimeError(
+                            "KL objective requires PEFT LoRA adapters. "
+                            "Expected model to expose `.disable_adapter()` (PeftModel)."
+                        )
+                    base_logits = base_outputs.logits[:, :-1]
+                    base_log_probs = F.log_softmax(base_logits, dim=-1)
+                # Tokenwise KL divergence between current model and base model.
+                probs = log_probs.exp()
+                kl_token = (probs * (log_probs - base_log_probs)).sum(dim=-1)
+                kl_token = kl_token * response_mask[:, 1:]
+                kl_sum = kl_token.sum(dim=-1) / num_tokens
+                # if model is training, we need to reduce the number of tokens across all processes
+                # main objective: avg KL divergence vs. base model
+                loss = kl_sum
+                if cfg.loss_type != "erm":
+                    slack = (cfg.tol - answer_log_probs) * is_constraint.float()
 
                 if cfg.loss_type == "avg":
                         dual_avg = self.avg_dual.clone()
@@ -554,7 +588,7 @@ class SAFETY(Experiment):
                     return result
 
                 try:
-                    gen_ds = load_dataset("iboero16/safe-generate-eval")["eval"]
+                    gen_ds = load_dataset("ihounie/SAFE-ALPACA-4")["eval"]
                 except Exception as exc:
                     print(f"[safe-generate-eval] Failed to load dataset: {exc}")
                     return None
@@ -610,6 +644,58 @@ class SAFETY(Experiment):
 
                 cfg = self.custom_cfg
 
+                def _avg_logprob_answer(prompt_ids_1d: torch.Tensor, answer_text):
+                    """
+                    Compute average token logprob of `answer_text` conditioned on `prompt_ids_1d`
+                    under the *current* model (after training).
+                    Returns (avg_logprob, n_tokens). If answer is missing/empty, returns (None, 0).
+                    """
+                    if not isinstance(answer_text, str):
+                        return None, 0
+                    if answer_text.strip() == "":
+                        return None, 0
+
+                    # Tokenize answer without adding BOS/EOS; we want the exact answer tokens.
+                    ans_ids = self.processing_class(
+                        answer_text,
+                        add_special_tokens=False,
+                        return_tensors="pt",
+                    )["input_ids"][0]
+                    if ans_ids.numel() == 0:
+                        return None, 0
+
+                    device = prompt_ids_1d.device
+                    ans_ids = ans_ids.to(device)
+
+                    full_ids = torch.cat([prompt_ids_1d, ans_ids], dim=0)
+
+                    # Truncate from the left if needed (keep the tail so answer remains).
+                    max_len = int(getattr(cfg.train, "max_length", getattr(self.processing_class, "model_max_length", 2048)))
+                    prompt_len_eff = int(prompt_ids_1d.numel())
+                    if full_ids.numel() > max_len:
+                        overflow = int(full_ids.numel() - max_len)
+                        full_ids = full_ids[overflow:]
+                        prompt_len_eff = max(0, prompt_len_eff - overflow)
+
+                    # Answer starts after the (possibly truncated) prompt prefix.
+                    start = int(prompt_len_eff)
+                    if start >= full_ids.numel():
+                        return None, 0
+                    # Need at least one token before start to index logits[start-1]
+                    start = max(1, start)
+
+                    attn = torch.ones((1, full_ids.numel()), dtype=torch.long, device=device)
+                    with torch.no_grad():
+                        out = model(input_ids=full_ids.unsqueeze(0), attention_mask=attn)
+                        # out.logits: (1, L, V); use positions [start-1 .. L-2] to score targets [start .. L-1]
+                        lp = F.log_softmax(out.logits[0], dim=-1)
+                        lp_pos = lp[start - 1 : full_ids.numel() - 1]  # (T, V)
+                        targets = full_ids[start:]  # (T,)
+                        token_lp = torch.gather(lp_pos, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)  # (T,)
+                        avg_lp = (token_lp.mean()).item()
+                        n_tok = int(token_lp.numel())
+                    return float(avg_lp), n_tok
+
                 def _to_bool(x):
                     if isinstance(x, bool):
                         return x
@@ -622,17 +708,45 @@ class SAFETY(Experiment):
                 def _log_outputs(tag, rows):
                     result = {
                         "prompts": [r["prompt"] for r in rows],
-                        "outputs": [r["output"] for r in rows],
+                        # Backward-compatible: `outputs` remains the newly sampled answers.
+                        "outputs": [r.get("sampled_output") for r in rows],
+                        # Additional reference answers provided by the dataset.
+                        "ref_outputs": [r.get("output") for r in rows],
+                        "unsafe_outputs": [r.get("unsafe_output") for r in rows],
                         "safe": [r["safe"] for r in rows],
+                        # Logprobs: dataset `output`, dataset `unsafe_output`, and sampled output.
+                        "logprob_output": [r.get("logprob_output") for r in rows],
+                        "logprob_unsafe_output": [r.get("logprob_unsafe_output") for r in rows],
+                        "logprob_sampled_output": [r.get("logprob_sampled_output") for r in rows],
                     }
                     if cfg.train.use_wandb:
                         import wandb
                         if wandb.run is not None:
                             epoch = self.state.epoch
                             epoch_tag = f"epoch_{int(epoch)}" if epoch is not None else "epoch_unknown"
-                            table = wandb.Table(columns=["prompt", "answer", "safe"])
+                            table = wandb.Table(
+                                columns=[
+                                    "prompt",
+                                    "sampled_output",
+                                    "output",
+                                    "unsafe_output",
+                                    "safe",
+                                    "logprob_output",
+                                    "logprob_unsafe_output",
+                                    "logprob_sampled_output",
+                                ]
+                            )
                             for r in rows:
-                                table.add_data(r["prompt"], r["output"], r["safe"])
+                                table.add_data(
+                                    r.get("prompt"),
+                                    r.get("sampled_output"),
+                                    r.get("output"),
+                                    r.get("unsafe_output"),
+                                    r.get("safe"),
+                                    r.get("logprob_output"),
+                                    r.get("logprob_unsafe_output"),
+                                    r.get("logprob_sampled_output"),
+                                )
                             wandb.log({f"{tag}_outputs_{epoch_tag}": table})
 
                             out_dir = Path(cfg.train.output_dir)
@@ -710,12 +824,25 @@ class SAFETY(Experiment):
                                 )
                             generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
                             decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
+
+                            prompt_ids_1d = tokenized["input_ids"][0]
+                            ref_out = sample.get("output") if hasattr(sample, "get") else None
+                            unsafe_out = sample.get("unsafe_output") if hasattr(sample, "get") else None
+                            lp_out, _ = _avg_logprob_answer(prompt_ids_1d, ref_out)
+                            lp_unsafe, _ = _avg_logprob_answer(prompt_ids_1d, unsafe_out)
+                            lp_sampled, _ = _avg_logprob_answer(prompt_ids_1d, decoded)
+
                             rows_local.append(
                                 {
                                     "i": int(i),
                                     "prompt": prompt_text,
-                                    "output": decoded,
+                                    "output": ref_out,
+                                    "unsafe_output": unsafe_out,
+                                    "sampled_output": decoded,
                                     "safe": sample.get("safe") if hasattr(sample, "get") else None,
+                                    "logprob_output": lp_out,
+                                    "logprob_unsafe_output": lp_unsafe,
+                                    "logprob_sampled_output": lp_sampled,
                                 }
                             )
                     else:
@@ -775,12 +902,26 @@ class SAFETY(Experiment):
                                 )
                             generated_ids = output_ids[0][prompt_ids.shape[1]:]
                             decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
+
+                            # Reference answers are expected to be present on the (preprocessed) dataset.
+                            ref_out = sample.get("output")
+                            unsafe_out = sample.get("unsafe_output")
+                            prompt_ids_1d = prompt_ids[0]
+                            lp_out, _ = _avg_logprob_answer(prompt_ids_1d, ref_out)
+                            lp_unsafe, _ = _avg_logprob_answer(prompt_ids_1d, unsafe_out)
+                            lp_sampled, _ = _avg_logprob_answer(prompt_ids_1d, decoded)
+
                             rows_local.append(
                                 {
                                     "i": int(i),
                                     "prompt": prompt_text,
-                                    "output": decoded,
+                                    "output": ref_out,
+                                    "unsafe_output": unsafe_out,
+                                    "sampled_output": decoded,
                                     "safe": True,
+                                    "logprob_output": lp_out,
+                                    "logprob_unsafe_output": lp_unsafe,
+                                    "logprob_sampled_output": lp_sampled,
                                 }
                             )
                 finally:
