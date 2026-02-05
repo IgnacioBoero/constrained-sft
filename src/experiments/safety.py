@@ -598,11 +598,12 @@ class SAFETY(Experiment):
             def _generate_eval_answers_end_of_training(self):
                 """
                 Generate answers for a fixed evaluation prompt set once at the very end
-                of training (rank-0 only). This avoids doing generation during each eval.
+                of training. This avoids doing generation during each eval.
+
+                Multi-GPU: if torch.distributed is initialized, we shard prompts across
+                ranks and gather the generated rows to rank 0 for logging.
                 """
                 if self._generated_eval_answers:
-                    return None
-                if not self.is_world_process_zero():
                     return None
 
                 self._generated_eval_answers = True
@@ -654,7 +655,12 @@ class SAFETY(Experiment):
                 if isinstance(gen_data, str) and not gen_data.strip():
                     gen_data = None
 
-                rows = []
+                # Dist info
+                dist_on = dist.is_available() and dist.is_initialized()
+                rank = dist.get_rank() if dist_on else 0
+                world_size = dist.get_world_size() if dist_on else 1
+
+                rows_local = []
                 model = extract_model_from_parallel(self.model)
                 was_training = model.training
                 model.eval()
@@ -670,15 +676,23 @@ class SAFETY(Experiment):
                             ds_dict = load_dataset(gen_data)
                             gen_ds = _select_split(ds_dict) if hasattr(ds_dict, "keys") else ds_dict
                         except Exception as exc:
-                            print(f"[gen_data] Failed to load dataset '{gen_data}': {exc}")
+                            if rank == 0:
+                                print(f"[gen_data] Failed to load dataset '{gen_data}': {exc}")
                             return None
 
                         if len(gen_ds) == 0:
-                            print(f"[gen_data] Dataset '{gen_data}' is empty.")
+                            if rank == 0:
+                                print(f"[gen_data] Dataset '{gen_data}' is empty.")
                             return None
 
-                        print(f"[gen_data] (train end) Generating answers for {len(gen_ds)} prompts from '{gen_data}'...")
-                        for sample in tqdm(gen_ds, desc="[gen_data] (train end) Generating", leave=False):
+                        n_total = len(gen_ds)
+                        if rank == 0:
+                            print(f"[gen_data] (train end) Generating answers for {n_total} prompts from '{gen_data}' across {world_size} ranks...")
+
+                        # Shard indices across ranks (strided to avoid needing a sampler)
+                        local_indices = list(range(rank, n_total, world_size))
+                        for i in tqdm(local_indices, desc=f"[gen_data] (train end) Generating [rank {rank}]", leave=False):
+                            sample = gen_ds[i]
                             prompt_text = sample.get("prompt") if hasattr(sample, "get") else None
                             if not isinstance(prompt_text, str):
                                 continue
@@ -696,8 +710,9 @@ class SAFETY(Experiment):
                                 )
                             generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
                             decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
-                            rows.append(
+                            rows_local.append(
                                 {
+                                    "i": int(i),
                                     "prompt": prompt_text,
                                     "output": decoded,
                                     "safe": sample.get("safe") if hasattr(sample, "get") else None,
@@ -716,20 +731,25 @@ class SAFETY(Experiment):
                             n_gen = None
 
                         if n_gen == 0:
-                            print("[gen_data] (train end) No safe=True samples found in validation set.")
+                            if rank == 0:
+                                print("[gen_data] (train end) No safe=True samples found in validation set.")
                             return None
 
                         n_str = str(n_gen) if n_gen is not None else "?"
-                        print(f"[gen_data] (train end) Generating answers for {n_str} safe=True validation prompts...")
+                        if rank == 0:
+                            print(f"[gen_data] (train end) Generating answers for {n_str} safe=True validation prompts across {world_size} ranks...")
 
                         def _as_tensor(x):
                             if isinstance(x, torch.Tensor):
                                 return x
                             return torch.tensor(x)
 
-                        for i in tqdm(range(len(gen_ds)), desc="[gen_data] (train end) Generating (val safe=True)", leave=False):
+                        # After filtering, all rows should be safe=True, but keep the guard.
+                        n_total = len(gen_ds)
+                        local_indices = list(range(rank, n_total, world_size))
+                        for i in tqdm(local_indices, desc=f"[gen_data] (train end) Generating (val safe=True) [rank {rank}]", leave=False):
                             sample = gen_ds[i]
-                            if not _to_bool(sample.get("safe", False)):
+                            if not _to_bool(sample.get("safe", True)):
                                 continue
 
                             input_ids = _as_tensor(sample["input_ids"]).to(model.device)
@@ -755,8 +775,9 @@ class SAFETY(Experiment):
                                 )
                             generated_ids = output_ids[0][prompt_ids.shape[1]:]
                             decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
-                            rows.append(
+                            rows_local.append(
                                 {
+                                    "i": int(i),
                                     "prompt": prompt_text,
                                     "output": decoded,
                                     "safe": True,
@@ -766,8 +787,31 @@ class SAFETY(Experiment):
                     if was_training:
                         model.train()
 
-                print("[gen_data] (train end) Generation complete.")
-                return _log_outputs("safe_generate_train_end", rows)
+                # Gather results to rank 0 for a single log/artifact.
+                if dist_on and world_size > 1:
+                    gathered = [None for _ in range(world_size)]
+                    dist.all_gather_object(gathered, rows_local)
+                    if rank == 0:
+                        rows_all = []
+                        for part in gathered:
+                            if part:
+                                rows_all.extend(part)
+                        # Stable-ish ordering
+                        rows_all.sort(key=lambda r: r.get("i", 0))
+                        for r in rows_all:
+                            r.pop("i", None)
+                        print("[gen_data] (train end) Generation complete.")
+                        return _log_outputs("safe_generate_train_end", rows_all)
+                    return None
+                else:
+                    # Single process
+                    rows_local.sort(key=lambda r: r.get("i", 0))
+                    for r in rows_local:
+                        r.pop("i", None)
+                    if rank == 0:
+                        print("[gen_data] (train end) Generation complete.")
+                        return _log_outputs("safe_generate_train_end", rows_local)
+                    return None
 
             def _compute_metrics(self, pred):
 
