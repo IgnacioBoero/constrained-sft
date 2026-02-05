@@ -28,7 +28,7 @@ train:
   enable_profiler: false
   include_inputs_for_metrics: true
   dropout: 0.0
-  data_proportion: 1.0
+  data_proportion: 0.1
   # Optional: cap number of prompts for train-end generation/logprob eval. Disabled by default.
   max_gen: 100
   max_length: 2048
@@ -61,7 +61,7 @@ train:
 
 exp:
   name: "safety"
-  model_name: ihounie/Llama-2-7B-hf_lora_r_1_alpha_16
+  model_name: ihounie/huggy-2-1k-alpaca-f16
   loss_type: penalty
   tol: 0.0
   loss_alpha: 100
