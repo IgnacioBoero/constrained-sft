@@ -62,6 +62,7 @@ train:
 exp:
   name: "safety"
   model_name: ihounie/huggy-2-1k-alpaca-f16
+  dataset: ihounie/SAFE-ALPACA-BTails
   loss_type: penalty
   tol: 0.0
   loss_alpha: 100

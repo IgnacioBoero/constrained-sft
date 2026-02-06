@@ -48,7 +48,8 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        ds = load_dataset("ihounie/SAFE-ALPACA-4")
+        dataset_name = getattr(cfg.exp, "dataset", "ihounie/SAFE-ALPACA-4")
+        ds = load_dataset(dataset_name)
 
         tr_raw = ds["train"]
         ev_raw = ds["validation"]
@@ -592,7 +593,8 @@ class SAFETY(Experiment):
                     return result
 
                 try:
-                    gen_ds = load_dataset("ihounie/SAFE-ALPACA-4")["validation"]
+                    dataset_name = getattr(self.custom_cfg.exp, "dataset", "ihounie/SAFE-ALPACA-4")
+                    gen_ds = load_dataset(dataset_name)["validation"]
                 except Exception as exc:
                     print(f"[safe-generate-eval] Failed to load dataset: {exc}")
                     return None
