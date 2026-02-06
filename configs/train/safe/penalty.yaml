@@ -44,7 +44,7 @@ train:
   hf_args:
     per_device_train_batch_size: 8          # ST recipe
     per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 16
     eval_accumulation_steps: 4
     num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 5e-4
