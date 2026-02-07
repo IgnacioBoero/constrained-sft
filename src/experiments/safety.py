@@ -862,85 +862,122 @@ class SAFETY(Experiment):
                                 }
                             )
                     else:
-                        # Default: generate from the validation set used in normal eval,
-                        # but only for samples with safe=True.
-                        gen_ds = self.eval_dataset
-                        if hasattr(gen_ds, "filter"):
-                            gen_ds = gen_ds.filter(lambda x: _to_bool(x.get("safe", False)) is True)
+                        # Default: generate from the validation set used in normal eval.
+                        # We generate answers for safe=True samples, and ALSO for an equal number
+                        # of safe=False samples. The unsafe subset is selected deterministically
+                        # by taking the first N (so results are comparable across runs/tasks).
+                        ev_ds = self.eval_dataset
+                        if not hasattr(ev_ds, "filter"):
+                            if rank == 0:
+                                print("[gen_data] (train end) eval_dataset does not support filtering; skipping generation.")
+                            return None
 
-                        try:
-                            n_gen = len(gen_ds)
-                        except Exception:
-                            n_gen = None
+                        safe_ds = ev_ds.filter(lambda x: _to_bool(x.get("safe", False)) is True)
+                        unsafe_ds = ev_ds.filter(lambda x: _to_bool(x.get("safe", False)) is False)
 
-                        if n_gen == 0:
+                        n_safe_total = len(safe_ds)
+                        if n_safe_total == 0:
                             if rank == 0:
                                 print("[gen_data] (train end) No safe=True samples found in validation set.")
                             return None
 
-                        n_str = str(n_gen) if n_gen is not None else "?"
+                        n_safe = n_safe_total
+                        if max_gen is not None:
+                            n_safe = min(n_safe, max_gen)
+                        if hasattr(safe_ds, "select") and n_safe < n_safe_total:
+                            safe_ds = safe_ds.select(range(n_safe))
+
+                        n_unsafe_total = len(unsafe_ds)
+                        n_unsafe = min(n_unsafe_total, n_safe)
+                        if hasattr(unsafe_ds, "select") and n_unsafe < n_unsafe_total:
+                            # Deterministic subset: take the first N unsafe samples.
+                            unsafe_ds = unsafe_ds.select(range(n_unsafe))
+
                         if rank == 0:
-                            print(f"[gen_data] (train end) Generating answers for {n_str} safe=True validation prompts across {world_size} ranks...")
+                            print(
+                                f"[gen_data] (train end) Generating answers for {n_safe} safe=True and "
+                                f"{n_unsafe} safe=False validation prompts across {world_size} ranks..."
+                            )
+                            if n_unsafe_total == 0:
+                                print("[gen_data] (train end) No safe=False samples found in validation set; skipping unsafe generation.")
+                            elif n_unsafe < n_safe:
+                                print(
+                                    f"[gen_data] (train end) Only found {n_unsafe_total} safe=False samples; "
+                                    f"generating for {n_unsafe} (requested {n_safe})."
+                                )
 
                         def _as_tensor(x):
                             if isinstance(x, torch.Tensor):
                                 return x
                             return torch.tensor(x)
 
-                        # After filtering, all rows should be safe=True, but keep the guard.
-                        n_total = len(gen_ds)
-                        if max_gen is not None:
-                            n_total = min(n_total, max_gen)
-                        local_indices = list(range(rank, n_total, world_size))
-                        for i in tqdm(local_indices, desc=f"[gen_data] (train end) Generating (val safe=True) [rank {rank}]", leave=False):
-                            sample = gen_ds[i]
-                            if not _to_bool(sample.get("safe", True)):
-                                continue
+                        def _generate_rows(ds, n_total, expected_safe: bool, i_offset: int, desc: str):
+                            local_indices = list(range(rank, n_total, world_size))
+                            for i in tqdm(local_indices, desc=desc, leave=False):
+                                sample = ds[i]
+                                if _to_bool(sample.get("safe", expected_safe)) != expected_safe:
+                                    continue
 
-                            input_ids = _as_tensor(sample["input_ids"]).to(model.device)
-                            response_mask = _as_tensor(sample["response_mask"]).bool()
-                            # Prompt ends where response_mask turns True for the first time.
-                            true_pos = torch.where(response_mask)[0]
-                            if true_pos.numel() == 0:
-                                # Fallback: can't find boundary; skip.
-                                continue
-                            prompt_end = int(true_pos[0].item())
-                            if prompt_end <= 0:
-                                continue
+                                input_ids = _as_tensor(sample["input_ids"]).to(model.device)
+                                response_mask = _as_tensor(sample["response_mask"]).bool()
+                                # Prompt ends where response_mask turns True for the first time.
+                                true_pos = torch.where(response_mask)[0]
+                                if true_pos.numel() == 0:
+                                    # Fallback: can't find boundary; skip.
+                                    continue
+                                prompt_end = int(true_pos[0].item())
+                                if prompt_end <= 0:
+                                    continue
 
-                            prompt_ids = input_ids[:prompt_end].unsqueeze(0)
-                            attn = torch.ones_like(prompt_ids, device=model.device)
-                            prompt_text = self.processing_class.decode(prompt_ids[0], skip_special_tokens=True)
+                                prompt_ids = input_ids[:prompt_end].unsqueeze(0)
+                                attn = torch.ones_like(prompt_ids, device=model.device)
+                                prompt_text = self.processing_class.decode(prompt_ids[0], skip_special_tokens=True)
 
-                            with torch.no_grad():
-                                output_ids = model.generate(
-                                    input_ids=prompt_ids,
-                                    attention_mask=attn,
-                                    max_new_tokens=512,
+                                with torch.no_grad():
+                                    output_ids = model.generate(
+                                        input_ids=prompt_ids,
+                                        attention_mask=attn,
+                                        max_new_tokens=512,
+                                    )
+                                generated_ids = output_ids[0][prompt_ids.shape[1]:]
+                                decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
+
+                                # Reference answers are expected to be present on the (preprocessed) dataset.
+                                ref_out = sample.get("output")
+                                unsafe_out = sample.get("unsafe_response")
+                                prompt_ids_1d = prompt_ids[0]
+                                lp_out, _ = _avg_logprob_answer(prompt_ids_1d, ref_out)
+                                lp_unsafe, _ = _avg_logprob_answer(prompt_ids_1d, unsafe_out)
+                                lp_sampled, _ = _avg_logprob_answer(prompt_ids_1d, decoded)
+
+                                rows_local.append(
+                                    {
+                                        "i": int(i_offset + i),
+                                        "prompt": prompt_text,
+                                        "output": ref_out,
+                                        "unsafe_response": unsafe_out,
+                                        "sampled_output": decoded,
+                                        "safe": expected_safe,
+                                        "logprob_output": lp_out,
+                                        "logprob_unsafe_response": lp_unsafe,
+                                        "logprob_sampled_output": lp_sampled,
+                                    }
                                 )
-                            generated_ids = output_ids[0][prompt_ids.shape[1]:]
-                            decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
 
-                            # Reference answers are expected to be present on the (preprocessed) dataset.
-                            ref_out = sample.get("output")
-                            unsafe_out = sample.get("unsafe_response")
-                            prompt_ids_1d = prompt_ids[0]
-                            lp_out, _ = _avg_logprob_answer(prompt_ids_1d, ref_out)
-                            lp_unsafe, _ = _avg_logprob_answer(prompt_ids_1d, unsafe_out)
-                            lp_sampled, _ = _avg_logprob_answer(prompt_ids_1d, decoded)
-
-                            rows_local.append(
-                                {
-                                    "i": int(i),
-                                    "prompt": prompt_text,
-                                    "output": ref_out,
-                                    "unsafe_response": unsafe_out,
-                                    "sampled_output": decoded,
-                                    "safe": True,
-                                    "logprob_output": lp_out,
-                                    "logprob_unsafe_response": lp_unsafe,
-                                    "logprob_sampled_output": lp_sampled,
-                                }
+                        _generate_rows(
+                            safe_ds,
+                            n_safe,
+                            True,
+                            0,
+                            f"[gen_data] (train end) Generating (val safe=True) [rank {rank}]",
+                        )
+                        if n_unsafe > 0:
+                            _generate_rows(
+                                unsafe_ds,
+                                n_unsafe,
+                                False,
+                                n_safe,
+                                f"[gen_data] (train end) Generating (val safe=False) [rank {rank}]",
                             )
                 finally:
                     if was_training:
