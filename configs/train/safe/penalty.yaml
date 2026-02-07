@@ -6,7 +6,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: penalty
-      exp.loss_alpha: 10.0
+      exp.loss_alpha: 7.5
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
