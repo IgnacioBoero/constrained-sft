@@ -54,6 +54,7 @@ train:
     eval_strategy: "no"
     save_strategy: "no"
     gradient_checkpointing: false
+    ddp_find_unused_parameters: false
     # load_best_model_at_end: true
     # metric_for_best_model: "objective"
     # greater_is_better: true
