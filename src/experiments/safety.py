@@ -515,7 +515,7 @@ class SAFETY(Experiment):
                 tol2 = getattr(cfg, "tol2", None)
                 slack2 = None
 
-                if cfg.loss_type != "erm" and tol2 is not None and bool(is_not_constraint.any()):
+                if cfg.loss_type != "erm" and tol2 is not None:
                     proc = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
                     if proc is None:
                         raise RuntimeError("Could not find tokenizer/processing_class on Trainer to score safe_output.")
@@ -542,20 +542,23 @@ class SAFETY(Experiment):
                     max_len = int(input_ids.shape[1])
                     # First True position of response_mask = end of prompt.
                     prompt_ends = response_mask.long().argmax(dim=-1)  # (B,)
-                    unsafe_batch_idx = torch.nonzero(is_not_constraint, as_tuple=False).squeeze(-1).tolist()
+                    batch_idx = list(range(input_ids.shape[0]))
 
-                    # Build a *compact* batch of (prompt + refusal + EOS) sequences for unsafe samples.
-                    # IMPORTANT: don't pad to global max_len; pad only to the max length among unsafe samples
-                    # in this batch. Padding to max_len makes this extra forward extremely expensive.
+                    # Build a batch of (prompt + response + EOS) sequences for all samples.
+                    # For safety_label=True, we use an empty response (i.e., prompt + EOS).
                     safe_ids_list: list[torch.Tensor] = []
                     safe_resp_mask_list: list[torch.Tensor] = []
                     kept_idx: list[int] = []
-                    seq_lens: list[int] = []
-                    for bi in unsafe_batch_idx:
+                    for bi in batch_idx:
                         prompt_end = int(prompt_ends[bi].item())
                         prompt_ids = input_ids[bi, :prompt_end]
 
-                        full_ids = torch.cat([prompt_ids, safe_out_ids], dim=0)
+                        if is_not_constraint[bi]:
+                            resp_ids = safe_out_ids
+                        else:
+                            resp_ids = prompt_ids.new_empty((0,), dtype=prompt_ids.dtype)
+
+                        full_ids = torch.cat([prompt_ids, resp_ids], dim=0)
                         if full_ids.numel() == 0 or full_ids[-1].item() != eos_id:
                             full_ids = torch.cat([full_ids, full_ids.new_tensor([eos_id])], dim=0)
 
@@ -567,40 +570,32 @@ class SAFETY(Experiment):
                             prompt_len_eff = max(0, prompt_len - overflow)
 
                         seq_len = int(full_ids.numel())
-                        resp_m = torch.zeros(seq_len, dtype=torch.bool, device=input_ids.device)
+                        if seq_len < max_len:
+                            pad_len = max_len - seq_len
+                            full_ids = torch.cat([full_ids, full_ids.new_full((pad_len,), pad_id)], dim=0)
+                        else:
+                            full_ids = full_ids[:max_len]
+                            seq_len = max_len
+
+                        resp_m = torch.zeros(max_len, dtype=torch.bool, device=input_ids.device)
                         start = min(int(prompt_len_eff), int(seq_len))
                         resp_m[start:seq_len] = True
 
                         safe_ids_list.append(full_ids)
                         safe_resp_mask_list.append(resp_m)
                         kept_idx.append(bi)
-                        seq_lens.append(seq_len)
 
                     if kept_idx:
-                        # Pad to the max length among unsafe samples in this batch (<= max_len).
-                        safe_input_ids = pad_sequence(
-                            safe_ids_list,
-                            batch_first=True,
-                            padding_value=pad_id,
-                        )  # (U, L_u)
-                        safe_resp_mask = pad_sequence(
-                            safe_resp_mask_list,
-                            batch_first=True,
-                            padding_value=0,
-                        ).bool()  # (U, L_u)
-                        L_u = int(safe_input_ids.shape[1])
-                        seq_lens_t = torch.tensor(seq_lens, device=input_ids.device, dtype=torch.long)
-                        safe_attn = (torch.arange(L_u, device=input_ids.device)[None, :] < seq_lens_t[:, None]).bool()
+                        safe_input_ids = torch.stack(safe_ids_list, dim=0)  # (B, L)
+                        safe_resp_mask = torch.stack(safe_resp_mask_list, dim=0)  # (B, L)
+                        safe_attn = safe_input_ids.ne(pad_id)
 
                         safe_out = model(input_ids=safe_input_ids, attention_mask=safe_attn)
                         safe_logits = safe_out.logits[:, :-1]  # (U, L-1, V)
-                        # Token logp without materializing full log_softmax (saves lots of memory).
-                        safe_targets = safe_input_ids[:, 1:]
-                        safe_logsumexp = torch.logsumexp(safe_logits, dim=-1)  # (U, L-1)
-                        safe_target_logits = torch.gather(
-                            safe_logits, dim=-1, index=safe_targets.unsqueeze(-1)
+                        safe_lp = F.log_softmax(safe_logits, dim=-1)
+                        safe_tok_lp = torch.gather(
+                            safe_lp, dim=-1, index=safe_input_ids[:, 1:].unsqueeze(-1)
                         ).squeeze(-1)  # (U, L-1)
-                        safe_tok_lp = safe_target_logits - safe_logsumexp  # (U, L-1)
                         safe_tok_lp = safe_tok_lp * safe_resp_mask[:, 1:]
                         safe_sum = safe_tok_lp.sum(dim=-1)  # (U,)
                         safe_denom = safe_resp_mask[:, 1:].sum(dim=-1).clamp_min(1)
@@ -609,6 +604,7 @@ class SAFETY(Experiment):
                         # Per request: slack2 = logp - tol2 (only for unsafe samples)
                         slack2 = torch.zeros_like(answer_log_probs)
                         slack2[torch.tensor(kept_idx, device=input_ids.device, dtype=torch.long)] = safe_avg - float(tol2)
+                        slack2 = slack2 * is_not_constraint.float()
                     else:
                         slack2 = torch.zeros_like(answer_log_probs)
                 else:
@@ -1333,31 +1329,16 @@ class SAFETY(Experiment):
                         def _flush():
                             if not batch_pos:
                                 return
-                            # Pad only to the max length in this mini-batch.
-                            seq_lens_local = [int(t.numel()) for t in batch_ids]
-                            safe_input_ids = pad_sequence(
-                                batch_ids,
-                                batch_first=True,
-                                padding_value=pad_id,
-                            ).to(model_device)  # (U, L_u)
-                            safe_resp_mask = pad_sequence(
-                                batch_masks,
-                                batch_first=True,
-                                padding_value=0,
-                            ).bool().to(model_device)  # (U, L_u)
-                            L_u = int(safe_input_ids.shape[1])
-                            seq_lens_t = torch.tensor(seq_lens_local, device=model_device, dtype=torch.long)
-                            safe_attn = (torch.arange(L_u, device=model_device)[None, :] < seq_lens_t[:, None]).bool()
+                            safe_input_ids = torch.stack(batch_ids, dim=0).to(model_device)  # (U, L)
+                            safe_resp_mask = torch.stack(batch_masks, dim=0).to(model_device)  # (U, L)
+                            safe_attn = safe_input_ids.ne(pad_id)
                             with torch.no_grad():
                                 out = model(input_ids=safe_input_ids, attention_mask=safe_attn)
                                 logits = out.logits[:, :-1]
-                                # Token logp without materializing full log_softmax.
-                                targets = safe_input_ids[:, 1:]
-                                logsumexp = torch.logsumexp(logits, dim=-1)  # (U, L-1)
-                                target_logits = torch.gather(
-                                    logits, dim=-1, index=targets.unsqueeze(-1)
-                                ).squeeze(-1)  # (U, L-1)
-                                tok_lp = target_logits - logsumexp  # (U, L-1)
+                                lp = F.log_softmax(logits, dim=-1)
+                                tok_lp = torch.gather(
+                                    lp, dim=-1, index=safe_input_ids[:, 1:].unsqueeze(-1)
+                                ).squeeze(-1)
                                 tok_lp = tok_lp * safe_resp_mask[:, 1:]
                                 sum_lp = tok_lp.sum(dim=-1)
                                 denom_lp = safe_resp_mask[:, 1:].sum(dim=-1).clamp_min(1)
@@ -1386,7 +1367,14 @@ class SAFETY(Experiment):
                                 prompt_len_eff = max(0, prompt_len - overflow)
 
                             seq_len = int(full_ids.numel())
-                            resp_m = torch.zeros(seq_len, dtype=torch.bool)
+                            if seq_len < max_len:
+                                pad_len = max_len - seq_len
+                                full_ids = torch.cat([full_ids, full_ids.new_full((pad_len,), pad_id)], dim=0)
+                            else:
+                                full_ids = full_ids[:max_len]
+                                seq_len = max_len
+
+                            resp_m = torch.zeros(max_len, dtype=torch.bool)
                             start = min(int(prompt_len_eff), int(seq_len))
                             resp_m[start:seq_len] = True
 
