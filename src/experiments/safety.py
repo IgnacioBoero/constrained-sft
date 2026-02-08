@@ -260,18 +260,32 @@ class SAFETY(Experiment):
                 self.pad_token_id = pad_token_id
                 
             def __call__(self, samples):
-                
-                input_ids = right_padding(
-                            [torch.tensor(sample['input_ids']) for sample in samples],
-                            padding_value=self.pad_token_id,
-                        )
 
-                response_masks = right_padding(
-                    [torch.tensor(sample['response_mask']) for sample in samples],
-                    padding_value=0,
-                )
+                # Most preprocessing pads to fixed `max_length`, so prefer stacking (faster)
+                # and avoid decoding/handling of extra columns.
+                ids_list = [torch.as_tensor(sample["input_ids"], dtype=torch.long) for sample in samples]
+                rm_list = [torch.as_tensor(sample["response_mask"], dtype=torch.bool) for sample in samples]
 
-                attention_mask = input_ids.ne(self.pad_token_id)
+                same_len = len(ids_list) > 0 and all(x.shape == ids_list[0].shape for x in ids_list)
+                if same_len:
+                    input_ids = torch.stack(ids_list, dim=0)  # (B, L)
+                    response_masks = torch.stack(rm_list, dim=0)  # (B, L)
+                else:
+                    input_ids = right_padding(ids_list, padding_value=self.pad_token_id)
+                    response_masks = right_padding([x.to(torch.long) for x in rm_list], padding_value=0).bool()
+
+                # Build attention_mask from sequence length implied by response_masks (EOS is inside mask),
+                # instead of `input_ids != pad_id` (pad may equal eos_id).
+                # response_masks is False on padding; last True corresponds to (seq_len-1).
+                L = input_ids.shape[1]
+                rev = response_masks.flip(-1).to(torch.long)  # (B, L)
+                first_true_from_right = rev.argmax(dim=-1)     # (B,)
+                last_true = (L - 1) - first_true_from_right
+                seq_len = (last_true + 1).clamp(min=1, max=L)  # (B,)
+                attention_mask = (
+                    torch.arange(L, device=input_ids.device)[None, :] < seq_len[:, None]
+                ).bool()
+
                 safe = torch.tensor(
                     [sample['safe'] for sample in samples],
                     dtype=torch.bool,
@@ -327,6 +341,32 @@ class SAFETY(Experiment):
                 # Refusal used as `safe_output` for unsafe samples (safety_label=False).
                 self.safe_output_text = SAFE_REFUSAL_OUTPUT
                 self._safe_output_token_ids_cpu = None  # cached 1D LongTensor on CPU
+                self._maybe_optimize_train_dataset()
+
+            def _maybe_optimize_train_dataset(self):
+                """
+                Speed win for training: the processed dataset still contains long string columns
+                (`output`, `unsafe_response`, ...). Even if the collator ignores them, the dataloader
+                still decodes them unless we restrict the returned columns.
+                """
+                ds = getattr(self, "train_dataset", None)
+                if ds is None:
+                    return
+                if not hasattr(ds, "set_format"):
+                    return
+
+                keep_cols = ["input_ids", "response_mask", "safe", "index"]
+                # Only apply if all expected columns exist.
+                if not all(hasattr(ds, "column_names") and c in ds.column_names for c in keep_cols):
+                    return
+
+                try:
+                    ds.set_format(type="torch", columns=keep_cols, output_all_columns=False)
+                    if self.is_world_process_zero():
+                        print(f"[SAFETY] train_dataset set_format(torch, columns={keep_cols}) to avoid decoding text columns.")
+                except Exception as exc:
+                    if self.is_world_process_zero():
+                        print(f"[SAFETY] train_dataset set_format(...) failed (continuing): {exc}")
 
                 
             def init_dual_vars(self):
