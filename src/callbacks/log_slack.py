@@ -26,13 +26,20 @@ class ConstraintSlackWandbCallback(TrainerCallback):
 
         slacks = trainer._last_constraint_slacks.numpy()
         idxs_constraint = trainer._last_constraint_indexes.numpy()
+        safety_labels = getattr(trainer, "_last_constraint_safety_labels", None)
+        if safety_labels is not None:
+            safety_labels = safety_labels.numpy()
         
         objective_ratios = trainer._last_objective_ratios.numpy()
         idxs_objective = trainer._last_objective_indexes 
 
-        table_constraints = wandb.Table(columns=["index", "slack"])
-        for idx, slack in zip(idxs_constraint.tolist(), slacks.tolist()):
-            table_constraints.add_data(idx, slack)
+        table_constraints = wandb.Table(columns=["index", "slack", "safety_label"])
+        if safety_labels is None:
+            for idx, slack in zip(idxs_constraint.tolist(), slacks.tolist()):
+                table_constraints.add_data(idx, slack, None)
+        else:
+            for idx, slack, lbl in zip(idxs_constraint.tolist(), slacks.tolist(), safety_labels.tolist()):
+                table_constraints.add_data(idx, slack, bool(lbl))
         
         table_objective = wandb.Table(columns=["index", "objective_log_ratio"])
         for idx, ratio in zip(idxs_objective.tolist(), objective_ratios.tolist()):

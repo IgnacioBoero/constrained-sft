@@ -27,6 +27,7 @@ class TrainSetEvalCallback(TrainerCallback):
         # backup eval slacks/indexes (so outer eval can still see them)
         prev_slacks = getattr(self.trainer, "_last_constraint_slacks", None)
         prev_indexes = getattr(self.trainer, "_last_constraint_indexes", None)
+        prev_labels = getattr(self.trainer, "_last_constraint_safety_labels", None)
         prev_prefix = getattr(self.trainer, "_current_eval_prefix", "eval")
 
         # tag as train and run nested eval
@@ -41,6 +42,8 @@ class TrainSetEvalCallback(TrainerCallback):
             self.trainer._last_constraint_slacks = prev_slacks
         if prev_indexes is not None:
             self.trainer._last_constraint_indexes = prev_indexes
+        if prev_labels is not None:
+            self.trainer._last_constraint_safety_labels = prev_labels
         self.trainer._current_eval_prefix = prev_prefix
 
         self._inside = False

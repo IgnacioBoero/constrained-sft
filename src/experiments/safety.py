@@ -19,6 +19,8 @@ from utils import format_prompt, right_padding
 from peft import LoraConfig, get_peft_model
 
 
+SAFE_REFUSAL_OUTPUT = "I'm sorry, but I can't fulfill this request"
+
 class SAFETY(Experiment):
     
     def load_model_and_tok(self, cfg):
@@ -138,6 +140,17 @@ class SAFETY(Experiment):
 
         # Add one common index for both (after any filtering)
         complete_dl = complete_dl.add_column("index", list(range(len(complete_dl))))
+
+        # Add a `safe_output` column so train/eval have identical schemas.
+        # Per request: set a refusal `safe_output` ONLY for train samples with safety_label=False.
+        def _add_safe_output(ex):
+            is_train = ex.get("split") == "train"
+            is_unsafe = _to_bool(ex.get("safety_label", False)) is False
+            if is_train and is_unsafe:
+                return {"safe_output": SAFE_REFUSAL_OUTPUT}
+            return {"safe_output": ""}
+
+        complete_dl = complete_dl.map(_add_safe_output)
         
         # Recover splits from the "split" tag
         tr = complete_dl.filter(lambda x: x["split"] == "train")
@@ -175,6 +188,7 @@ class SAFETY(Experiment):
             # Some datasets also provide an `unsafe_response` column (assumed by train-end eval).
             answer = sample.get("output", "")
             unsafe_answer = sample.get("unsafe_response", "")
+            safe_output = sample.get("safe_output", "")
             prompt = format_prompt(input=input_text, eos_token=tok.eos_token)
             text = prompt + answer
 
@@ -234,6 +248,7 @@ class SAFETY(Experiment):
                 "index": index,
                 "output": answer,
                 "unsafe_response": unsafe_answer,
+                "safe_output": safe_output,
                 #"labels": labels,
             }
         return fn
@@ -309,6 +324,9 @@ class SAFETY(Experiment):
                 self.label_names = ["index"]
                 # Generate qualitative answers only once at the end of training.
                 self._generated_eval_answers = False
+                # Refusal used as `safe_output` for unsafe samples (safety_label=False).
+                self.safe_output_text = SAFE_REFUSAL_OUTPUT
+                self._safe_output_token_ids_cpu = None  # cached 1D LongTensor on CPU
 
                 
             def init_dual_vars(self):
@@ -445,6 +463,111 @@ class SAFETY(Experiment):
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 num_tokens = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
                 answer_log_probs = answer_log_probs / num_tokens
+
+                # -----------------------------
+                # Extra constraint for unsafe samples (safety_label == False):
+                #   (1) use `safe_output` = refusal string
+                #   (2) compute avg token logprob of that refusal
+                #   (3) define slack2 = logp_safe_output - tol2
+                # -----------------------------
+                is_constraint = inputs['safe']  # size = (B,)
+                is_not_constraint = ~is_constraint
+                tol2 = getattr(cfg, "tol2", None)
+                safe_output_logp = None
+                slack2 = None
+                unsafe_violation = None
+
+                if cfg.loss_type != "erm" and tol2 is not None and bool(is_not_constraint.any()):
+                    proc = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+                    if proc is None:
+                        raise RuntimeError("Could not find tokenizer/processing_class on Trainer to score safe_output.")
+
+                    pad_id = getattr(proc, "pad_token_id", None)
+                    eos_id = getattr(proc, "eos_token_id", None)
+                    if eos_id is None:
+                        raise RuntimeError("Tokenizer/processing_class must define eos_token_id to score safe_output.")
+                    if pad_id is None:
+                        pad_id = eos_id
+
+                    if self._safe_output_token_ids_cpu is None:
+                        self._safe_output_token_ids_cpu = (
+                            proc(
+                                self.safe_output_text,
+                                add_special_tokens=False,
+                                return_tensors="pt",
+                            )["input_ids"][0]
+                            .to(torch.long)
+                            .cpu()
+                        )
+                    safe_out_ids = self._safe_output_token_ids_cpu.to(input_ids.device)
+
+                    max_len = int(input_ids.shape[1])
+                    # First True position of response_mask = end of prompt.
+                    prompt_ends = response_mask.long().argmax(dim=-1)  # (B,)
+                    unsafe_batch_idx = torch.nonzero(is_not_constraint, as_tuple=False).squeeze(-1).tolist()
+
+                    safe_ids_list = []
+                    safe_resp_mask_list = []
+                    kept_idx = []
+                    for bi in unsafe_batch_idx:
+                        prompt_end = int(prompt_ends[bi].item())
+                        prompt_ids = input_ids[bi, :prompt_end]
+
+                        full_ids = torch.cat([prompt_ids, safe_out_ids], dim=0)
+                        if full_ids.numel() == 0 or full_ids[-1].item() != eos_id:
+                            full_ids = torch.cat([full_ids, full_ids.new_tensor([eos_id])], dim=0)
+
+                        prompt_len = int(prompt_ids.numel())
+                        prompt_len_eff = prompt_len
+                        if full_ids.numel() > max_len:
+                            overflow = int(full_ids.numel() - max_len)
+                            full_ids = full_ids[overflow:]  # truncate from the left to keep the refusal tail
+                            prompt_len_eff = max(0, prompt_len - overflow)
+
+                        seq_len = int(full_ids.numel())
+                        if seq_len < max_len:
+                            pad_len = max_len - seq_len
+                            full_ids = torch.cat([full_ids, full_ids.new_full((pad_len,), pad_id)], dim=0)
+                        else:
+                            full_ids = full_ids[:max_len]
+                            seq_len = max_len
+
+                        resp_m = torch.zeros(max_len, dtype=torch.bool, device=input_ids.device)
+                        start = min(int(prompt_len_eff), int(seq_len))
+                        resp_m[start:seq_len] = True
+
+                        safe_ids_list.append(full_ids)
+                        safe_resp_mask_list.append(resp_m)
+                        kept_idx.append(bi)
+
+                    if kept_idx:
+                        safe_input_ids = torch.stack(safe_ids_list, dim=0)  # (U, L)
+                        safe_resp_mask = torch.stack(safe_resp_mask_list, dim=0)  # (U, L)
+                        safe_attn = safe_input_ids.ne(pad_id)
+
+                        safe_out = model(input_ids=safe_input_ids, attention_mask=safe_attn)
+                        safe_logits = safe_out.logits[:, :-1]  # (U, L-1, V)
+                        safe_lp = F.log_softmax(safe_logits, dim=-1)
+                        safe_tok_lp = torch.gather(
+                            safe_lp, dim=-1, index=safe_input_ids[:, 1:].unsqueeze(-1)
+                        ).squeeze(-1)  # (U, L-1)
+                        safe_tok_lp = safe_tok_lp * safe_resp_mask[:, 1:]
+                        safe_sum = safe_tok_lp.sum(dim=-1)  # (U,)
+                        safe_denom = safe_resp_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                        safe_avg = safe_sum / safe_denom  # avg token logprob of refusal
+
+                        safe_output_logp = torch.zeros_like(answer_log_probs)
+                        safe_output_logp[torch.tensor(kept_idx, device=input_ids.device, dtype=torch.long)] = safe_avg
+                        # Per request: slack2 = logp - tol2 (only for unsafe samples)
+                        slack2 = (safe_output_logp - float(tol2)) * is_not_constraint.float()
+                    else:
+                        safe_output_logp = torch.zeros_like(answer_log_probs)
+                        slack2 = torch.zeros_like(answer_log_probs)
+                        unsafe_violation = torch.zeros_like(answer_log_probs)
+                else:
+                    # No unsafe-refusal constraint active (tol2 not set or no unsafe samples in batch).
+                    safe_output_logp = torch.zeros_like(answer_log_probs)
+                    slack2 = torch.zeros_like(answer_log_probs)
                 # Additional forward pass with adapters disabled (or base model) for KL objective.
                 device = input_ids.device
                 with torch.no_grad():
@@ -476,7 +599,11 @@ class SAFETY(Experiment):
                 # main objective: avg KL divergence vs. base model
                 loss = kl_sum
                 if cfg.loss_type != "erm":
-                    slack = (cfg.tol - answer_log_probs) * is_constraint.float()
+                    # Safe-sample constraint (existing): answer_log_probs >= tol  <=>  tol - logp <= 0
+                    slack_safe = (cfg.tol - answer_log_probs) * is_constraint.float()
+                    # Unsafe-sample constraint (new): logp - tol2 <= 0
+                    # We already computed `slack2= logp - tol2` (masked to unsafe samples).
+                    slack = slack_safe + slack2
 
                 if cfg.loss_type == "avg":
                         dual_avg = self.avg_dual.clone()
@@ -1043,13 +1170,12 @@ class SAFETY(Experiment):
                 # Get is_constraint, response_mask, input_ids from complete dataset and index
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
                 collated = self.data_collator(samples)
+                input_ids = collated["input_ids"]
                 response_mask = collated['response_mask'].to(answer_log_probs.device)
                 is_constraint = collated['safe'].to(answer_log_probs.device)  # size
                 # precomputed_answer_log_probs = collated['baseline_logprob'].to(answer_log_probs.device)
 
                 is_not_constraint = ~is_constraint
-                self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
-                self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
                 
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
@@ -1060,23 +1186,176 @@ class SAFETY(Experiment):
                 
                 
                 answer_log_ratios_objective = answer_log_probs[is_not_constraint]
-                answer_log_ratios_constraint = -1 * answer_log_probs[is_constraint]
-                
-                if is_constraint.sum() == 0:
-                    answer_log_ratios_constraint = torch.tensor([0.0], device=answer_log_probs.device)
-                    self._last_constraint_indexes = torch.tensor([0], dtype=torch.long)
-                    
-                
-                objective = -1 * answer_log_ratios_objective.mean().item()
-                constraint_mean = answer_log_ratios_constraint.mean().item()
-                constrain_min = answer_log_ratios_constraint.min().item()
-                constrain_max = answer_log_ratios_constraint.max().item()
-                contriant_cvar = answer_log_ratios_constraint[answer_log_ratios_constraint > np.quantile(answer_log_ratios_constraint.cpu().numpy(), 0.9)].mean().item()
-                
-                slacks = answer_log_ratios_constraint
-                
+                tol2 = getattr(cfg, "tol2", None)
+                if tol2 is None:
+                    # -----------------------------
+                    # Existing behavior (when tol2 is NOT provided):
+                    # only compute/log constraint slacks for safety_label=True samples.
+                    # -----------------------------
+                    self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
+                    self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
+
+                    answer_log_ratios_constraint = -1 * answer_log_probs[is_constraint]
+                    if is_constraint.sum() == 0:
+                        answer_log_ratios_constraint = torch.tensor([0.0], device=answer_log_probs.device)
+                        self._last_constraint_indexes = torch.tensor([0], dtype=torch.long)
+                        self._last_constraint_safety_labels = torch.tensor([True], dtype=torch.bool)
+                    else:
+                        # all True, but keep shape aligned with slacks/indexes
+                        self._last_constraint_safety_labels = is_constraint[is_constraint].detach().cpu()
+
+                    slacks = answer_log_ratios_constraint
+                    self._last_constraint_slacks = slacks.detach().cpu()
+                    self._last_objective_ratios = answer_log_ratios_objective.detach().cpu()
+
+                    epoch = self.state.epoch
+                    constraint_slacks = slacks.flatten()
+
+                    import wandb
+                    if wandb.run is not None:
+                        table = wandb.Table(columns=["constraint_slack", "safety_label"])
+                        for slack in constraint_slacks.detach().cpu().tolist():
+                            table.add_data(slack, True)
+                        wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table})
+
+                    objective = -1 * answer_log_ratios_objective.mean().item()
+                    constraint_mean = slacks.mean().item()
+                    constrain_min = slacks.min().item()
+                    constrain_max = slacks.max().item()
+                    contriant_cvar = slacks[
+                        slacks > np.quantile(slacks.detach().cpu().numpy(), 0.9)
+                    ].mean().item()
+
+                    return {
+                        "objective": objective,
+                        "constraint_mean": constraint_mean,
+                        "constraint_min": constrain_min,
+                        "constraint_max": constrain_max,
+                        "constraint_cvar": contriant_cvar,
+                    }
+
+                # -----------------------------
+                # tol2 is provided => compute BOTH constraints in eval:
+                #  - safe samples (safety_label=True): slack_safe = tol - logp(output)
+                #  - unsafe samples (safety_label=False): slack2 = logp(safe_output) - tol2
+                # -----------------------------
+                slack_safe = (cfg.tol - answer_log_probs) * is_constraint.float()
+
+                safe_output_logp = torch.zeros_like(answer_log_probs)
+                slack2 = torch.zeros_like(answer_log_probs)
+                if bool(is_not_constraint.any()):
+                    proc = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+                    if proc is None:
+                        raise RuntimeError("Could not find tokenizer/processing_class on Trainer to score safe_output.")
+
+                    pad_id = getattr(proc, "pad_token_id", None)
+                    eos_id = getattr(proc, "eos_token_id", None)
+                    if eos_id is None:
+                        raise RuntimeError("Tokenizer/processing_class must define eos_token_id to score safe_output.")
+                    if pad_id is None:
+                        pad_id = eos_id
+
+                    if self._safe_output_token_ids_cpu is None:
+                        self._safe_output_token_ids_cpu = (
+                            proc(
+                                self.safe_output_text,
+                                add_special_tokens=False,
+                                return_tensors="pt",
+                            )["input_ids"][0]
+                            .to(torch.long)
+                            .cpu()
+                        )
+                    safe_out_ids_cpu = self._safe_output_token_ids_cpu  # (T,)
+
+                    prompt_ends = response_mask.long().argmax(dim=-1)  # (N,)
+                    unsafe_batch_idx = (
+                        torch.nonzero(is_not_constraint, as_tuple=False).squeeze(-1).detach().cpu().tolist()
+                    )
+
+                    model = extract_model_from_parallel(self.model)
+                    was_training = model.training
+                    model.eval()
+                    try:
+                        model_device = next(model.parameters()).device
+                        bs = int(getattr(self.args, "per_device_eval_batch_size", 8) or 8)
+                        bs = max(1, min(32, bs))
+
+                        batch_ids = []
+                        batch_masks = []
+                        batch_pos = []
+
+                        def _flush():
+                            if not batch_pos:
+                                return
+                            safe_input_ids = torch.stack(batch_ids, dim=0).to(model_device)  # (U, L)
+                            safe_resp_mask = torch.stack(batch_masks, dim=0).to(model_device)  # (U, L)
+                            safe_attn = safe_input_ids.ne(pad_id)
+                            with torch.no_grad():
+                                out = model(input_ids=safe_input_ids, attention_mask=safe_attn)
+                                logits = out.logits[:, :-1]
+                                lp = F.log_softmax(logits, dim=-1)
+                                tok_lp = torch.gather(
+                                    lp, dim=-1, index=safe_input_ids[:, 1:].unsqueeze(-1)
+                                ).squeeze(-1)
+                                tok_lp = tok_lp * safe_resp_mask[:, 1:]
+                                sum_lp = tok_lp.sum(dim=-1)
+                                denom_lp = safe_resp_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                                avg_lp = (sum_lp / denom_lp).float().detach().cpu()
+
+                            pos_t = torch.tensor(batch_pos, dtype=torch.long)
+                            safe_output_logp[pos_t] = avg_lp
+                            batch_ids.clear()
+                            batch_masks.clear()
+                            batch_pos.clear()
+
+                        max_len = int(input_ids.shape[1])
+                        for bi in unsafe_batch_idx:
+                            prompt_end = int(prompt_ends[bi].item())
+                            prompt_ids = input_ids[bi, :prompt_end].to(torch.long).cpu()
+
+                            full_ids = torch.cat([prompt_ids, safe_out_ids_cpu], dim=0)
+                            if full_ids.numel() == 0 or full_ids[-1].item() != eos_id:
+                                full_ids = torch.cat([full_ids, full_ids.new_tensor([eos_id])], dim=0)
+
+                            prompt_len = int(prompt_ids.numel())
+                            prompt_len_eff = prompt_len
+                            if full_ids.numel() > max_len:
+                                overflow = int(full_ids.numel() - max_len)
+                                full_ids = full_ids[overflow:]
+                                prompt_len_eff = max(0, prompt_len - overflow)
+
+                            seq_len = int(full_ids.numel())
+                            if seq_len < max_len:
+                                pad_len = max_len - seq_len
+                                full_ids = torch.cat([full_ids, full_ids.new_full((pad_len,), pad_id)], dim=0)
+                            else:
+                                full_ids = full_ids[:max_len]
+                                seq_len = max_len
+
+                            resp_m = torch.zeros(max_len, dtype=torch.bool)
+                            start = min(int(prompt_len_eff), int(seq_len))
+                            resp_m[start:seq_len] = True
+
+                            batch_ids.append(full_ids)
+                            batch_masks.append(resp_m)
+                            batch_pos.append(bi)
+                            if len(batch_pos) >= bs:
+                                _flush()
+                        _flush()
+                    finally:
+                        if was_training:
+                            model.train()
+
+                    slack2 = (safe_output_logp - float(tol2)) * is_not_constraint.float()
+
+                slacks = slack_safe + slack2
+
+                # Keep for wandb callback logging
                 self._last_constraint_slacks = slacks.detach().cpu()
+                self._last_constraint_indexes = indexes.detach().cpu()
+                self._last_constraint_safety_labels = is_constraint.detach().cpu()
                 self._last_objective_ratios = answer_log_ratios_objective.detach().cpu()
+                self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
 
                 epoch = self.state.epoch
                 # Flatten slacks and output table to wandb
@@ -1084,17 +1363,45 @@ class SAFETY(Experiment):
 
                 import wandb
                 if wandb.run is not None:
-                    table = wandb.Table(columns=["constraint_slack"])
-                    for slack in constraint_slacks.tolist():
-                        table.add_data(slack)
+                    table = wandb.Table(columns=["constraint_slack", "safety_label"])
+                    safety_labels = is_constraint.detach().cpu().flatten().tolist()
+                    for slack, lbl in zip(constraint_slacks.detach().cpu().tolist(), safety_labels):
+                        table.add_data(slack, bool(lbl))
                     wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table})
             
+                # Metrics
+                if answer_log_ratios_objective.numel() > 0:
+                    objective = -1 * answer_log_ratios_objective.mean().item()
+                else:
+                    objective = 0.0
+
+                # Combined constraint stats (safe+unsafe)
+                if slacks.numel() > 0:
+                    constraint_mean = slacks.mean().item()
+                    constrain_min = slacks.min().item()
+                    constrain_max = slacks.max().item()
+                    sl_np = slacks.detach().cpu().numpy()
+                    q = float(np.quantile(sl_np, 0.9)) if sl_np.size > 0 else 0.0
+                    tail = slacks[slacks > q]
+                    contriant_cvar = tail.mean().item() if tail.numel() > 0 else 0.0
+                else:
+                    constraint_mean = 0.0
+                    constrain_min = 0.0
+                    constrain_max = 0.0
+                    contriant_cvar = 0.0
+
+                # Per-group means for debugging
+                safe_mean = slack_safe[is_constraint].mean().item() if bool(is_constraint.any()) else 0.0
+                unsafe_mean = slack2[is_not_constraint].mean().item() if bool(is_not_constraint.any()) else 0.0
+
                 return {
                     "objective": objective,
                     "constraint_mean": constraint_mean,
                     "constraint_min": constrain_min,
                     "constraint_max": constrain_max,
                     "constraint_cvar": contriant_cvar,
-                        }
+                    "constraint_safe_mean": safe_mean,
+                    "constraint_unsafe_mean": unsafe_mean,
+                }
         return CustomTrainer
     
