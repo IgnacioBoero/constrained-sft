@@ -7,7 +7,7 @@ hydra:
     params:
       exp.loss_type: aug_dual
       exp.loss_alpha: 1000.0
-      exp.tol: -0.0
+      exp.tol: -0.04
       exp.tol2: -2.0
       exp.dual_step_size: 1.0
 
@@ -49,10 +49,10 @@ train:
     per_device_eval_batch_size: 4
     gradient_accumulation_steps: 8
     eval_accumulation_steps: 4
-    num_train_epochs: 3                      # ST example uses 1 epoch
+    num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 5e-4
     lr_scheduler_type: "cosine"
-    warmup_ratio: 0.2
+    warmup_ratio: 0.1
     weight_decay: 0.01
     eval_strategy: "no"
     save_strategy: "no"
