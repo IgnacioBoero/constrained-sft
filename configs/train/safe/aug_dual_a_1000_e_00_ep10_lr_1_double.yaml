@@ -60,6 +60,7 @@ train:
     eval_do_concat_batches: false
     bf16: true
     fp16: false
+    ddp_find_unused_parameters: false
 
 exp:
   name: "safety"
