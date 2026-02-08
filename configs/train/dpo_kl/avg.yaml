@@ -1,0 +1,58 @@
+# @package _global_
+
+hydra:
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+train:
+  seed: 42
+  split_seed: 42
+  output_dir: "./outputs/dpo_kl/${exp.loss_type}/tol:${exp.tol}-dual_lr:${exp.dual_step_size}"
+  do_train: true
+  do_initial_eval: false
+  use_wandb: true
+  save_model: true
+  wandb_project: "dpo_kl"
+  run_name: "dpo_kl-${exp.loss_type}-tol:${exp.tol}-dual_lr:${exp.dual_step_size}"
+
+  cache_dir: "./cache"
+  val_fraction: 0.1
+  shuffle: true
+  sanity_check: false
+  data_proportion: 1.0
+  max_prompt_length: 1024
+  max_length: 1536
+  max_gen: 10
+
+  lora:
+    r: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+
+  hf_args:
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 8
+    eval_accumulation_steps: 4
+    num_train_epochs: 1
+    learning_rate: 5e-5
+    lr_scheduler_type: "cosine"
+    warmup_steps: 200
+    weight_decay: 0.0
+    eval_strategy: "no"
+    save_strategy: "no"
+    gradient_checkpointing: true
+    eval_do_concat_batches: false
+    bf16: true
+    fp16: false
+
+exp:
+  name: "dpo_kl"
+  model_name: meta-llama/Llama-3.1-8B-Instruct
+  tol: 0.3
+
+  loss_type: avg
+  # avg-dual doesn't use loss_alpha, but we keep the field for consistency across configs.
+  loss_alpha: 10.0
+  dual_step_size: 1.0
+

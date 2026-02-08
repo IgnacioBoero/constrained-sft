@@ -1,0 +1,541 @@
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from accelerate.utils import extract_model_from_parallel
+from datasets import load_dataset, concatenate_datasets
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer
+
+from peft import LoraConfig, get_peft_model
+
+from .base import Experiment
+from utils import right_padding
+
+
+class DPO_KL(Experiment):
+    """
+    Constrained preference finetuning:
+      - Objective: minimize KL(πθ || π0) on response tokens (π0 = pretrained/base model)
+      - Constraint: logp(chosen) - logp(rejected) >= tol
+        slack := tol + logp(rejected) - logp(chosen)   (constraint satisfied when slack <= 0)
+
+    Loss types (mirroring `SAFETY`):
+      - erm: objective only
+      - avg: average dual variable
+      - aug_dual: augmented Lagrangian with per-example dual variables
+      - penalty: linear penalty
+      - simpo: SimPO objective (no KL regularization), margin gamma = tol
+    """
+
+    def load_model_and_tok(self, cfg):
+        tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
+        tok.model_max_length = int(getattr(cfg.train, "max_length", 2048))
+
+        # Ensure pad token exists (common for Llama-family)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+        dtype = torch.bfloat16 if getattr(cfg.train.hf_args, "bf16", False) else torch.float16
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.exp.model_name,
+            low_cpu_mem_usage=True,
+            torch_dtype=dtype,
+        )
+
+        if getattr(cfg.train, "lora", False):
+            model = get_peft_model(
+                model,
+                LoraConfig(
+                    r=int(cfg.train.lora.r),
+                    lora_alpha=int(cfg.train.lora.lora_alpha),
+                    lora_dropout=float(getattr(cfg.train.lora, "lora_dropout", 0.05)),
+                    target_modules=[
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "o_proj",
+                    ],
+                ),
+            )
+
+        # With gradient checkpointing + PEFT, inputs must require grads or loss has no grad_fn.
+        if (
+            getattr(cfg.train, "hf_args", None) is not None
+            and getattr(cfg.train.hf_args, "gradient_checkpointing", False)
+        ):
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+
+        return model, tok
+
+    def load_datasets(self, cfg):
+        cache_dir = getattr(cfg.train, "cache_dir", None)
+        val_fraction = float(getattr(cfg.train, "val_fraction", 0.1))
+        sanity_check = bool(getattr(cfg.train, "sanity_check", False))
+        do_shuffle = bool(getattr(cfg.train, "shuffle", True))
+        # Split seed controls the random train/val membership (kept fixed for comparability).
+        # Defaults to train.seed for backward compatibility.
+        split_seed = int(getattr(cfg.train, "split_seed", cfg.train.seed))
+
+        ds = load_dataset(
+            "argilla/distilabel-intel-orca-dpo-pairs",
+            split="train",
+            cache_dir=cache_dir,
+        )
+
+        # Filter as requested
+        ds = ds.filter(
+            lambda r: (r["status"] != "tie")
+            and (r["chosen_score"] >= 8)
+            and (not r["in_gsm8k_train"])
+        )
+
+        # Optional: proportion cap
+        data_prop = float(getattr(cfg.train, "data_proportion", 1.0))
+        if not (0.0 < data_prop <= 1.0):
+            raise ValueError(f"cfg.train.data_proportion must be in (0,1], got {data_prop}")
+        if data_prop < 1.0:
+            keep = max(1, int(data_prop * len(ds)))
+            ds = ds.select(range(keep))
+
+        # Remove unused / heavy columns up-front (keeps behavior similar to the provided snippet)
+        original_columns = ds.column_names
+
+        def chatml_format(r):
+            return {
+                "system": r.get("system") or "",
+                "prompt": r.get("input") or "",
+                "chosen": r.get("chosen") or "",
+                "rejected": r.get("rejected") or "",
+            }
+
+        ds = ds.map(chatml_format, remove_columns=original_columns)
+
+        if do_shuffle:
+            ds = ds.shuffle(seed=split_seed)
+
+        if not (0.0 < val_fraction < 1.0):
+            raise ValueError(f"cfg.train.val_fraction must be in (0,1), got {val_fraction}")
+
+        n_val = max(1, int(len(ds) * val_fraction))
+        ev_raw = ds.select(range(n_val))
+        tr_raw = ds.select(range(n_val, len(ds)))
+
+        if sanity_check:
+            tr_raw = tr_raw.select(range(min(len(tr_raw), 16)))
+            ev_raw = ev_raw.select(range(min(len(ev_raw), 16)))
+
+        tr_raw = tr_raw.add_column("split", ["train"] * len(tr_raw))
+        ev_raw = ev_raw.add_column("split", ["validation"] * len(ev_raw))
+
+        complete_ds = concatenate_datasets([tr_raw, ev_raw])
+        complete_ds = complete_ds.add_column("index", list(range(len(complete_ds))))
+
+        tr = complete_ds.filter(lambda x: x["split"] == "train").shuffle(seed=int(cfg.train.seed))
+        ev = complete_ds.filter(lambda x: x["split"] == "validation").shuffle(seed=int(cfg.train.seed))
+
+        print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
+        return tr, ev, complete_ds
+
+    def preprocessing_fn(self, tok, cfg):
+        max_length = int(getattr(cfg.train, "max_length", 1536))
+        max_prompt_length = int(getattr(cfg.train, "max_prompt_length", max_length))
+
+        if tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token
+
+        eos_id = tok.eos_token_id
+        if eos_id is None:
+            raise ValueError("Tokenizer must have eos_token_id set for this experiment.")
+
+        def _prompt_ids(system_text: str, prompt_text: str) -> List[int]:
+            system_text = system_text or ""
+            prompt_text = prompt_text or ""
+            if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None):
+                msgs = []
+                if system_text.strip():
+                    msgs.append({"role": "system", "content": system_text})
+                msgs.append({"role": "user", "content": prompt_text})
+                ids = tok.apply_chat_template(
+                    msgs,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors=None,
+                )
+                ids = list(ids)
+            else:
+                # Fallback: simple prompt (keeps assistant prefix)
+                buf = []
+                if system_text.strip():
+                    buf.append(system_text.strip())
+                buf.append(prompt_text.strip())
+                prompt = "\n\n".join(buf) + "\n\nAssistant:"
+                ids = tok(prompt, add_special_tokens=False)["input_ids"]
+
+            # Truncate from the LEFT to keep the end-of-prompt (assistant header) intact.
+            if len(ids) > max_prompt_length:
+                ids = ids[-max_prompt_length:]
+            # Ensure room for EOS at end of full sequence.
+            if len(ids) > max_length - 1:
+                ids = ids[-(max_length - 1) :]
+            return ids
+
+        def _build_full(prompt_ids: List[int], answer_text: str) -> Tuple[List[int], List[bool]]:
+            ans_ids = tok(answer_text or "", add_special_tokens=False)["input_ids"]
+            # Reserve space for EOS
+            max_ans = max(0, max_length - len(prompt_ids) - 1)
+            ans_ids = ans_ids[:max_ans]
+            full = prompt_ids + ans_ids + [eos_id]
+            # Response mask: score only answer+EOS (not prompt)
+            resp = [False] * len(prompt_ids) + [True] * (len(full) - len(prompt_ids))
+            return full, resp
+
+        def fn(sample: Dict[str, Any]):
+            system_text = sample.get("system", "")
+            prompt_text = sample.get("prompt", "")
+            chosen_text = sample.get("chosen", "")
+            rejected_text = sample.get("rejected", "")
+
+            p_ids = _prompt_ids(system_text, prompt_text)
+            chosen_ids, chosen_mask = _build_full(p_ids, chosen_text)
+            rejected_ids, rejected_mask = _build_full(p_ids, rejected_text)
+
+            return {
+                "chosen_input_ids": chosen_ids,
+                "rejected_input_ids": rejected_ids,
+                "chosen_response_mask": chosen_mask,
+                "rejected_response_mask": rejected_mask,
+                "index": int(sample["index"]),
+            }
+
+        return fn
+
+    def get_collator(self, tok):
+        pad_id = tok.pad_token_id
+        if pad_id is None:
+            tok.pad_token = tok.eos_token
+            pad_id = tok.pad_token_id
+
+        class Collator:
+            def __init__(self, pad_token_id: int) -> None:
+                self.pad_token_id = pad_token_id
+
+            def __call__(self, samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+                B = len(samples)
+
+                # Pad chosen + rejected together to a shared max length for a single stacked forward pass.
+                seqs = (
+                    [torch.tensor(s["chosen_input_ids"], dtype=torch.long) for s in samples]
+                    + [torch.tensor(s["rejected_input_ids"], dtype=torch.long) for s in samples]
+                )
+                padded = right_padding(seqs, padding_value=self.pad_token_id)  # (2B, L)
+                chosen_input_ids = padded[:B]
+                rejected_input_ids = padded[B:]
+
+                masks = (
+                    [torch.tensor(s["chosen_response_mask"], dtype=torch.bool) for s in samples]
+                    + [torch.tensor(s["rejected_response_mask"], dtype=torch.bool) for s in samples]
+                )
+                padded_masks = right_padding(masks, padding_value=0).bool()  # (2B, L)
+                chosen_response_mask = padded_masks[:B]
+                rejected_response_mask = padded_masks[B:]
+
+                chosen_attn = chosen_input_ids.ne(self.pad_token_id)
+                rejected_attn = rejected_input_ids.ne(self.pad_token_id)
+
+                index = torch.tensor([s["index"] for s in samples], dtype=torch.long)
+
+                return {
+                    "chosen_input_ids": chosen_input_ids,
+                    "rejected_input_ids": rejected_input_ids,
+                    "chosen_attention_mask": chosen_attn.bool(),
+                    "rejected_attention_mask": rejected_attn.bool(),
+                    "chosen_response_mask": chosen_response_mask,
+                    "rejected_response_mask": rejected_response_mask,
+                    "index": index,
+                }
+
+        return Collator(pad_id)
+
+    def get_trainer_class(self):
+        class CustomTrainer(Trainer):
+            def __init__(
+                self,
+                *args,
+                custom_cfg=None,
+                complete_dataset=None,
+                experiment=None,
+                **kwargs,
+            ):
+                super().__init__(*args, **kwargs)
+                self.custom_cfg = custom_cfg
+                self.complete_ds = complete_dataset
+                self.experiment = experiment
+                self.init_dual_vars()
+                # Use per-example `index` as the label returned to metrics/prediction loops.
+                self.label_names = ["index"]
+                self._generated_eval_answers = False
+                self.compute_metrics = self._compute_metrics
+
+            def init_dual_vars(self):
+                n = len(self.complete_ds) if self.complete_ds is not None else (len(self.train_dataset) + len(self.eval_dataset))
+                self.dual_vars = torch.zeros(n, dtype=torch.float, requires_grad=False).to(self.model.device)
+                self.avg_dual = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+
+            def train(self, *args, **kwargs):
+                out = super().train(*args, **kwargs)
+                self._generate_eval_answers_end_of_training()
+                return out
+
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                cfg = self.custom_cfg.exp
+
+                chosen_ids = inputs["chosen_input_ids"]
+                rejected_ids = inputs["rejected_input_ids"]
+                chosen_attn = inputs["chosen_attention_mask"]
+                rejected_attn = inputs["rejected_attention_mask"]
+                chosen_resp = inputs["chosen_response_mask"]
+                rejected_resp = inputs["rejected_response_mask"]
+                index = inputs["index"]
+
+                B = chosen_ids.shape[0]
+
+                input_ids = torch.cat([chosen_ids, rejected_ids], dim=0)  # (2B, L)
+                attention_mask = torch.cat([chosen_attn, rejected_attn], dim=0)
+                response_mask = torch.cat([chosen_resp, rejected_resp], dim=0)
+
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits[:, :-1]  # (2B, L-1, V)
+                log_probs = F.log_softmax(logits, dim=-1)
+
+                # logp of the realized tokens (average over response tokens)
+                token_logp = torch.gather(
+                    log_probs,
+                    dim=-1,
+                    index=input_ids[:, 1:].unsqueeze(-1),
+                ).squeeze(-1)  # (2B, L-1)
+                token_logp = token_logp * response_mask[:, 1:]
+                num_tokens = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                avg_logp = token_logp.sum(dim=-1) / num_tokens  # (2B,)
+                logp_chosen = avg_logp[:B]
+                logp_rejected = avg_logp[B:]
+                gap = logp_chosen - logp_rejected  # (B,)
+
+                # SimPO objective (no KL regularization / no base model pass):
+                #   log σ( β/|y_w| logπ(y_w|x) - β/|y_l| logπ(y_l|x) - γ )
+                # We use per-token average logprobs, so this becomes:
+                #   log σ( β*(logp_chosen - logp_rejected) - γ )
+                # and set γ from the existing constraint tolerance (cfg.tol).
+                if cfg.loss_type == "simpo":
+                    gamma = float(getattr(cfg, "tol", 0.0))
+                    # Use `loss_alpha` as the SimPO beta (per user request) so we can reuse
+                    # the same hyperparameter slot across constraint methods/configs.
+                    beta_simpo = float(getattr(cfg, "loss_alpha", 1.0))
+                    score = beta_simpo * gap - gamma  # (B,)
+                    # -log σ(score) == softplus(-score)
+                    loss = F.softplus(-score).mean()
+                    if return_outputs:
+                        packed = torch.stack([logp_chosen, logp_rejected, score], dim=-1)
+                        return loss, SimpleNamespace(logits=packed)
+                    return loss
+
+                # KL objective vs pretrained/base (adapters disabled)
+                with torch.no_grad():
+                    if hasattr(model, "disable_adapter"):
+                        with model.disable_adapter():
+                            base_out = model(input_ids=input_ids, attention_mask=attention_mask)
+                    elif hasattr(model, "module") and hasattr(model.module, "disable_adapter"):
+                        with model.module.disable_adapter():
+                            base_out = model(input_ids=input_ids, attention_mask=attention_mask)
+                    else:
+                        raise RuntimeError(
+                            "KL objective requires PEFT LoRA adapters. "
+                            "Expected model to expose `.disable_adapter()` (PeftModel)."
+                        )
+                    base_logits = base_out.logits[:, :-1]
+                    base_log_probs = F.log_softmax(base_logits, dim=-1)
+
+                probs = log_probs.exp()
+                kl_token = (probs * (log_probs - base_log_probs)).sum(dim=-1)  # (2B, L-1)
+                kl_token = kl_token * response_mask[:, 1:]
+                kl_seq = kl_token.sum(dim=-1) / num_tokens  # (2B,)
+                kl_chosen = kl_seq[:B]
+                kl_rejected = kl_seq[B:]
+                kl_mean = 0.5 * (kl_chosen + kl_rejected)  # (B,)
+
+                # Objective: minimize KL (matches `SAFETY`; no separate beta scaling)
+                loss = kl_mean
+
+                # Constraint slack: tol + logp(rejected) - logp(chosen) == tol - (logp_chosen - logp_rejected)
+                slack = cfg.tol - gap  # (B,)
+
+                # Loss schemes (as in SAFETY)
+                if cfg.loss_type == "erm":
+                    pass
+
+                elif cfg.loss_type == "avg":
+                    if model.training:
+                        dual_avg = self.avg_dual.clone()
+                        dual_avg = torch.clamp(
+                            dual_avg + cfg.dual_step_size * slack.mean(),
+                            min=0.0,
+                        )
+                        self.avg_dual = dual_avg.detach()
+                    loss = loss + self.avg_dual.detach() * slack
+
+                elif cfg.loss_type == "aug_dual":
+                    dual_var = self.dual_vars[index].clone()
+                    a = slack
+                    b = dual_var / (cfg.loss_alpha)
+                    z = 2 * a + b
+                    dual_grad = torch.where(z > 0, a, -0.5 * b)
+                    if model.training:
+                        dual_var = dual_var + cfg.dual_step_size * dual_grad
+                        self.dual_vars[index] = dual_var.detach()
+                    loss = loss + cfg.loss_alpha / 4 * (torch.clamp(z, min=0.0) ** 2 - b**2)
+
+                elif cfg.loss_type == "penalty":
+                    loss = loss + cfg.loss_alpha * slack
+
+                else:
+                    raise ValueError(f"Unknown loss_type: {cfg.loss_type}")
+
+                loss = loss.mean()
+
+                if return_outputs:
+                    # Return compact predictions for metrics: [logp_chosen, logp_rejected, third]
+                    # third = KL mean for KL-based methods
+                    packed = torch.stack([logp_chosen, logp_rejected, kl_mean], dim=-1)
+                    return loss, SimpleNamespace(logits=packed)
+                return loss
+
+            def _compute_metrics(self, pred):
+                cfg = self.custom_cfg.exp
+                arr = pred.predictions
+                if isinstance(arr, (list, tuple)):
+                    arr = arr[0]
+                arr = np.asarray(arr)
+                if arr.ndim != 2 or arr.shape[1] < 3:
+                    return {}
+                logp_chosen = arr[:, 0]
+                logp_rejected = arr[:, 1]
+                gap = logp_chosen - logp_rejected
+                slack = float(cfg.tol) - gap
+
+                out = {
+                    "logp_gap": float(np.mean(gap)),
+                    "constraint_mean_slack": float(np.mean(slack)),
+                    "constraint_sat_rate": float(np.mean(slack <= 0.0)),
+                }
+
+                if cfg.loss_type == "simpo":
+                    # third column is the SimPO score used inside logsigmoid
+                    score = arr[:, 2]
+                    # logsigmoid(score) = -softplus(-score) = -logaddexp(0, -score)
+                    out["objective_simpo_logsigmoid"] = float(np.mean(-np.logaddexp(0.0, -score)))
+                    # softplus(-score) = logaddexp(0, -score)
+                    out["objective_simpo_loss"] = float(np.mean(np.logaddexp(0.0, -score)))
+                    out["simpo_margin_sat_rate"] = float(np.mean(score >= 0.0))
+                else:
+                    kl_mean = arr[:, 2]
+                    out["objective_kl"] = float(np.mean(kl_mean))
+
+                return out
+
+            def _generate_eval_answers_end_of_training(self):
+                if self._generated_eval_answers:
+                    return None
+                self._generated_eval_answers = True
+
+                # Rank-0 only
+                rank = int(os.environ.get("RANK", "0"))
+                if rank != 0:
+                    return None
+
+                cfg = self.custom_cfg
+                n = int(getattr(cfg.train, "max_gen", 10) or 10)
+                if n <= 0:
+                    return None
+
+                ev_ds = self.eval_dataset
+                if ev_ds is None or len(ev_ds) == 0:
+                    return None
+
+                n = min(n, len(ev_ds))
+                # Deterministic subset selection for comparability across runs:
+                # pick the rows with the smallest global `index` values (stable across shuffles/DDP).
+                row_idxs = None
+                try:
+                    if hasattr(ev_ds, "column_names") and "index" in ev_ds.column_names:
+                        idx_col = np.asarray(ev_ds["index"], dtype=np.int64)
+                        row_idxs = np.argsort(idx_col)[:n].tolist()
+                except Exception:
+                    row_idxs = None
+                if row_idxs is None:
+                    row_idxs = list(range(n))
+
+                model = extract_model_from_parallel(self.model)
+                was_training = model.training
+                model.eval()
+
+                rows = []
+                for i in row_idxs:
+                    sample = ev_ds[int(i)]
+                    ids = torch.tensor(sample["chosen_input_ids"], dtype=torch.long, device=model.device)
+                    mask = torch.tensor(sample["chosen_response_mask"], dtype=torch.bool, device=model.device)
+                    true_pos = torch.where(mask)[0]
+                    if true_pos.numel() == 0:
+                        continue
+                    prompt_end = int(true_pos[0].item())
+                    if prompt_end <= 0:
+                        continue
+                    prompt_ids = ids[:prompt_end].unsqueeze(0)
+                    attn = torch.ones_like(prompt_ids, device=model.device)
+                    with torch.no_grad():
+                        out_ids = model.generate(
+                            input_ids=prompt_ids,
+                            attention_mask=attn,
+                            max_new_tokens=512,
+                        )
+                    gen_ids = out_ids[0][prompt_ids.shape[1] :]
+                    prompt_text = self.tokenizer.decode(prompt_ids[0], skip_special_tokens=True) if self.tokenizer is not None else ""
+                    decoded = self.tokenizer.decode(gen_ids, skip_special_tokens=True) if self.tokenizer is not None else ""
+                    rows.append({"index": int(sample.get("index", -1)), "prompt": prompt_text, "output": decoded})
+
+                if was_training:
+                    model.train()
+
+                if not rows:
+                    return None
+
+                # Log to wandb + json artifact in output_dir
+                out_dir = Path(cfg.train.output_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / "dpo_kl_generate_val10.json"
+                out_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+                if cfg.train.use_wandb:
+                    try:
+                        import wandb
+
+                        if wandb.run is not None:
+                            table = wandb.Table(columns=["prompt", "output"])
+                            for r in rows:
+                                table.add_data(r.get("prompt"), r.get("output"))
+                            wandb.log({"dpo_kl_val_generations": table})
+                            artifact = wandb.Artifact("dpo_kl_val_generations", type="generations")
+                            artifact.add_file(str(out_path))
+                            wandb.log_artifact(artifact)
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                return rows
+
+        return CustomTrainer
+
