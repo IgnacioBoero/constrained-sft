@@ -121,7 +121,7 @@ class DPO_KL(Experiment):
                 system = ""
 
             message = {"role": "user", "content": r.get("input") or ""}
-            prompt = tok.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+            prompt = tok.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
 
             chosen = (r.get("chosen") or "") + "<|im_end|>\n"
             rejected = (r.get("rejected") or "") + "<|im_end|>\n"
