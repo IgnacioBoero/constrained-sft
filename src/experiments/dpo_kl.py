@@ -40,7 +40,8 @@ class DPO_KL(Experiment):
         # Ensure pad token exists (common for Llama-family)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
-        tok.padding_side = "left"
+        # Right padding keeps response masks aligned with shifted labels in training.
+        tok.padding_side = "right"
 
         dtype = torch.bfloat16 if getattr(cfg.train.hf_args, "bf16", False) else torch.float16
         model = AutoModelForCausalLM.from_pretrained(
@@ -108,7 +109,7 @@ class DPO_KL(Experiment):
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
-        tok.padding_side = "left"
+        tok.padding_side = "right"
 
         def chatml_format(r):
             # Match the reference notebook formatting (ChatML-style strings)
@@ -164,7 +165,7 @@ class DPO_KL(Experiment):
 
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
-        tok.padding_side = "left"
+        tok.padding_side = "right"
 
         eos_id = tok.eos_token_id
         if eos_id is None:
@@ -216,7 +217,7 @@ class DPO_KL(Experiment):
         if pad_id is None:
             tok.pad_token = tok.eos_token
             pad_id = tok.pad_token_id
-        tok.padding_side = "left"
+        tok.padding_side = "right"
 
         class Collator:
             def __init__(self, pad_token_id: int) -> None:
@@ -480,6 +481,11 @@ class DPO_KL(Experiment):
                 was_training = model.training
                 model.eval()
 
+                tok = self.tokenizer
+                pad_id = tok.pad_token_id if tok is not None and tok.pad_token_id is not None else None
+                if pad_id is None and tok is not None:
+                    pad_id = tok.eos_token_id
+
                 rows = []
                 for i in row_idxs:
                     sample = ev_ds[int(i)]
@@ -492,12 +498,17 @@ class DPO_KL(Experiment):
                     if prompt_end <= 0:
                         continue
                     prompt_ids = ids[:prompt_end].unsqueeze(0)
-                    attn = torch.ones_like(prompt_ids, device=model.device)
+                    if pad_id is None:
+                        attn = torch.ones_like(prompt_ids, device=model.device)
+                    else:
+                        attn = prompt_ids.ne(pad_id).long()
                     with torch.no_grad():
                         out_ids = model.generate(
                             input_ids=prompt_ids,
                             attention_mask=attn,
-                            max_new_tokens=512,
+                            max_new_tokens=1024,
+                            pad_token_id=pad_id,
+                            eos_token_id=tok.eos_token_id if tok is not None else None,
                         )
                     gen_ids = out_ids[0][prompt_ids.shape[1] :]
                     prompt_text = self.tokenizer.decode(prompt_ids[0], skip_special_tokens=True) if self.tokenizer is not None else ""
