@@ -17,7 +17,6 @@ train:
   run_name: "dpo_kl-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}"
   eval_at_end: true
   eval_on_train: true
-  push_adapters_to_wandb: true
 
   cache_dir: "./cache"
   val_fraction: 0.1
