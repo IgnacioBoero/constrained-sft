@@ -15,6 +15,9 @@ train:
   push_adapters_to_wandb: true
   wandb_project: "dpo_kl"
   run_name: "dpo_kl-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}"
+  eval_at_end: true
+  eval_on_train: true
+  push_adapters_to_wandb: true
 
   cache_dir: "./cache"
   val_fraction: 0.1
@@ -35,7 +38,7 @@ train:
     per_device_eval_batch_size: 4
     gradient_accumulation_steps: 2
     eval_accumulation_steps: 4
-    num_train_epochs: 20
+    num_train_epochs: 0
     learning_rate: 5e-4
     lr_scheduler_type: "cosine"
     warmup_steps: 200
