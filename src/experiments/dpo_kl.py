@@ -114,19 +114,16 @@ class DPO_KL(Experiment):
         def chatml_format(r):
             # Match the reference notebook formatting (ChatML-style strings)
             system_text = r.get("system") or ""
+            msgs = []
             if len(system_text) > 0:
-                message = {"role": "system", "content": system_text}
-                system = tok.apply_chat_template([message], tokenize=False)
-            else:
-                system = ""
-
-            message = {"role": "user", "content": r.get("input") or ""}
-            prompt = tok.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
+                msgs.append({"role": "system", "content": system_text})
+            msgs.append({"role": "user", "content": r.get("input") or ""})
+            prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
             chosen = (r.get("chosen") or "") + "<|im_end|>\n"
             rejected = (r.get("rejected") or "") + "<|im_end|>\n"
             return {
-                "prompt": system + prompt,
+                "prompt": prompt,
                 "chosen": chosen,
                 "rejected": rejected,
             }
