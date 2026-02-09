@@ -3,6 +3,8 @@
 hydra:
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+    params:
+      exp.tol: 0.3
 
 train:
   seed: 42
@@ -30,11 +32,11 @@ train:
     lora_dropout: 0.05
 
   hf_args:
-    per_device_train_batch_size: 1
-    per_device_eval_batch_size: 1
-    gradient_accumulation_steps: 8
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 2
     eval_accumulation_steps: 4
-    num_train_epochs: 1
+    num_train_epochs: 20
     learning_rate: 5e-5
     lr_scheduler_type: "cosine"
     warmup_steps: 200

@@ -3,6 +3,9 @@
 hydra:
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  params:
+    exp.loss_alpha: 2.0
+    exp.tol: 1.0
 
 train:
   seed: 42
@@ -33,7 +36,7 @@ train:
   hf_args:
     per_device_train_batch_size: 4
     per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 1
+    gradient_accumulation_steps: 2
     eval_accumulation_steps: 4
     num_train_epochs: 20
     learning_rate: 1e-5

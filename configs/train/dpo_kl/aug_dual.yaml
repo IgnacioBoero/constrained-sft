@@ -3,8 +3,8 @@
 hydra:
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
-    params:
-      exp.loss_alpha: 1.0,10.0, 100.0
+  params:
+    exp.loss_alpha: 1.0
 
 train:
   seed: 42

@@ -327,10 +327,8 @@ class DPO_KL(Experiment):
                 #   log σ( β*(logp_chosen - logp_rejected) - γ )
                 # and set γ from the existing constraint tolerance (cfg.tol).
                 if cfg.loss_type == "simpo":
-                    gamma = float(getattr(cfg, "tol", 0.0))
-                    # Use `loss_alpha` as the SimPO beta (per user request) so we can reuse
-                    # the same hyperparameter slot across constraint methods/configs.
-                    beta_simpo = float(getattr(cfg, "loss_alpha", 1.0))
+                    gamma = cfg.tol
+                    beta_simpo = cfg.loss_alpha
                     score = beta_simpo * gap - gamma  # (B,)
                     # -log σ(score) == softplus(-score)
                     loss = F.softplus(-score).mean()
