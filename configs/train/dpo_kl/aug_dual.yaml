@@ -3,8 +3,6 @@
 hydra:
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
-  params:
-    exp.loss_alpha: 1.0
 
 train:
   seed: 42
@@ -60,6 +58,6 @@ exp:
 
   # Loss/optimizer hyperparams (same naming as SAFETY)
   loss_type: aug_dual
-  loss_alpha: 10.0
+  loss_alpha: 1.0
   dual_step_size: 1.0
 

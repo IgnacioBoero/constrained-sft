@@ -3,8 +3,6 @@
 hydra:
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
-    params:
-      exp.loss_alpha: 10.0
 
 train:
   seed: 42
@@ -53,7 +51,6 @@ exp:
   name: "dpo_kl"
   model_name: meta-llama/Llama-3.1-8B-Instruct
   tol: 0.3
-
   loss_type: penalty
   loss_alpha: 10.0
   # unused for penalty, but kept for consistency

@@ -3,8 +3,6 @@
 hydra:
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
-    params:
-      exp.tol: 0.3
 
 train:
   seed: 42
@@ -52,7 +50,6 @@ exp:
   name: "dpo_kl"
   model_name: meta-llama/Llama-3.1-8B-Instruct
   tol: 0.3
-
   loss_type: avg
   # avg-dual doesn't use loss_alpha, but we keep the field for consistency across configs.
   loss_alpha: 10.0

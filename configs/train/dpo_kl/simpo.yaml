@@ -3,9 +3,6 @@
 hydra:
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
-  params:
-    exp.loss_alpha: 2.0
-    exp.tol: 1.0
 
 train:
   seed: 42
@@ -55,11 +52,11 @@ exp:
   model_name: meta-llama/Llama-3.1-8B-Instruct
 
   # SimPO margin γ (reusing the constraint tolerance field)
-  tol: 0.3
+  tol: 1.0
 
   loss_type: simpo
 
   # SimPO temperature / scaling (β)
-  loss_alpha: 0.1
+  loss_alpha: 2.0
   dual_step_size: 1.0
 
