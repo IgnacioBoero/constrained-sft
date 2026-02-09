@@ -40,6 +40,7 @@ class DPO_KL(Experiment):
         # Ensure pad token exists (common for Llama-family)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
 
         dtype = torch.bfloat16 if getattr(cfg.train.hf_args, "bf16", False) else torch.float16
         model = AutoModelForCausalLM.from_pretrained(
@@ -79,9 +80,6 @@ class DPO_KL(Experiment):
         val_fraction = float(getattr(cfg.train, "val_fraction", 0.1))
         sanity_check = bool(getattr(cfg.train, "sanity_check", False))
         do_shuffle = bool(getattr(cfg.train, "shuffle", True))
-        # Split seed controls the random train/val membership (kept fixed for comparability).
-        # Defaults to train.seed for backward compatibility.
-        split_seed = int(getattr(cfg.train, "split_seed", cfg.train.seed))
 
         ds = load_dataset(
             "argilla/distilabel-intel-orca-dpo-pairs",
@@ -107,18 +105,32 @@ class DPO_KL(Experiment):
         # Remove unused / heavy columns up-front (keeps behavior similar to the provided snippet)
         original_columns = ds.column_names
 
+        tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
+
         def chatml_format(r):
+            # Match the reference notebook formatting (ChatML-style strings)
+            system_text = r.get("system") or ""
+            if len(system_text) > 0:
+                message = {"role": "system", "content": system_text}
+                system = tok.apply_chat_template([message], tokenize=False)
+            else:
+                system = ""
+
+            message = {"role": "user", "content": r.get("input") or ""}
+            prompt = tok.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+
+            chosen = (r.get("chosen") or "") + "<|im_end|>\n"
+            rejected = (r.get("rejected") or "") + "<|im_end|>\n"
             return {
-                "system": r.get("system") or "",
-                "prompt": r.get("input") or "",
-                "chosen": r.get("chosen") or "",
-                "rejected": r.get("rejected") or "",
+                "prompt": system + prompt,
+                "chosen": chosen,
+                "rejected": rejected,
             }
 
         ds = ds.map(chatml_format, remove_columns=original_columns)
-
-        if do_shuffle:
-            ds = ds.shuffle(seed=split_seed)
 
         if not (0.0 < val_fraction < 1.0):
             raise ValueError(f"cfg.train.val_fraction must be in (0,1), got {val_fraction}")
@@ -137,8 +149,11 @@ class DPO_KL(Experiment):
         complete_ds = concatenate_datasets([tr_raw, ev_raw])
         complete_ds = complete_ds.add_column("index", list(range(len(complete_ds))))
 
-        tr = complete_ds.filter(lambda x: x["split"] == "train").shuffle(seed=int(cfg.train.seed))
-        ev = complete_ds.filter(lambda x: x["split"] == "validation").shuffle(seed=int(cfg.train.seed))
+        tr = complete_ds.filter(lambda x: x["split"] == "train")
+        ev = complete_ds.filter(lambda x: x["split"] == "validation")
+        if do_shuffle:
+            tr = tr.shuffle(seed=int(cfg.train.seed))
+            ev = ev.shuffle(seed=int(cfg.train.seed))
 
         print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
         return tr, ev, complete_ds
@@ -149,34 +164,15 @@ class DPO_KL(Experiment):
 
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
 
         eos_id = tok.eos_token_id
         if eos_id is None:
             raise ValueError("Tokenizer must have eos_token_id set for this experiment.")
 
-        def _prompt_ids(system_text: str, prompt_text: str) -> List[int]:
-            system_text = system_text or ""
+        def _prompt_ids(prompt_text: str) -> List[int]:
             prompt_text = prompt_text or ""
-            if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None):
-                msgs = []
-                if system_text.strip():
-                    msgs.append({"role": "system", "content": system_text})
-                msgs.append({"role": "user", "content": prompt_text})
-                ids = tok.apply_chat_template(
-                    msgs,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_tensors=None,
-                )
-                ids = list(ids)
-            else:
-                # Fallback: simple prompt (keeps assistant prefix)
-                buf = []
-                if system_text.strip():
-                    buf.append(system_text.strip())
-                buf.append(prompt_text.strip())
-                prompt = "\n\n".join(buf) + "\n\nAssistant:"
-                ids = tok(prompt, add_special_tokens=False)["input_ids"]
+            ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
 
             # Truncate from the LEFT to keep the end-of-prompt (assistant header) intact.
             if len(ids) > max_prompt_length:
@@ -197,12 +193,11 @@ class DPO_KL(Experiment):
             return full, resp
 
         def fn(sample: Dict[str, Any]):
-            system_text = sample.get("system", "")
             prompt_text = sample.get("prompt", "")
             chosen_text = sample.get("chosen", "")
             rejected_text = sample.get("rejected", "")
 
-            p_ids = _prompt_ids(system_text, prompt_text)
+            p_ids = _prompt_ids(prompt_text)
             chosen_ids, chosen_mask = _build_full(p_ids, chosen_text)
             rejected_ids, rejected_mask = _build_full(p_ids, rejected_text)
 
@@ -221,6 +216,7 @@ class DPO_KL(Experiment):
         if pad_id is None:
             tok.pad_token = tok.eos_token
             pad_id = tok.pad_token_id
+        tok.padding_side = "left"
 
         class Collator:
             def __init__(self, pad_token_id: int) -> None:
