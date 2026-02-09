@@ -372,7 +372,8 @@ class SAFETY(Experiment):
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros(len(self.train_dataset) + len(self.eval_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
-                self.avg_dual = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                self.avg_dual_safe = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                self.avg_dual_unsafe = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
 
             def train(self, *args, **kwargs):
                 """
@@ -648,12 +649,17 @@ class SAFETY(Experiment):
                     slack = slack_safe + slack2
 
                 if cfg.loss_type == "avg":
-                        dual_avg = self.avg_dual.clone()
-                        dual_avg = torch.clamp(dual_avg + cfg.dual_step_size * slack.mean(), min=0.0)
-                        self.avg_dual = dual_avg.detach()
+                        dual_safe = self.avg_dual_safe.clone()
+                        dual_safe = torch.clamp(dual_safe + cfg.dual_step_size * slack_safe.mean(), min=0.0)
+                        self.avg_dual_safe = dual_safe.detach()
+
+                        dual_unsafe = self.avg_dual_unsafe.clone()
+                        dual_unsafe = torch.clamp(dual_unsafe + cfg.dual_step_size * slack2.mean(), min=0.0)
+                        self.avg_dual_unsafe = dual_unsafe.detach()
+
                         loss += (
-                            dual_avg.detach()
-                            * slack
+                            dual_safe.detach() * slack_safe
+                            + dual_unsafe.detach() * slack2
                         )
                         # log the avg dual
 
