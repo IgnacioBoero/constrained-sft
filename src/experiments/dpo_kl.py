@@ -397,6 +397,21 @@ class DPO_KL(Experiment):
                         self.dual_vars[index] = dual_var.detach()
                     loss = loss + cfg.loss_alpha / 4 * (torch.clamp(z, min=0.0) ** 2 - b**2)
 
+                elif cfg.loss_type == "resilient":
+                    dual_var = self.dual_vars[index].clone()
+                    a = slack
+                    a_resilient = slack - dual_var / 2 * (cfg.resilient_coef)
+                    b = dual_var / (cfg.loss_alpha)
+                    coef = (cfg.resilient_coef) / (cfg.loss_alpha + cfg.resilient_coef)
+                    z = 2 * a + b
+                    dual_grad = torch.where(z > 0, coef * a_resilient, -0.5 * b)
+                    if model.training:
+                        dual_var += cfg.dual_step_size * dual_grad
+                        self.dual_vars[index] = dual_var.detach()
+                    loss = loss + cfg.loss_alpha / 4 * (
+                        coef * torch.clamp(z, min=0.0) ** 2 - b**2
+                    )
+
                 elif cfg.loss_type == "penalty":
                     loss = loss + cfg.loss_alpha * slack
 
@@ -481,11 +496,6 @@ class DPO_KL(Experiment):
                 was_training = model.training
                 model.eval()
 
-                tok = self.tokenizer
-                pad_id = tok.pad_token_id if tok is not None and tok.pad_token_id is not None else None
-                if pad_id is None and tok is not None:
-                    pad_id = tok.eos_token_id
-
                 rows = []
                 for i in row_idxs:
                     sample = ev_ds[int(i)]
@@ -498,17 +508,12 @@ class DPO_KL(Experiment):
                     if prompt_end <= 0:
                         continue
                     prompt_ids = ids[:prompt_end].unsqueeze(0)
-                    if pad_id is None:
-                        attn = torch.ones_like(prompt_ids, device=model.device)
-                    else:
-                        attn = prompt_ids.ne(pad_id).long()
+                    attn = torch.ones_like(prompt_ids, device=model.device)
                     with torch.no_grad():
                         out_ids = model.generate(
                             input_ids=prompt_ids,
                             attention_mask=attn,
-                            max_new_tokens=1024,
-                            pad_token_id=pad_id,
-                            eos_token_id=tok.eos_token_id if tok is not None else None,
+                            max_new_tokens=512,
                         )
                     gen_ids = out_ids[0][prompt_ids.shape[1] :]
                     prompt_text = self.tokenizer.decode(prompt_ids[0], skip_special_tokens=True) if self.tokenizer is not None else ""

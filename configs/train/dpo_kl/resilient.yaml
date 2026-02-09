@@ -9,13 +9,13 @@ hydra:
 train:
   seed: 42
   split_seed: 42
-  output_dir: "./outputs/dpo_kl/${exp.loss_type}/tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  output_dir: "./outputs/dpo_kl/${exp.loss_type}/tol:${exp.tol}-alpha:${exp.loss_alpha}-rescoef:${exp.resilient_coef}-dual_lr:${exp.dual_step_size}"
   do_train: true
   do_initial_eval: false
   use_wandb: true
   save_model: true
   wandb_project: "dpo_kl"
-  run_name: "dpo_kl-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  run_name: "dpo_kl-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}-rescoef:${exp.resilient_coef}-dual_lr:${exp.dual_step_size}"
 
   # Dataset / preprocessing
   cache_dir: "./cache"
@@ -59,7 +59,7 @@ exp:
   tol: 0.3
 
   # Loss/optimizer hyperparams (same naming as SAFETY)
-  loss_type: aug_dual
+  loss_type: resilient
   loss_alpha: 10.0
   dual_step_size: 1.0
-
+  resilient_coef: 1.0
