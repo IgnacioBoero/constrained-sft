@@ -334,7 +334,7 @@ class DPO_KL(Experiment):
                     loss = F.softplus(-score).mean()
                     if return_outputs:
                         packed = torch.stack([logp_chosen, logp_rejected, score], dim=-1)
-                        return loss, SimpleNamespace(logits=packed)
+                        return loss, {"logits": packed}
                     return loss
 
                 # KL objective vs pretrained/base (adapters disabled)
@@ -419,7 +419,7 @@ class DPO_KL(Experiment):
                     # Return compact predictions for metrics: [logp_chosen, logp_rejected, third]
                     # third = KL mean for KL-based methods
                     packed = torch.stack([logp_chosen, logp_rejected, kl_mean], dim=-1)
-                    return loss, SimpleNamespace(logits=packed)
+                    return loss, {"logits": packed}
                 return loss
 
             def _compute_metrics(self, pred):
