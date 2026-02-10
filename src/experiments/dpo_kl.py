@@ -423,7 +423,8 @@ class DPO_KL(Experiment):
                 return loss
 
             def _compute_metrics(self, pred):
-                cfg = self.custom_cfg.exp
+                cfg = self.custom_cfg
+                exp_cfg = cfg.exp
                 arr = pred.predictions
                 if isinstance(arr, (list, tuple)):
                     arr = arr[0]
@@ -433,7 +434,7 @@ class DPO_KL(Experiment):
                 logp_chosen = arr[:, 0]
                 logp_rejected = arr[:, 1]
                 gap = logp_chosen - logp_rejected
-                slack = float(cfg.tol) - gap
+                slack = float(exp_cfg.tol) - gap
 
                 out = {
                     "logp_gap": float(np.mean(gap)),
@@ -454,7 +455,7 @@ class DPO_KL(Experiment):
                     except Exception as exc:
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
-                if cfg.loss_type in {"aug_dual", "resilient"} and getattr(cfg.train, "use_wandb", False):
+                if exp_cfg.loss_type in {"aug_dual", "resilient"} and getattr(cfg.train, "use_wandb", False):
                     try:
                         import wandb
 
@@ -474,10 +475,10 @@ class DPO_KL(Experiment):
                     except Exception as exc:
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
-                if cfg.loss_type == "avg":
+                if exp_cfg.loss_type == "avg":
                     out["avg_dual"] = float(self.avg_dual.detach().cpu().item())
 
-                if cfg.loss_type == "simpo":
+                if exp_cfg.loss_type == "simpo":
                     # third column is the SimPO score used inside logsigmoid
                     score = arr[:, 2]
                     # logsigmoid(score) = -softplus(-score) = -logaddexp(0, -score)
