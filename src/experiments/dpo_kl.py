@@ -431,15 +431,45 @@ class DPO_KL(Experiment):
                 arr = np.asarray(arr)
                 if arr.ndim != 2 or arr.shape[1] < 3:
                     return {}
+                idx_chunks = pred.label_ids
+                if isinstance(idx_chunks, (list, tuple)):
+                    indexes = np.concatenate([np.asarray(x) for x in idx_chunks], axis=0)
+                else:
+                    indexes = np.asarray(idx_chunks)
+                indexes = np.asarray(indexes).reshape(-1)
                 logp_chosen = arr[:, 0]
                 logp_rejected = arr[:, 1]
                 gap = logp_chosen - logp_rejected
-                slack = float(exp_cfg.tol) - gap
+                # Match SAFETY convention: "constraint" is the negated log-ratio.
+                # constraint = -(logp_chosen - logp_rejected)
+                constraint_values = -gap
+                if indexes.shape[0] != constraint_values.shape[0]:
+                    # Fallback for unexpected prediction/label packing mismatch.
+                    indexes = np.arange(constraint_values.shape[0], dtype=np.int64)
+
+                # Store full-eval tensors for shared eval callbacks (eval/train prefixes).
+                self._last_constraint_slacks = torch.tensor(constraint_values, dtype=torch.float).detach().cpu()
+                self._last_constraint_indexes = torch.tensor(indexes, dtype=torch.long).detach().cpu()
+                self._last_objective_ratios = torch.tensor(gap, dtype=torch.float).detach().cpu()
+                self._last_objective_indexes = torch.tensor(indexes, dtype=torch.long).detach().cpu()
+
+                # Safety-style aggregate metrics over constraint values.
+                constraint_mean = float(np.mean(constraint_values))
+                constraint_min = float(np.min(constraint_values))
+                constraint_max = float(np.max(constraint_values))
+                q90 = float(np.quantile(constraint_values, 0.9))
+                q99 = float(np.quantile(constraint_values, 0.99))
+                tail = constraint_values[constraint_values > q90]
+                constraint_cvar = float(np.mean(tail)) if tail.size > 0 else constraint_max
 
                 out = {
                     "logp_gap": float(np.mean(gap)),
-                    "constraint_mean_slack": float(np.mean(slack)),
-                    "constraint_sat_rate": float(np.mean(slack <= 0.0)),
+                    "constraint_mean": constraint_mean,
+                    "constraint_min": constraint_min,
+                    "constraint_max": constraint_max,
+                    "constraint_q90": q90,
+                    "constraint_q99": q99,
+                    "constraint_cvar": constraint_cvar,
                 }
 
                 if getattr(cfg.train, "use_wandb", False):
@@ -449,9 +479,10 @@ class DPO_KL(Experiment):
                         if wandb.run is not None:
                             epoch = self.state.epoch
                             table = wandb.Table(columns=["constraint_slack"])
-                            for s in slack.tolist():
+                            for s in constraint_values.tolist():
                                 table.add_data(s)
-                            wandb.log({f"constraint_slacks_epoch_{epoch}": table})
+                            prefix = getattr(self, "_current_eval_prefix", "eval")
+                            wandb.log({f"constraint_slacks_epoch_{epoch}_{prefix}": table})
                     except Exception as exc:
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
@@ -471,7 +502,8 @@ class DPO_KL(Experiment):
                                 for idx in train_indexes:
                                     if 0 <= int(idx) < len(dual_vals):
                                         table.add_data(int(idx), float(dual_vals[int(idx)]))
-                            wandb.log({f"dual_vars_train_epoch_{epoch}": table})
+                            prefix = getattr(self, "_current_eval_prefix", "eval")
+                            wandb.log({f"dual_vars_{prefix}_epoch_{epoch}": table})
                     except Exception as exc:
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
