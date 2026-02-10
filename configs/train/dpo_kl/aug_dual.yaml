@@ -14,6 +14,9 @@ train:
   save_model: true
   wandb_project: "dpo_kl"
   run_name: "dpo_kl-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  eval_at_end: true
+  eval_on_train: true
+  push_adapters_to_wandb: true
 
   # Dataset / preprocessing
   cache_dir: "./cache"

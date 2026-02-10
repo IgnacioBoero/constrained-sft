@@ -12,6 +12,7 @@ train:
   do_initial_eval: false
   use_wandb: true
   save_model: true
+  push_adapters_to_wandb: true
   wandb_project: "dpo_kl"
   run_name: "dpo_kl-${exp.loss_type}-tol:${exp.tol}-dual_lr:${exp.dual_step_size}"
 
@@ -23,6 +24,8 @@ train:
   max_prompt_length: 1024
   max_length: 1536
   max_gen: 10
+  eval_at_end: true
+  eval_on_train: true
 
   lora:
     r: 8

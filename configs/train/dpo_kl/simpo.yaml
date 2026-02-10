@@ -15,6 +15,8 @@ train:
   push_adapters_to_wandb: true
   wandb_project: "dpo_kl"
   run_name: "dpo_kl-${exp.loss_type}-beta:${exp.loss_alpha}-gamma:${exp.tol}"
+  eval_at_end: true
+  eval_on_train: true
 
   cache_dir: "./cache"
   val_fraction: 0.1

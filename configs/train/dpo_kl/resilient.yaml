@@ -23,6 +23,9 @@ train:
   data_proportion: 1.0
   max_prompt_length: 1024
   max_length: 1536
+  push_adapters_to_wandb: true
+  eval_at_end: true
+  eval_on_train: true
 
   # Train-end generation: sample 10 validation prompts
   max_gen: 10

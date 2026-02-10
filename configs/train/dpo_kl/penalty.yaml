@@ -37,7 +37,7 @@ train:
     per_device_eval_batch_size: 4
     gradient_accumulation_steps: 2
     eval_accumulation_steps: 4
-    num_train_epochs: 0
+    num_train_epochs: 20
     learning_rate: 5e-4
     lr_scheduler_type: "cosine"
     warmup_steps: 200
@@ -54,7 +54,7 @@ exp:
   model_name: meta-llama/Llama-3.1-8B-Instruct
   tol: 0.3
   loss_type: penalty
-  loss_alpha: 10.0
+  loss_alpha: 1.0
   # unused for penalty, but kept for consistency
   dual_step_size: 1.0
 
