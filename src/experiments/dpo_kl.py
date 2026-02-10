@@ -441,6 +441,42 @@ class DPO_KL(Experiment):
                     "constraint_sat_rate": float(np.mean(slack <= 0.0)),
                 }
 
+                if getattr(cfg.train, "use_wandb", False):
+                    try:
+                        import wandb
+
+                        if wandb.run is not None:
+                            epoch = self.state.epoch
+                            table = wandb.Table(columns=["constraint_slack"])
+                            for s in slack.tolist():
+                                table.add_data(s)
+                            wandb.log({f"constraint_slacks_epoch_{epoch}": table})
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                if cfg.loss_type in {"aug_dual", "resilient"} and getattr(cfg.train, "use_wandb", False):
+                    try:
+                        import wandb
+
+                        if wandb.run is not None:
+                            epoch = self.state.epoch
+                            table = wandb.Table(columns=["index", "dual_var"])
+                            if self.train_dataset is not None and hasattr(self.train_dataset, "column_names") and "index" in self.train_dataset.column_names:
+                                train_indexes = list(self.train_dataset["index"])
+                            else:
+                                train_indexes = list(range(len(self.train_dataset))) if self.train_dataset is not None else []
+                            if train_indexes:
+                                dual_vals = self.dual_vars.detach().cpu().numpy()
+                                for idx in train_indexes:
+                                    if 0 <= int(idx) < len(dual_vals):
+                                        table.add_data(int(idx), float(dual_vals[int(idx)]))
+                            wandb.log({f"dual_vars_train_epoch_{epoch}": table})
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                if cfg.loss_type == "avg":
+                    out["avg_dual"] = float(self.avg_dual.detach().cpu().item())
+
                 if cfg.loss_type == "simpo":
                     # third column is the SimPO score used inside logsigmoid
                     score = arr[:, 2]
