@@ -426,9 +426,20 @@ class DPO_KL(Experiment):
                 cfg = self.custom_cfg
                 exp_cfg = cfg.exp
                 arr = pred.predictions
+                # Flatten prediction chunks robustly (match SAFETY behavior):
+                # keep all rows from the full evaluated dataset.
                 if isinstance(arr, (list, tuple)):
-                    arr = arr[0]
-                arr = np.asarray(arr)
+                    parts = []
+                    for x in arr:
+                        x_np = np.asarray(x)
+                        if x_np.ndim == 1:
+                            x_np = x_np[:, None]
+                        parts.append(x_np)
+                    if not parts:
+                        return {}
+                    arr = np.concatenate(parts, axis=0)
+                else:
+                    arr = np.asarray(arr)
                 if arr.ndim != 2 or arr.shape[1] < 3:
                     return {}
                 idx_chunks = pred.label_ids
@@ -471,6 +482,59 @@ class DPO_KL(Experiment):
                     "constraint_q99": q99,
                     "constraint_cvar": constraint_cvar,
                 }
+                dual_stats = None
+                if exp_cfg.loss_type in {"aug_dual", "resilient"}:
+                    if (
+                        self.train_dataset is not None
+                        and hasattr(self.train_dataset, "column_names")
+                        and "index" in self.train_dataset.column_names
+                    ):
+                        train_indexes = list(self.train_dataset["index"])
+                    else:
+                        train_indexes = (
+                            list(range(len(self.train_dataset)))
+                            if self.train_dataset is not None
+                            else []
+                        )
+                    if train_indexes:
+                        dual_vals = self.dual_vars.detach().cpu().numpy()
+                        selected = [
+                            float(dual_vals[int(idx)])
+                            for idx in train_indexes
+                            if 0 <= int(idx) < len(dual_vals)
+                        ]
+                    else:
+                        selected = []
+                    if selected:
+                        selected_np = np.asarray(selected, dtype=np.float64)
+                        dual_q90 = float(np.quantile(selected_np, 0.9))
+                        dual_q99 = float(np.quantile(selected_np, 0.99))
+                        dual_tail = selected_np[selected_np > dual_q90]
+                        dual_cvar = (
+                            float(np.mean(dual_tail))
+                            if dual_tail.size > 0
+                            else float(np.max(selected_np))
+                        )
+                        dual_stats = {
+                            "dual_vars_mean": float(np.mean(selected_np)),
+                            "dual_vars_min": float(np.min(selected_np)),
+                            "dual_vars_max": float(np.max(selected_np)),
+                            "dual_vars_q90": dual_q90,
+                            "dual_vars_q99": dual_q99,
+                            "dual_vars_cvar": dual_cvar,
+                            "_train_indexes": train_indexes,
+                            "_dual_vals": dual_vals if train_indexes else None,
+                        }
+                        out.update(
+                            {
+                                "dual_vars_mean": dual_stats["dual_vars_mean"],
+                                "dual_vars_min": dual_stats["dual_vars_min"],
+                                "dual_vars_max": dual_stats["dual_vars_max"],
+                                "dual_vars_q90": dual_stats["dual_vars_q90"],
+                                "dual_vars_q99": dual_stats["dual_vars_q99"],
+                                "dual_vars_cvar": dual_stats["dual_vars_cvar"],
+                            }
+                        )
 
                 if getattr(cfg.train, "use_wandb", False):
                     try:
@@ -490,20 +554,27 @@ class DPO_KL(Experiment):
                     try:
                         import wandb
 
-                        if wandb.run is not None:
+                        if wandb.run is not None and dual_stats is not None:
                             epoch = self.state.epoch
                             table = wandb.Table(columns=["index", "dual_var"])
-                            if self.train_dataset is not None and hasattr(self.train_dataset, "column_names") and "index" in self.train_dataset.column_names:
-                                train_indexes = list(self.train_dataset["index"])
-                            else:
-                                train_indexes = list(range(len(self.train_dataset))) if self.train_dataset is not None else []
+                            train_indexes = dual_stats["_train_indexes"]
+                            dual_vals = dual_stats["_dual_vals"]
                             if train_indexes:
-                                dual_vals = self.dual_vars.detach().cpu().numpy()
                                 for idx in train_indexes:
                                     if 0 <= int(idx) < len(dual_vals):
                                         table.add_data(int(idx), float(dual_vals[int(idx)]))
                             prefix = getattr(self, "_current_eval_prefix", "eval")
-                            wandb.log({f"dual_vars_{prefix}_epoch_{epoch}": table})
+                            wandb.log(
+                                {
+                                    f"dual_vars_{prefix}_epoch_{epoch}": table,
+                                    f"dual_vars_mean_{prefix}": dual_stats["dual_vars_mean"],
+                                    f"dual_vars_min_{prefix}": dual_stats["dual_vars_min"],
+                                    f"dual_vars_max_{prefix}": dual_stats["dual_vars_max"],
+                                    f"dual_vars_q90_{prefix}": dual_stats["dual_vars_q90"],
+                                    f"dual_vars_q99_{prefix}": dual_stats["dual_vars_q99"],
+                                    f"dual_vars_cvar_{prefix}": dual_stats["dual_vars_cvar"],
+                                }
+                            )
                     except Exception as exc:
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
