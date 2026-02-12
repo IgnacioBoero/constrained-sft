@@ -1,0 +1,23 @@
+# @package _global_
+
+wandb:
+  entity: "alelab"
+  project: "dpo_kl"
+  run_id: "68l7gg1o"
+
+model:
+  # Optional override. If null, inferred from run config (`exp.model_name`).
+  base_model: null
+
+eval:
+  dataset_path: "src/datasets/safety/evaluation/alpaca_eval.json"
+  max_samples: 10
+  max_new_tokens: 2048
+  temperature: 0.7
+  top_p: 0.9
+  greedy: false
+
+hydra:
+  run:
+    dir: outputs/eval/wandb_alpaca_eval/${wandb.project}/${wandb.run_id}
+
