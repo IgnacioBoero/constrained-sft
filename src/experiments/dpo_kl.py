@@ -275,6 +275,7 @@ class DPO_KL(Experiment):
                 # Use per-example `index` as the label returned to metrics/prediction loops.
                 self.label_names = ["index"]
                 self._generated_eval_answers = False
+                self._generated_eval_keys = set()
                 self.compute_metrics = self._compute_metrics
 
             def init_dual_vars(self):
@@ -286,6 +287,11 @@ class DPO_KL(Experiment):
                 out = super().train(*args, **kwargs)
                 self._generate_eval_answers_end_of_training()
                 return out
+
+            def evaluate(self, *args, **kwargs):
+                metrics = super().evaluate(*args, **kwargs)
+                self._generate_eval_answers_on_epoch_eval()
+                return metrics
 
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 cfg = self.custom_cfg.exp
@@ -599,6 +605,29 @@ class DPO_KL(Experiment):
                 if self._generated_eval_answers:
                     return None
                 self._generated_eval_answers = True
+                return self._generate_eval_answers(file_tag="end_of_training")
+
+            def _generate_eval_answers_on_epoch_eval(self):
+                # Run generation when eval is configured per-epoch.
+                strategy = getattr(self.args, "eval_strategy", None)
+                if strategy is None:
+                    strategy = getattr(self.args, "evaluation_strategy", None)
+                strategy_str = str(strategy).lower() if strategy is not None else ""
+                if "epoch" not in strategy_str:
+                    return None
+
+                epoch = self.state.epoch
+                if epoch is None:
+                    key = f"step_{int(self.state.global_step)}"
+                else:
+                    key = f"epoch_{int(round(float(epoch)))}"
+                if key in self._generated_eval_keys:
+                    return None
+                self._generated_eval_keys.add(key)
+
+                return self._generate_eval_answers(file_tag=key)
+
+            def _generate_eval_answers(self, file_tag: str):
 
                 # Rank-0 only
                 rank = int(os.environ.get("RANK", "0"))
@@ -664,7 +693,7 @@ class DPO_KL(Experiment):
                 # Log to wandb + json artifact in output_dir
                 out_dir = Path(cfg.train.output_dir)
                 out_dir.mkdir(parents=True, exist_ok=True)
-                out_path = out_dir / "dpo_kl_generate_val10.json"
+                out_path = out_dir / f"dpo_kl_generate_val10_{file_tag}.json"
                 out_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
                 if cfg.train.use_wandb:
@@ -675,8 +704,8 @@ class DPO_KL(Experiment):
                             table = wandb.Table(columns=["prompt", "output"])
                             for r in rows:
                                 table.add_data(r.get("prompt"), r.get("output"))
-                            wandb.log({"dpo_kl_val_generations": table})
-                            artifact = wandb.Artifact("dpo_kl_val_generations", type="generations")
+                            wandb.log({f"dpo_kl_val_generations_{file_tag}": table})
+                            artifact = wandb.Artifact(f"dpo_kl_val_generations_{file_tag}", type="generations")
                             artifact.add_file(str(out_path))
                             wandb.log_artifact(artifact)
                     except Exception as exc:
