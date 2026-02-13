@@ -1,0 +1,34 @@
+# @package _global_
+
+wandb:
+  entity: "alelab"
+  project: "dpo_kl"
+  run_id: "694jyduz" # "ppocpwoy" # null #"83q43pt7" #"bqp0t0qs"
+
+model:
+  # Optional override. If null, inferred from run config (`exp.model_name`).
+  base_model: "meta-llama/Llama-3.1-8B"
+
+eval:
+  dataset_path: "src/datasets/safety/evaluation/alpaca_eval.json"
+  max_samples: 805
+  max_new_tokens: 2048
+  temperature: 0.7
+  top_p: 0.9
+  greedy: false
+  local_output_dir: "outputs/alpaca_eval_vllm"
+
+vllm:
+  # <= 0 means auto-detect all visible GPUs.
+  tensor_parallel_size: -1
+  dtype: "bfloat16"
+  merge_dtype: "bfloat16"
+  gpu_memory_utilization: 0.9
+  max_model_len: null
+  trust_remote_code: false
+  enforce_eager: false
+
+hydra:
+  run:
+    dir: outputs/eval/wandb_alpaca_eval_vllm/${wandb.project}/${wandb.run_id}
+
