@@ -32,9 +32,39 @@ class DPO_KL(Experiment):
       - penalty: linear penalty
       - simpo: SimPO objective (no KL regularization), margin gamma = tol
     """
+    DEFAULT_CHAT_TEMPLATE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+    def _get_default_chat_template(self) -> str:
+        cached = getattr(self, "_default_chat_template", None)
+        if cached:
+            return cached
+
+        fallback_tok = AutoTokenizer.from_pretrained(
+            self.DEFAULT_CHAT_TEMPLATE_MODEL,
+            use_fast=True,
+        )
+        template = getattr(fallback_tok, "chat_template", None)
+        if not template:
+            raise ValueError(
+                "Fallback tokenizer has no chat template: "
+                f"{self.DEFAULT_CHAT_TEMPLATE_MODEL}"
+            )
+        self._default_chat_template = template
+        return template
+
+    def _ensure_chat_template(self, tok):
+        if getattr(tok, "chat_template", None):
+            return tok
+        tok.chat_template = self._get_default_chat_template()
+        print(
+            "[dpo_kl] tokenizer has no chat template; "
+            f"using template from {self.DEFAULT_CHAT_TEMPLATE_MODEL}"
+        )
+        return tok
 
     def load_model_and_tok(self, cfg):
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
+        tok = self._ensure_chat_template(tok)
         tok.model_max_length = int(getattr(cfg.train, "max_length", 2048))
 
         # Ensure pad token exists (common for Llama-family)
@@ -107,6 +137,7 @@ class DPO_KL(Experiment):
         original_columns = ds.column_names
 
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
+        tok = self._ensure_chat_template(tok)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         tok.padding_side = "right"
