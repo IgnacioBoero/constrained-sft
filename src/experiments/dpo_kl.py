@@ -184,6 +184,19 @@ class DPO_KL(Experiment):
             tr = tr.shuffle(seed=int(cfg.train.seed))
             ev = ev.shuffle(seed=int(cfg.train.seed))
 
+        # Keep only the shortest `filter_shortest_train` fraction of training
+        # samples, measured by character length of the "chosen" response.
+        filter_shortest = float(getattr(cfg.train, "filter_shortest_train", 1.0))
+        if not (0.0 < filter_shortest <= 1.0):
+            raise ValueError(
+                f"cfg.train.filter_shortest_train must be in (0,1], got {filter_shortest}"
+            )
+        if filter_shortest < 1.0:
+            chosen_lengths = [len(r["chosen"]) for r in tr]
+            keep_n = max(1, int(filter_shortest * len(tr)))
+            sorted_indices = sorted(range(len(tr)), key=lambda i: chosen_lengths[i])
+            tr = tr.select(sorted_indices[:keep_n])
+
         print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
         return tr, ev, complete_ds
 
