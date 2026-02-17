@@ -28,6 +28,44 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 DEFAULT_CHAT_TEMPLATE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
+# ---------------------------------------------------------------------------
+# SAFETY prompt format (matches src/experiments/safety.py / src/utils.py)
+# Used for Llama-2-era models trained with the SAFETY experiment.
+# ---------------------------------------------------------------------------
+_PROMPT_BEGIN: str = "BEGINNING OF CONVERSATION: "
+_PROMPT_USER: str = "USER: {input} "
+_PROMPT_ASSISTANT: str = "ASSISTANT:"
+
+
+def _is_llama2_style_model(model_name: str) -> bool:
+    """Return True when *model_name* is a Llama-2-era (or LLaMA-1) model
+    that was trained with the SAFETY ``format_prompt`` template rather than a
+    chat template."""
+    name_lower = model_name.lower()
+    # Explicitly Llama 2
+    if "llama-2" in name_lower or "llama2" in name_lower:
+        return True
+    # huggyllama/llama-7b and derivatives (e.g. ihounie/huggy-*)
+    if "huggyllama" in name_lower:
+        return True
+    if "huggy" in name_lower:
+        return True
+    # Generic LLaMA 1/2 pattern (but NOT Llama 3+)
+    if "llama" in name_lower and not any(
+        tag in name_lower for tag in ("llama-3", "llama3")
+    ):
+        return True
+    return False
+
+
+def _build_safety_prompt(instruction: str, input_text: str) -> str:
+    """Build a prompt using the SAFETY format_prompt template
+    (``BEGINNING OF CONVERSATION: USER: ... ASSISTANT:``)."""
+    user_content = instruction.strip()
+    if input_text and input_text.strip():
+        user_content = f"{user_content} {input_text.strip()}"
+    return f"{_PROMPT_BEGIN}{_PROMPT_USER.format(input=user_content)}{_PROMPT_ASSISTANT}"
+
 
 def _iso_now() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -163,7 +201,21 @@ def _load_alpaca_eval_prompts(dataset_path: str, max_samples: int) -> List[Dict[
     return prompts
 
 
-def _build_chat_prompt(tok: AutoTokenizer, instruction: str, input_text: str) -> str:
+def _build_chat_prompt(
+    tok: AutoTokenizer,
+    instruction: str,
+    input_text: str,
+    *,
+    use_safety_format: bool = False,
+) -> str:
+    """Build the text prompt for a single AlpacaEval example.
+
+    When *use_safety_format* is True the SAFETY ``format_prompt`` template is
+    used (matching the training format for Llama-2-era models).  Otherwise the
+    tokenizer's chat template is applied.
+    """
+    if use_safety_format:
+        return _build_safety_prompt(instruction, input_text)
     user_content = instruction.strip()
     if input_text and input_text.strip():
         user_content = f"{user_content}\n\n{input_text.strip()}"
@@ -224,10 +276,13 @@ def _merge_lora_to_local_model(
     adapter_dir: Path,
     merged_dir: Path,
     merge_dtype: str,
+    *,
+    skip_chat_template: bool = False,
 ) -> AutoTokenizer:
     merged_dir.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(base_model, use_fast=True)
-    tok = _ensure_chat_template(tok)
+    if not skip_chat_template:
+        tok = _ensure_chat_template(tok)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
@@ -236,7 +291,7 @@ def _merge_lora_to_local_model(
         base_model,
         torch_dtype=_torch_dtype(merge_dtype),
         low_cpu_mem_usage=True,
-        device_map="auto",
+        device_map="cpu",
     )
     peft_model = PeftModel.from_pretrained(base, str(adapter_dir))
     merged = peft_model.merge_and_unload()
@@ -251,7 +306,8 @@ def _merge_lora_to_local_model(
         torch.cuda.empty_cache()
 
     merged_tok = AutoTokenizer.from_pretrained(str(merged_dir), use_fast=True)
-    merged_tok = _ensure_chat_template(merged_tok)
+    if not skip_chat_template:
+        merged_tok = _ensure_chat_template(merged_tok)
     return merged_tok
 
 
@@ -292,6 +348,14 @@ def main(cfg: DictConfig) -> None:
             )
         base_model = base_model_override
 
+    # Detect Llama-2 / LLaMA-1 models that use the SAFETY prompt format
+    use_safety_format = _is_llama2_style_model(base_model)
+    if use_safety_format:
+        print(
+            f"[wandb_alpaca_eval_vllm] Detected Llama-2-era model ({base_model}); "
+            "using SAFETY prompt format instead of chat template."
+        )
+
     with tempfile.TemporaryDirectory(prefix="wandb_eval_vllm_") as td:
         tmp_root = Path(td)
         if use_existing_run:
@@ -303,12 +367,14 @@ def main(cfg: DictConfig) -> None:
                 adapter_dir=adapter_dir,
                 merged_dir=merged_dir,
                 merge_dtype=str(cfg.vllm.merge_dtype),
+                skip_chat_template=use_safety_format,
             )
             model_ref = str(merged_dir)
             generator_name = "wandb_lora_merged_vllm"
         else:
             tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
-            tokenizer = _ensure_chat_template(tokenizer)
+            if not use_safety_format:
+                tokenizer = _ensure_chat_template(tokenizer)
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
             tokenizer.padding_side = "right"
@@ -323,7 +389,10 @@ def main(cfg: DictConfig) -> None:
             raise RuntimeError("No prompts found after parsing and filtering dataset.")
 
         prompt_texts = [
-            _build_chat_prompt(tokenizer, p["instruction"], p.get("input", ""))
+            _build_chat_prompt(
+                tokenizer, p["instruction"], p.get("input", ""),
+                use_safety_format=use_safety_format,
+            )
             for p in prompts
         ]
 

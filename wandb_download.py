@@ -2,8 +2,8 @@ import wandb
 from pathlib import Path
 
 entity = "alelab"
-project = "dpo_kl"
-run_id = "694jyduz"#"ppocpwoy"#"h4h0gxko" #"83q43pt7"#"bqp0t0qs"
+project = "SAFE-long1k"
+run_id = "5dwh4stq"#n8oe8pxk"#"acsip14q"#"694jyduz"#"ppocpwoy"#"h4h0gxko" #"83q43pt7"#"bqp0t0qs"
     
 api = wandb.Api()
 artifact = api.artifact(f"{entity}/{project}/{run_id}-alpaca_eval_outputs-vllm:latest")

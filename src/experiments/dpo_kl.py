@@ -112,18 +112,29 @@ class DPO_KL(Experiment):
         sanity_check = bool(getattr(cfg.train, "sanity_check", False))
         do_shuffle = bool(getattr(cfg.train, "shuffle", True))
 
-        ds = load_dataset(
-            "argilla/distilabel-intel-orca-dpo-pairs",
-            split="train",
-            cache_dir=cache_dir,
-        )
+        dataset_name = str(getattr(cfg.train, "dataset", "orca")).lower()
 
-        # Filter as requested
-        ds = ds.filter(
-            lambda r: (r["status"] != "tie")
-            and (r["chosen_score"] >= 8)
-            and (not r["in_gsm8k_train"])
-        )
+        if dataset_name == "ultra":
+            ds = load_dataset(
+                "HuggingFaceH4/ultrafeedback_binarized",
+                split="train_prefs",
+                cache_dir=cache_dir,
+            )
+            if sanity_check:
+                ds = ds.select(range(min(len(ds), 1000)))
+        else:
+            # Default: Orca DPO pairs
+            ds = load_dataset(
+                "argilla/distilabel-intel-orca-dpo-pairs",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            # Filter as requested
+            ds = ds.filter(
+                lambda r: (r["status"] != "tie")
+                and (r["chosen_score"] >= 8)
+                and (not r["in_gsm8k_train"])
+            )
 
         # Optional: proportion cap
         data_prop = float(getattr(cfg.train, "data_proportion", 1.0))
@@ -142,22 +153,39 @@ class DPO_KL(Experiment):
             tok.pad_token = tok.eos_token
         tok.padding_side = "right"
 
-        def chatml_format(r):
-            # Match the reference notebook formatting (ChatML-style strings)
-            system_text = r.get("system") or ""
-            msgs = []
-            if len(system_text) > 0:
-                msgs.append({"role": "system", "content": system_text})
-            msgs.append({"role": "user", "content": r.get("input") or ""})
-            prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-
-            chosen = (r.get("chosen") or "") + "<|im_end|>\n"
-            rejected = (r.get("rejected") or "") + "<|im_end|>\n"
-            return {
-                "prompt": prompt,
-                "chosen": chosen,
-                "rejected": rejected,
-            }
+        if dataset_name == "ultra":
+            def chatml_format(r):
+                # UltraFeedback: chosen/rejected are message lists;
+                # extract the assistant response from index 1.
+                msgs = [{"role": "user", "content": r.get("prompt") or ""}]
+                prompt = tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+                chosen = (r["chosen"][1]["content"] if r.get("chosen") else "") + "<|im_end|>\n"
+                rejected = (r["rejected"][1]["content"] if r.get("rejected") else "") + "<|im_end|>\n"
+                return {
+                    "prompt": prompt,
+                    "chosen": chosen,
+                    "rejected": rejected,
+                }
+        else:
+            def chatml_format(r):
+                # Match the reference notebook formatting (ChatML-style strings)
+                system_text = r.get("system") or ""
+                msgs = []
+                if len(system_text) > 0:
+                    msgs.append({"role": "system", "content": system_text})
+                msgs.append({"role": "user", "content": r.get("input") or ""})
+                prompt = tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+                chosen = (r.get("chosen") or "") + "<|im_end|>\n"
+                rejected = (r.get("rejected") or "") + "<|im_end|>\n"
+                return {
+                    "prompt": prompt,
+                    "chosen": chosen,
+                    "rejected": rejected,
+                }
 
         ds = ds.map(chatml_format, remove_columns=original_columns)
 
