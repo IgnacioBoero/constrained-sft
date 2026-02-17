@@ -5,6 +5,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
 
 train:
+  dataset: ultra
   seed: 42
   split_seed: 42
   output_dir: "./outputs/dpo_kl/${exp.loss_type}/beta:${exp.loss_alpha}-gamma:${exp.tol}"
@@ -25,7 +26,7 @@ train:
   data_proportion: 1.0
   max_prompt_length: 1024
   max_length: 1536
-  max_gen: 10
+  max_gen: 2
 
   lora:
     r: 8
@@ -33,16 +34,16 @@ train:
     lora_dropout: 0.05
 
   hf_args:
-    per_device_train_batch_size: 4
-    per_device_eval_batch_size: 4
-    gradient_accumulation_steps: 2
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 4
     eval_accumulation_steps: 4
-    num_train_epochs: 10
+    num_train_epochs: 1
     learning_rate: 1e-5
     lr_scheduler_type: "cosine"
-    warmup_steps: 200
+    warmup_ratio: 0.1
     weight_decay: 0.0
-    eval_strategy: "epoch"
+    eval_strategy: "no"
     save_strategy: "no"
     gradient_checkpointing: false
     eval_do_concat_batches: false
@@ -51,7 +52,7 @@ train:
 
 exp:
   name: "dpo_kl"
-  model_name: meta-llama/Llama-3.1-8B-Instruct
+  model_name: princeton-nlp/Llama-3-Base-8B-SFT # meta-llama/Llama-3.1-8B-Instruct
 
   # SimPO margin γ (reusing the constraint tolerance field)
   tol: 1.0
