@@ -24,12 +24,17 @@ class DPO_KL(Experiment):
       - Objective: minimize KL(πθ || π0) on response tokens (π0 = pretrained/base model)
       - Constraint: logp(chosen) - logp(rejected) >= tol
         slack := tol + logp(rejected) - logp(chosen)   (constraint satisfied when slack <= 0)
+      - Optional two-constraint mode:
+        logp(chosen) >= tol_win and logp(rejected) <= tol_loose
 
     Loss types (mirroring `SAFETY`):
       - erm: objective only
       - avg: average dual variable
       - aug_dual: augmented Lagrangian with per-example dual variables
       - penalty: linear penalty
+      - _both_avg: avg dual on (win, loose) slacks with separate duals
+      - _both_aug_dual: augmented dual on (win, loose) slacks with separate per-sample duals
+      - _both_penalty: linear penalty with separate multipliers for (win, loose) slacks
       - simpo: SimPO objective (no KL regularization), margin gamma = tol
     """
     DEFAULT_CHAT_TEMPLATE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
@@ -78,7 +83,10 @@ class DPO_KL(Experiment):
             cfg.exp.model_name,
             low_cpu_mem_usage=True,
             torch_dtype=dtype,
+            attn_implementation="flash_attention_2",
         )
+        # Training/eval in this script never uses KV-cache; disable it to reduce GPU memory.
+        model.config.use_cache = False
 
         if getattr(cfg.train, "lora", False):
             model = get_peft_model(
@@ -95,6 +103,8 @@ class DPO_KL(Experiment):
                     ],
                 ),
             )
+        if hasattr(model, "config"):
+            model.config.use_cache = False
 
         # With gradient checkpointing + PEFT, inputs must require grads or loss has no grad_fn.
         if (
@@ -351,9 +361,48 @@ class DPO_KL(Experiment):
                 self.compute_metrics = self._compute_metrics
 
             def init_dual_vars(self):
-                n = len(self.complete_ds) if self.complete_ds is not None else (len(self.train_dataset) + len(self.eval_dataset))
-                self.dual_vars = torch.zeros(n, dtype=torch.float, requires_grad=False).to(self.model.device)
-                self.avg_dual = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                loss_type = str(self.custom_cfg.exp.loss_type)
+                both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
+                both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+
+                needs_single_avg_dual = loss_type == "avg"
+                needs_both_avg_duals = loss_type in both_avg_aliases
+                needs_single_aug_dual = loss_type in {"aug_dual", "resilient"}
+                needs_both_aug_duals = loss_type in both_aug_aliases
+                needs_any_per_example_duals = needs_single_aug_dual or needs_both_aug_duals
+
+                # Always define attributes so other code paths can safely check/use them.
+                self.dual_vars = None
+                self.avg_dual = None
+                self.dual_vars_win = None
+                self.dual_vars_loose = None
+                self.avg_dual_win = None
+                self.avg_dual_loose = None
+
+                if needs_any_per_example_duals:
+                    n = (
+                        len(self.complete_ds)
+                        if self.complete_ds is not None
+                        else len(self.train_dataset or []) + len(self.eval_dataset or [])
+                    )
+                    if needs_single_aug_dual:
+                        self.dual_vars = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                    if needs_both_aug_duals:
+                        # State for two-constraint (_both*) augmented-dual losses.
+                        self.dual_vars_win = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                        self.dual_vars_loose = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+
+                if needs_single_avg_dual:
+                    self.avg_dual = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                if needs_both_avg_duals:
+                    self.avg_dual_win = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                    self.avg_dual_loose = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
 
             def train(self, *args, **kwargs):
                 out = super().train(*args, **kwargs)
@@ -367,6 +416,16 @@ class DPO_KL(Experiment):
 
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 cfg = self.custom_cfg.exp
+                loss_type = str(cfg.loss_type)
+                both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
+                both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                both_penalty_aliases = {"_both_penalty", "both_penalty", "penalty_both"}
+                needs_pairwise_slack = loss_type in {"avg", "aug_dual", "resilient", "penalty"}
+                needs_two_constraint_slacks = (
+                    loss_type in both_avg_aliases
+                    or loss_type in both_aug_aliases
+                    or loss_type in both_penalty_aliases
+                )
 
                 chosen_ids = inputs["chosen_input_ids"]
                 rejected_ids = inputs["rejected_input_ids"]
@@ -382,8 +441,13 @@ class DPO_KL(Experiment):
                 attention_mask = torch.cat([chosen_attn, rejected_attn], dim=0)
                 response_mask = torch.cat([chosen_resp, rejected_resp], dim=0)
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
                 logits = outputs.logits[:, :-1]  # (2B, L-1, V)
+                del outputs
                 log_probs = F.log_softmax(logits, dim=-1)
 
                 # logp of the realized tokens (average over response tokens)
@@ -397,16 +461,20 @@ class DPO_KL(Experiment):
                 avg_logp = token_logp.sum(dim=-1) / num_tokens  # (2B,)
                 logp_chosen = avg_logp[:B]
                 logp_rejected = avg_logp[B:]
-                gap = logp_chosen - logp_rejected  # (B,)
+                gap = None
+                if loss_type == "simpo" or needs_pairwise_slack:
+                    gap = logp_chosen - logp_rejected  # (B,)
 
                 # SimPO objective (no KL regularization / no base model pass):
                 #   log σ( β/|y_w| logπ(y_w|x) - β/|y_l| logπ(y_l|x) - γ )
                 # We use per-token average logprobs, so this becomes:
                 #   log σ( β*(logp_chosen - logp_rejected) - γ )
                 # and set γ from the existing constraint tolerance (cfg.tol).
-                if cfg.loss_type == "simpo":
+                if loss_type == "simpo":
                     gamma = cfg.tol
                     beta_simpo = cfg.loss_alpha
+                    if gap is None:
+                        gap = logp_chosen - logp_rejected
                     score = beta_simpo * gap - gamma  # (B,)
                     # -log σ(score) == softplus(-score)
                     loss = F.softplus(-score).mean()
@@ -419,16 +487,25 @@ class DPO_KL(Experiment):
                 with torch.no_grad():
                     if hasattr(model, "disable_adapter"):
                         with model.disable_adapter():
-                            base_out = model(input_ids=input_ids, attention_mask=attention_mask)
+                            base_out = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                use_cache=False,
+                            )
                     elif hasattr(model, "module") and hasattr(model.module, "disable_adapter"):
                         with model.module.disable_adapter():
-                            base_out = model(input_ids=input_ids, attention_mask=attention_mask)
+                            base_out = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                use_cache=False,
+                            )
                     else:
                         raise RuntimeError(
                             "KL objective requires PEFT LoRA adapters. "
                             "Expected model to expose `.disable_adapter()` (PeftModel)."
                         )
                     base_logits = base_out.logits[:, :-1]
+                    del base_out
                     base_log_probs = F.log_softmax(base_logits, dim=-1)
 
                 probs = log_probs.exp()
@@ -442,54 +519,143 @@ class DPO_KL(Experiment):
                 # Objective: minimize KL (matches `SAFETY`; no separate beta scaling)
                 loss = kl_mean
 
-                # Constraint slack: tol + logp(rejected) - logp(chosen) == tol - (logp_chosen - logp_rejected)
-                slack = cfg.tol - gap  # (B,)
+                slack = None
+                if needs_pairwise_slack:
+                    if gap is None:
+                        gap = logp_chosen - logp_rejected
+                    # Constraint slack: tol + logp(rejected) - logp(chosen) == tol - (logp_chosen - logp_rejected)
+                    slack = cfg.tol - gap  # (B,)
+
+                slack_win = None
+                slack_loose = None
+                if needs_two_constraint_slacks:
+                    # Two explicit constraints:
+                    #   logp(chosen) >= tol_win      -> slack_win <= 0
+                    #   logp(rejected) <= tol_loose  -> slack_loose <= 0
+                    eps_win = float(
+                        getattr(
+                            cfg,
+                            "tol_win",
+                            getattr(cfg, "epsilon_win", getattr(cfg, "tol", 0.0)),
+                        )
+                    )
+                    eps_loose = float(
+                        getattr(
+                            cfg,
+                            "tol_loose",
+                            getattr(cfg, "epsilon_loose", getattr(cfg, "tol2", getattr(cfg, "tol", 0.0))),
+                        )
+                    )
+                    slack_win = eps_win - logp_chosen
+                    slack_loose = logp_rejected - eps_loose
 
                 # Loss schemes (as in SAFETY)
-                if cfg.loss_type == "erm":
+                if loss_type == "erm":
                     pass
 
-                elif cfg.loss_type == "avg":
+                elif loss_type == "avg":
                     if model.training:
-                        dual_avg = self.avg_dual.clone()
-                        dual_avg = torch.clamp(
-                            dual_avg + cfg.dual_step_size * slack.mean(),
-                            min=0.0,
-                        )
+                        with torch.no_grad():
+                            dual_avg = self.avg_dual.clone()
+                            dual_avg = torch.clamp(
+                                dual_avg + cfg.dual_step_size * slack.mean(),
+                                min=0.0,
+                            )
                         self.avg_dual = dual_avg.detach()
-                    loss = loss + self.avg_dual.detach() * slack
+                    loss = loss + self.avg_dual * slack
 
-                elif cfg.loss_type == "aug_dual":
+                elif loss_type == "aug_dual":
                     dual_var = self.dual_vars[index].clone()
                     a = slack
                     b = dual_var / (cfg.loss_alpha)
                     z = 2 * a + b
-                    dual_grad = torch.where(z > 0, a, -0.5 * b)
-                    if model.training:
-                        dual_var = dual_var + cfg.dual_step_size * dual_grad
-                        self.dual_vars[index] = dual_var.detach()
+                    with torch.no_grad():
+                        dual_grad = torch.where(z > 0, a, -0.5 * b)
+                        if model.training:
+                            dual_var = dual_var + cfg.dual_step_size * dual_grad
+                            self.dual_vars[index] = dual_var.detach()
                     loss = loss + cfg.loss_alpha / 4 * (torch.clamp(z, min=0.0) ** 2 - b**2)
-
-                elif cfg.loss_type == "resilient":
+                    loss = loss.mean()
+                elif loss_type == "resilient":
+                    
                     dual_var = self.dual_vars[index].clone()
                     a = slack
                     a_resilient = slack - dual_var / 2 * (cfg.resilient_coef)
                     b = dual_var / (cfg.loss_alpha)
                     coef = (cfg.resilient_coef) / (cfg.loss_alpha + cfg.resilient_coef)
                     z = 2 * a + b
-                    dual_grad = torch.where(z > 0, coef * a_resilient, -0.5 * b)
-                    if model.training:
-                        dual_var += cfg.dual_step_size * dual_grad
-                        self.dual_vars[index] = dual_var.detach()
+                    with torch.no_grad():
+                        dual_grad = torch.where(z > 0, coef * a_resilient, -0.5 * b)
+                        if model.training:
+                            dual_var += cfg.dual_step_size * dual_grad
+                            self.dual_vars[index] = dual_var.detach()
                     loss = loss + cfg.loss_alpha / 4 * (
                         coef * torch.clamp(z, min=0.0) ** 2 - b**2
                     )
 
-                elif cfg.loss_type == "penalty":
+                elif loss_type == "penalty":
                     loss = loss + cfg.loss_alpha * slack
 
+                elif loss_type in both_avg_aliases:
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
+                    with torch.no_grad():
+                        if model.training:
+                            dual_avg_win = self.avg_dual_win.clone()
+                            dual_avg_win = torch.clamp(
+                                dual_avg_win + cfg.dual_step_size * slack_win.mean(),
+                                min=0.0,
+                            )
+                            self.avg_dual_win = dual_avg_win.detach()
+
+                            dual_avg_loose = self.avg_dual_loose.clone()
+                            dual_avg_loose = torch.clamp(
+                                dual_avg_loose + cfg.dual_step_size * slack_loose.mean(),
+                                min=0.0,
+                            )
+                            self.avg_dual_loose = dual_avg_loose.detach()
+
+                    loss = (
+                        loss
+                        + alpha_win * self.avg_dual_win.detach() * slack_win
+                        + alpha_loose * self.avg_dual_loose.detach() * slack_loose
+                    )
+
+                elif loss_type in both_aug_aliases:
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_win = max(alpha_win, 1e-12)
+                    alpha_loose = max(alpha_loose, 1e-12)
+
+                    dual_var_win = self.dual_vars_win[index].clone()
+                    a_win = slack_win
+                    b_win = dual_var_win / alpha_win
+                    z_win = 2 * a_win + b_win
+                    with torch.no_grad():
+                        dual_grad_win = torch.where(z_win > 0, a_win, -0.5 * b_win)
+                        if model.training:
+                            dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
+                            self.dual_vars_win[index] = dual_var_win.detach()
+                    loss = loss + alpha_win / 4 * (torch.clamp(z_win, min=0.0) ** 2 - b_win**2)
+
+                    dual_var_loose = self.dual_vars_loose[index].clone()
+                    a_loose = slack_loose
+                    b_loose = dual_var_loose / alpha_loose
+                    z_loose = 2 * a_loose + b_loose
+                    with torch.no_grad():
+                        dual_grad_loose = torch.where(z_loose > 0, a_loose, -0.5 * b_loose)
+                        if model.training:
+                            dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
+                            self.dual_vars_loose[index] = dual_var_loose.detach()
+                    loss = loss + alpha_loose / 4 * (torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2)
+
+                elif loss_type in both_penalty_aliases:
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
+                    loss = loss + alpha_win * slack_win + alpha_loose * slack_loose
+
                 else:
-                    raise ValueError(f"Unknown loss_type: {cfg.loss_type}")
+                    raise ValueError(f"Unknown loss_type: {loss_type}")
 
                 loss = loss.mean()
 
@@ -503,6 +669,9 @@ class DPO_KL(Experiment):
             def _compute_metrics(self, pred):
                 cfg = self.custom_cfg
                 exp_cfg = cfg.exp
+                loss_type = str(exp_cfg.loss_type)
+                both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
+                both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
                 arr = pred.predictions
                 # Flatten prediction chunks robustly (match SAFETY behavior):
                 # keep all rows from the full evaluated dataset.
@@ -529,6 +698,22 @@ class DPO_KL(Experiment):
                 logp_chosen = arr[:, 0]
                 logp_rejected = arr[:, 1]
                 gap = logp_chosen - logp_rejected
+                eps_win = float(
+                    getattr(
+                        exp_cfg,
+                        "tol_win",
+                        getattr(exp_cfg, "epsilon_win", getattr(exp_cfg, "tol", 0.0)),
+                    )
+                )
+                eps_loose = float(
+                    getattr(
+                        exp_cfg,
+                        "tol_loose",
+                        getattr(exp_cfg, "epsilon_loose", getattr(exp_cfg, "tol2", getattr(exp_cfg, "tol", 0.0))),
+                    )
+                )
+                slack_win_values = eps_win - logp_chosen
+                slack_loose_values = logp_rejected - eps_loose
                 # Match SAFETY convention: "constraint" is the negated log-ratio.
                 # constraint = -(logp_chosen - logp_rejected)
                 constraint_values = -gap
@@ -539,29 +724,57 @@ class DPO_KL(Experiment):
                 # Store full-eval tensors for shared eval callbacks (eval/train prefixes).
                 self._last_constraint_slacks = torch.tensor(constraint_values, dtype=torch.float).detach().cpu()
                 self._last_constraint_indexes = torch.tensor(indexes, dtype=torch.long).detach().cpu()
+                self._last_constraint_slacks_win = torch.tensor(slack_win_values, dtype=torch.float).detach().cpu()
+                self._last_constraint_slacks_loose = torch.tensor(slack_loose_values, dtype=torch.float).detach().cpu()
                 self._last_objective_ratios = torch.tensor(gap, dtype=torch.float).detach().cpu()
                 self._last_objective_indexes = torch.tensor(indexes, dtype=torch.long).detach().cpu()
 
-                # Safety-style aggregate metrics over constraint values.
-                constraint_mean = float(np.mean(constraint_values))
-                constraint_min = float(np.min(constraint_values))
-                constraint_max = float(np.max(constraint_values))
-                q90 = float(np.quantile(constraint_values, 0.9))
-                q99 = float(np.quantile(constraint_values, 0.99))
-                tail = constraint_values[constraint_values > q90]
-                constraint_cvar = float(np.mean(tail)) if tail.size > 0 else constraint_max
+                def _slack_stats(values_np: np.ndarray) -> Dict[str, float]:
+                    mean_v = float(np.mean(values_np))
+                    min_v = float(np.min(values_np))
+                    max_v = float(np.max(values_np))
+                    q90_v = float(np.quantile(values_np, 0.9))
+                    q99_v = float(np.quantile(values_np, 0.99))
+                    tail_v = values_np[values_np > q90_v]
+                    cvar_v = float(np.mean(tail_v)) if tail_v.size > 0 else max_v
+                    return {
+                        "mean": mean_v,
+                        "min": min_v,
+                        "max": max_v,
+                        "q90": q90_v,
+                        "q99": q99_v,
+                        "cvar": cvar_v,
+                    }
+
+                constraint_stats = _slack_stats(constraint_values)
+                win_stats = _slack_stats(slack_win_values)
+                loose_stats = _slack_stats(slack_loose_values)
 
                 out = {
                     "logp_gap": float(np.mean(gap)),
-                    "constraint_mean": constraint_mean,
-                    "constraint_min": constraint_min,
-                    "constraint_max": constraint_max,
-                    "constraint_q90": q90,
-                    "constraint_q99": q99,
-                    "constraint_cvar": constraint_cvar,
+                    "constraint_mean": constraint_stats["mean"],
+                    "constraint_min": constraint_stats["min"],
+                    "constraint_max": constraint_stats["max"],
+                    "constraint_q90": constraint_stats["q90"],
+                    "constraint_q99": constraint_stats["q99"],
+                    "constraint_cvar": constraint_stats["cvar"],
+                    "slack_win_mean": win_stats["mean"],
+                    "slack_win_min": win_stats["min"],
+                    "slack_win_max": win_stats["max"],
+                    "slack_win_q90": win_stats["q90"],
+                    "slack_win_q99": win_stats["q99"],
+                    "slack_win_cvar": win_stats["cvar"],
+                    "slack_loose_mean": loose_stats["mean"],
+                    "slack_loose_min": loose_stats["min"],
+                    "slack_loose_max": loose_stats["max"],
+                    "slack_loose_q90": loose_stats["q90"],
+                    "slack_loose_q99": loose_stats["q99"],
+                    "slack_loose_cvar": loose_stats["cvar"],
                 }
                 dual_stats = None
-                if exp_cfg.loss_type in {"aug_dual", "resilient"}:
+                dual_stats_win = None
+                dual_stats_loose = None
+                if loss_type in {"aug_dual", "resilient"} or loss_type in both_aug_aliases:
                     if (
                         self.train_dataset is not None
                         and hasattr(self.train_dataset, "column_names")
@@ -574,16 +787,18 @@ class DPO_KL(Experiment):
                             if self.train_dataset is not None
                             else []
                         )
-                    if train_indexes:
-                        dual_vals = self.dual_vars.detach().cpu().numpy()
+
+                    def _dual_stats_for(dual_tensor):
+                        if not train_indexes:
+                            return None
+                        dual_vals = dual_tensor.detach().cpu().numpy()
                         selected = [
                             float(dual_vals[int(idx)])
                             for idx in train_indexes
                             if 0 <= int(idx) < len(dual_vals)
                         ]
-                    else:
-                        selected = []
-                    if selected:
+                        if not selected:
+                            return None
                         selected_np = np.asarray(selected, dtype=np.float64)
                         dual_q90 = float(np.quantile(selected_np, 0.9))
                         dual_q99 = float(np.quantile(selected_np, 0.99))
@@ -593,7 +808,7 @@ class DPO_KL(Experiment):
                             if dual_tail.size > 0
                             else float(np.max(selected_np))
                         )
-                        dual_stats = {
+                        return {
                             "dual_vars_mean": float(np.mean(selected_np)),
                             "dual_vars_min": float(np.min(selected_np)),
                             "dual_vars_max": float(np.max(selected_np)),
@@ -603,16 +818,45 @@ class DPO_KL(Experiment):
                             "_train_indexes": train_indexes,
                             "_dual_vals": dual_vals if train_indexes else None,
                         }
-                        out.update(
-                            {
-                                "dual_vars_mean": dual_stats["dual_vars_mean"],
-                                "dual_vars_min": dual_stats["dual_vars_min"],
-                                "dual_vars_max": dual_stats["dual_vars_max"],
-                                "dual_vars_q90": dual_stats["dual_vars_q90"],
-                                "dual_vars_q99": dual_stats["dual_vars_q99"],
-                                "dual_vars_cvar": dual_stats["dual_vars_cvar"],
-                            }
-                        )
+
+                    if loss_type in {"aug_dual", "resilient"}:
+                        dual_stats = _dual_stats_for(self.dual_vars)
+                        if dual_stats is not None:
+                            out.update(
+                                {
+                                    "dual_vars_mean": dual_stats["dual_vars_mean"],
+                                    "dual_vars_min": dual_stats["dual_vars_min"],
+                                    "dual_vars_max": dual_stats["dual_vars_max"],
+                                    "dual_vars_q90": dual_stats["dual_vars_q90"],
+                                    "dual_vars_q99": dual_stats["dual_vars_q99"],
+                                    "dual_vars_cvar": dual_stats["dual_vars_cvar"],
+                                }
+                            )
+                    else:
+                        dual_stats_win = _dual_stats_for(self.dual_vars_win)
+                        dual_stats_loose = _dual_stats_for(self.dual_vars_loose)
+                        if dual_stats_win is not None:
+                            out.update(
+                                {
+                                    "dual_vars_win_mean": dual_stats_win["dual_vars_mean"],
+                                    "dual_vars_win_min": dual_stats_win["dual_vars_min"],
+                                    "dual_vars_win_max": dual_stats_win["dual_vars_max"],
+                                    "dual_vars_win_q90": dual_stats_win["dual_vars_q90"],
+                                    "dual_vars_win_q99": dual_stats_win["dual_vars_q99"],
+                                    "dual_vars_win_cvar": dual_stats_win["dual_vars_cvar"],
+                                }
+                            )
+                        if dual_stats_loose is not None:
+                            out.update(
+                                {
+                                    "dual_vars_loose_mean": dual_stats_loose["dual_vars_mean"],
+                                    "dual_vars_loose_min": dual_stats_loose["dual_vars_min"],
+                                    "dual_vars_loose_max": dual_stats_loose["dual_vars_max"],
+                                    "dual_vars_loose_q90": dual_stats_loose["dual_vars_q90"],
+                                    "dual_vars_loose_q99": dual_stats_loose["dual_vars_q99"],
+                                    "dual_vars_loose_cvar": dual_stats_loose["dual_vars_cvar"],
+                                }
+                            )
 
                 if getattr(cfg.train, "use_wandb", False):
                     try:
@@ -623,12 +867,24 @@ class DPO_KL(Experiment):
                             table = wandb.Table(columns=["constraint_slack"])
                             for s in constraint_values.tolist():
                                 table.add_data(s)
+                            table_win = wandb.Table(columns=["slack_win"])
+                            for s in slack_win_values.tolist():
+                                table_win.add_data(s)
+                            table_loose = wandb.Table(columns=["slack_loose"])
+                            for s in slack_loose_values.tolist():
+                                table_loose.add_data(s)
                             prefix = getattr(self, "_current_eval_prefix", "eval")
-                            wandb.log({f"constraint_slacks_epoch_{epoch}_{prefix}": table})
+                            wandb.log(
+                                {
+                                    f"constraint_slacks_epoch_{epoch}_{prefix}": table,
+                                    f"constraint_slacks_win_epoch_{epoch}_{prefix}": table_win,
+                                    f"constraint_slacks_loose_epoch_{epoch}_{prefix}": table_loose,
+                                }
+                            )
                     except Exception as exc:
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
-                if exp_cfg.loss_type in {"aug_dual", "resilient"} and getattr(cfg.train, "use_wandb", False):
+                if loss_type in {"aug_dual", "resilient"} and getattr(cfg.train, "use_wandb", False):
                     try:
                         import wandb
 
@@ -656,10 +912,67 @@ class DPO_KL(Experiment):
                     except Exception as exc:
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
-                if exp_cfg.loss_type == "avg":
-                    out["avg_dual"] = float(self.avg_dual.detach().cpu().item())
+                if loss_type in both_aug_aliases and getattr(cfg.train, "use_wandb", False):
+                    try:
+                        import wandb
 
-                if exp_cfg.loss_type == "simpo":
+                        if wandb.run is not None:
+                            epoch = self.state.epoch
+                            prefix = getattr(self, "_current_eval_prefix", "eval")
+                            payload = {}
+
+                            if dual_stats_win is not None:
+                                table_win_dual = wandb.Table(columns=["index", "dual_var_win"])
+                                train_indexes = dual_stats_win["_train_indexes"]
+                                dual_vals = dual_stats_win["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_win_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_win_{prefix}_epoch_{epoch}": table_win_dual,
+                                        f"dual_vars_win_mean_{prefix}": dual_stats_win["dual_vars_mean"],
+                                        f"dual_vars_win_min_{prefix}": dual_stats_win["dual_vars_min"],
+                                        f"dual_vars_win_max_{prefix}": dual_stats_win["dual_vars_max"],
+                                        f"dual_vars_win_q90_{prefix}": dual_stats_win["dual_vars_q90"],
+                                        f"dual_vars_win_q99_{prefix}": dual_stats_win["dual_vars_q99"],
+                                        f"dual_vars_win_cvar_{prefix}": dual_stats_win["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if dual_stats_loose is not None:
+                                table_loose_dual = wandb.Table(columns=["index", "dual_var_loose"])
+                                train_indexes = dual_stats_loose["_train_indexes"]
+                                dual_vals = dual_stats_loose["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_loose_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_loose_{prefix}_epoch_{epoch}": table_loose_dual,
+                                        f"dual_vars_loose_mean_{prefix}": dual_stats_loose["dual_vars_mean"],
+                                        f"dual_vars_loose_min_{prefix}": dual_stats_loose["dual_vars_min"],
+                                        f"dual_vars_loose_max_{prefix}": dual_stats_loose["dual_vars_max"],
+                                        f"dual_vars_loose_q90_{prefix}": dual_stats_loose["dual_vars_q90"],
+                                        f"dual_vars_loose_q99_{prefix}": dual_stats_loose["dual_vars_q99"],
+                                        f"dual_vars_loose_cvar_{prefix}": dual_stats_loose["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if payload:
+                                wandb.log(payload)
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                if loss_type == "avg":
+                    out["avg_dual"] = float(self.avg_dual.detach().cpu().item())
+                if loss_type in both_avg_aliases:
+                    out["avg_dual_win"] = float(self.avg_dual_win.detach().cpu().item())
+                    out["avg_dual_loose"] = float(self.avg_dual_loose.detach().cpu().item())
+
+                if loss_type == "simpo":
                     # third column is the SimPO score used inside logsigmoid
                     score = arr[:, 2]
                     # logsigmoid(score) = -softplus(-score) = -logaddexp(0, -score)
