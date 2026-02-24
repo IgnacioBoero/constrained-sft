@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Tuple
 from types import SimpleNamespace
 
 import numpy as np
+from omegaconf import ListConfig
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -35,6 +36,8 @@ class DPO_KL(Experiment):
       - _both_avg: avg dual on (win, loose) slacks with separate duals
       - _both_aug_dual: augmented dual on (win, loose) slacks with separate per-sample duals
       - _both_penalty: linear penalty with separate multipliers for (win, loose) slacks
+      - aug_dual_three: augmented dual with three per-sample constraints
+        (win, loose, and pairwise gap)
       - simpo: SimPO objective (no KL regularization), margin gamma = tol
     """
     DEFAULT_CHAT_TEMPLATE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
@@ -123,6 +126,14 @@ class DPO_KL(Experiment):
         do_shuffle = bool(getattr(cfg.train, "shuffle", True))
 
         dataset_name = str(getattr(cfg.train, "dataset", "orca")).lower()
+        print(f"[dpo_kl] Dataset name: {dataset_name}")
+        helpsteer_pref_aliases = {
+            "helpsteer2",
+            "helpsteer2_pref",
+            "helpsteer2_preference",
+            "helpsteer2_preferences",
+        }
+        is_helpsteer_pref = dataset_name in helpsteer_pref_aliases
 
         if dataset_name == "ultra":
             ds = load_dataset(
@@ -132,6 +143,49 @@ class DPO_KL(Experiment):
             )
             if sanity_check:
                 ds = ds.select(range(min(len(ds), 1000)))
+        elif is_helpsteer_pref:
+            ds = load_dataset(
+                "nvidia/HelpSteer2",
+                data_dir="preference",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            print(f"[dpo_kl] HelpSteer2 preference columns: {ds.column_names}")
+
+            preference_strength_filter = getattr(cfg.train, "preference_strength", None)
+            if preference_strength_filter is not None:
+                if isinstance(preference_strength_filter, (list, tuple, set, ListConfig)):
+                    raw_strengths = {int(x) for x in preference_strength_filter}
+                else:
+                    raw_strengths = {int(preference_strength_filter)}
+                if not raw_strengths:
+                    raise ValueError(
+                        "cfg.train.preference_strength is empty; provide an int "
+                        "or a non-empty list of ints."
+                    )
+                # Filter by absolute preference strength so `2` keeps both +2 and -2.
+                allowed_strengths_abs = {abs(x) for x in raw_strengths}
+                valid_strengths_abs = {0, 1, 2, 3}
+                invalid_strengths = sorted(
+                    allowed_strengths_abs.difference(valid_strengths_abs)
+                )
+                if invalid_strengths:
+                    raise ValueError(
+                        "cfg.train.preference_strength must be within "
+                        f"{sorted(valid_strengths_abs)} in absolute value, got invalid values "
+                        f"{invalid_strengths}"
+                    )
+                allowed_strengths_tuple = tuple(sorted(allowed_strengths_abs))
+                ds = ds.filter(
+                    lambda r: abs(int(r["preference_strength"])) in allowed_strengths_tuple
+                )
+                print(
+                    "[dpo_kl] HelpSteer2 preference_strength abs-filter: "
+                    f"{allowed_strengths_tuple}"
+                )
+
+            # Drop ties; this trainer expects strict chosen vs rejected pairs.
+            ds = ds.filter(lambda r: int(r["preference_strength"]) != 0)
         else:
             # Default: Orca DPO pairs
             ds = load_dataset(
@@ -150,7 +204,7 @@ class DPO_KL(Experiment):
         data_prop = float(getattr(cfg.train, "data_proportion", 1.0))
         if not (0.0 < data_prop <= 1.0):
             raise ValueError(f"cfg.train.data_proportion must be in (0,1], got {data_prop}")
-        if data_prop < 1.0:
+        if data_prop < 1.0 and not is_helpsteer_pref:
             keep = max(1, int(data_prop * len(ds)))
             ds = ds.select(range(keep))
 
@@ -178,6 +232,31 @@ class DPO_KL(Experiment):
                     "chosen": chosen,
                     "rejected": rejected,
                 }
+        elif is_helpsteer_pref:
+            def chatml_format(r):
+                msgs = [{"role": "user", "content": r.get("prompt") or ""}]
+                prompt = tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+                strength = int(r.get("preference_strength", 0) or 0)
+                response_1 = r.get("response_1") or ""
+                response_2 = r.get("response_2") or ""
+                if strength > 0:
+                    chosen_raw, rejected_raw = response_2, response_1
+                elif strength < 0:
+                    chosen_raw, rejected_raw = response_1, response_2
+                else:
+                    # Ties are filtered above; keep deterministic fallback for safety.
+                    chosen_raw, rejected_raw = response_1, response_2
+                split_raw = str(r.get("split") or "train").lower()
+                split = "validation" if split_raw in {"val", "validation"} else "train"
+                return {
+                    "prompt": prompt,
+                    "chosen": chosen_raw + "<|im_end|>\n",
+                    "rejected": rejected_raw + "<|im_end|>\n",
+                    "split": split,
+                    "preference_strength": strength,
+                }
         else:
             def chatml_format(r):
                 # Match the reference notebook formatting (ChatML-style strings)
@@ -199,19 +278,39 @@ class DPO_KL(Experiment):
 
         ds = ds.map(chatml_format, remove_columns=original_columns)
 
-        if not (0.0 < val_fraction < 1.0):
-            raise ValueError(f"cfg.train.val_fraction must be in (0,1), got {val_fraction}")
+        if is_helpsteer_pref:
+            tr_raw = ds.filter(lambda x: x["split"] == "train")
+            ev_raw = ds.filter(lambda x: x["split"] == "validation")
 
-        n_val = max(1, int(len(ds) * val_fraction))
-        ev_raw = ds.select(range(n_val))
-        tr_raw = ds.select(range(n_val, len(ds)))
+            if data_prop < 1.0:
+                keep = max(1, int(data_prop * len(tr_raw)))
+                tr_raw = tr_raw.select(range(keep))
+
+            # Fallback for unexpected split naming/absence.
+            if len(ev_raw) == 0:
+                if not (0.0 < val_fraction < 1.0):
+                    raise ValueError(
+                        f"cfg.train.val_fraction must be in (0,1), got {val_fraction}"
+                    )
+                n_val = max(1, int(len(tr_raw) * val_fraction))
+                ev_raw = tr_raw.select(range(n_val))
+                tr_raw = tr_raw.select(range(n_val, len(tr_raw)))
+        else:
+            if not (0.0 < val_fraction < 1.0):
+                raise ValueError(f"cfg.train.val_fraction must be in (0,1), got {val_fraction}")
+
+            n_val = max(1, int(len(ds) * val_fraction))
+            ev_raw = ds.select(range(n_val))
+            tr_raw = ds.select(range(n_val, len(ds)))
 
         if sanity_check:
             tr_raw = tr_raw.select(range(min(len(tr_raw), 16)))
             ev_raw = ev_raw.select(range(min(len(ev_raw), 16)))
 
-        tr_raw = tr_raw.add_column("split", ["train"] * len(tr_raw))
-        ev_raw = ev_raw.add_column("split", ["validation"] * len(ev_raw))
+        if "split" not in tr_raw.column_names:
+            tr_raw = tr_raw.add_column("split", ["train"] * len(tr_raw))
+        if "split" not in ev_raw.column_names:
+            ev_raw = ev_raw.add_column("split", ["validation"] * len(ev_raw))
 
         complete_ds = concatenate_datasets([tr_raw, ev_raw])
         complete_ds = complete_ds.add_column("index", list(range(len(complete_ds))))
@@ -281,13 +380,16 @@ class DPO_KL(Experiment):
             chosen_ids, chosen_mask = _build_full(p_ids, chosen_text)
             rejected_ids, rejected_mask = _build_full(p_ids, rejected_text)
 
-            return {
+            out = {
                 "chosen_input_ids": chosen_ids,
                 "rejected_input_ids": rejected_ids,
                 "chosen_response_mask": chosen_mask,
                 "rejected_response_mask": rejected_mask,
                 "index": int(sample["index"]),
             }
+            if "preference_strength" in sample and sample.get("preference_strength") is not None:
+                out["preference_strength"] = int(sample["preference_strength"])
+            return out
 
         return fn
 
@@ -358,18 +460,23 @@ class DPO_KL(Experiment):
                 self.label_names = ["index"]
                 self._generated_eval_answers = False
                 self._generated_eval_keys = set()
+                self._index_to_preference_strength = None
                 self.compute_metrics = self._compute_metrics
 
             def init_dual_vars(self):
                 loss_type = str(self.custom_cfg.exp.loss_type)
                 both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
                 both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
 
                 needs_single_avg_dual = loss_type == "avg"
                 needs_both_avg_duals = loss_type in both_avg_aliases
                 needs_single_aug_dual = loss_type in {"aug_dual", "resilient"}
                 needs_both_aug_duals = loss_type in both_aug_aliases
-                needs_any_per_example_duals = needs_single_aug_dual or needs_both_aug_duals
+                needs_three_aug_duals = loss_type in three_aug_aliases
+                needs_any_per_example_duals = (
+                    needs_single_aug_dual or needs_both_aug_duals or needs_three_aug_duals
+                )
 
                 # Always define attributes so other code paths can safely check/use them.
                 self.dual_vars = None
@@ -378,6 +485,9 @@ class DPO_KL(Experiment):
                 self.dual_vars_loose = None
                 self.avg_dual_win = None
                 self.avg_dual_loose = None
+                self.dual_vars_three_gap = None
+                self.dual_vars_three_win = None
+                self.dual_vars_three_loose = None
 
                 if needs_any_per_example_duals:
                     n = (
@@ -395,6 +505,18 @@ class DPO_KL(Experiment):
                             n, dtype=torch.float, requires_grad=False, device=self.model.device
                         )
                         self.dual_vars_loose = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                    if needs_three_aug_duals:
+                        # State for three-constraint augmented-dual loss:
+                        # gap + explicit win/loose constraints.
+                        self.dual_vars_three_gap = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                        self.dual_vars_three_win = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                        self.dual_vars_three_loose = torch.zeros(
                             n, dtype=torch.float, requires_grad=False, device=self.model.device
                         )
 
@@ -420,11 +542,18 @@ class DPO_KL(Experiment):
                 both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
                 both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
                 both_penalty_aliases = {"_both_penalty", "both_penalty", "penalty_both"}
-                needs_pairwise_slack = loss_type in {"avg", "aug_dual", "resilient", "penalty"}
+                three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
+                needs_pairwise_slack = loss_type in {
+                    "avg",
+                    "aug_dual",
+                    "resilient",
+                    "penalty",
+                } or (loss_type in three_aug_aliases)
                 needs_two_constraint_slacks = (
                     loss_type in both_avg_aliases
                     or loss_type in both_aug_aliases
                     or loss_type in both_penalty_aliases
+                    or loss_type in three_aug_aliases
                 )
 
                 chosen_ids = inputs["chosen_input_ids"]
@@ -649,6 +778,51 @@ class DPO_KL(Experiment):
                             self.dual_vars_loose[index] = dual_var_loose.detach()
                     loss = loss + alpha_loose / 4 * (torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2)
 
+                elif loss_type in three_aug_aliases:
+                    alpha_gap = float(getattr(cfg, "loss_alpha_gap", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(
+                        getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0))
+                    )
+                    alpha_gap = max(alpha_gap, 1e-12)
+                    alpha_win = max(alpha_win, 1e-12)
+                    alpha_loose = max(alpha_loose, 1e-12)
+
+                    dual_var_gap = self.dual_vars_three_gap[index].clone()
+                    a_gap = slack
+                    b_gap = dual_var_gap / alpha_gap
+                    z_gap = 2 * a_gap + b_gap
+                    with torch.no_grad():
+                        dual_grad_gap = torch.where(z_gap > 0, a_gap, -0.5 * b_gap)
+                        if model.training:
+                            dual_var_gap = dual_var_gap + cfg.dual_step_size * dual_grad_gap
+                            self.dual_vars_three_gap[index] = dual_var_gap.detach()
+                    loss = loss + alpha_gap / 4 * (torch.clamp(z_gap, min=0.0) ** 2 - b_gap**2)
+
+                    dual_var_win = self.dual_vars_three_win[index].clone()
+                    a_win = slack_win
+                    b_win = dual_var_win / alpha_win
+                    z_win = 2 * a_win + b_win
+                    with torch.no_grad():
+                        dual_grad_win = torch.where(z_win > 0, a_win, -0.5 * b_win)
+                        if model.training:
+                            dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
+                            self.dual_vars_three_win[index] = dual_var_win.detach()
+                    loss = loss + alpha_win / 4 * (torch.clamp(z_win, min=0.0) ** 2 - b_win**2)
+
+                    dual_var_loose = self.dual_vars_three_loose[index].clone()
+                    a_loose = slack_loose
+                    b_loose = dual_var_loose / alpha_loose
+                    z_loose = 2 * a_loose + b_loose
+                    with torch.no_grad():
+                        dual_grad_loose = torch.where(z_loose > 0, a_loose, -0.5 * b_loose)
+                        if model.training:
+                            dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
+                            self.dual_vars_three_loose[index] = dual_var_loose.detach()
+                    loss = loss + alpha_loose / 4 * (
+                        torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2
+                    )
+
                 elif loss_type in both_penalty_aliases:
                     alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
                     alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
@@ -672,6 +846,7 @@ class DPO_KL(Experiment):
                 loss_type = str(exp_cfg.loss_type)
                 both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
                 both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
                 arr = pred.predictions
                 # Flatten prediction chunks robustly (match SAFETY behavior):
                 # keep all rows from the full evaluated dataset.
@@ -698,6 +873,32 @@ class DPO_KL(Experiment):
                 logp_chosen = arr[:, 0]
                 logp_rejected = arr[:, 1]
                 gap = logp_chosen - logp_rejected
+                gap_positive_count = int(np.sum(gap > 0.0))
+                gap_positive_rate = float(np.mean(gap > 0.0))
+                preference_strength_values = None
+                if (
+                    self.complete_ds is not None
+                    and hasattr(self.complete_ds, "column_names")
+                    and "preference_strength" in self.complete_ds.column_names
+                ):
+                    try:
+                        if self._index_to_preference_strength is None:
+                            full_indexes = np.asarray(self.complete_ds["index"], dtype=np.int64)
+                            full_strengths = np.asarray(
+                                self.complete_ds["preference_strength"], dtype=np.int64
+                            )
+                            self._index_to_preference_strength = {
+                                int(i): int(s)
+                                for i, s in zip(full_indexes.tolist(), full_strengths.tolist())
+                            }
+                        mapped_strengths = [
+                            self._index_to_preference_strength.get(int(idx))
+                            for idx in indexes.tolist()
+                        ]
+                        if all(v is not None for v in mapped_strengths):
+                            preference_strength_values = np.asarray(mapped_strengths, dtype=np.int64)
+                    except Exception:
+                        preference_strength_values = None
                 eps_win = float(
                     getattr(
                         exp_cfg,
@@ -752,6 +953,8 @@ class DPO_KL(Experiment):
 
                 out = {
                     "logp_gap": float(np.mean(gap)),
+                    "gap_positive_count": gap_positive_count,
+                    "gap_positive_rate": gap_positive_rate,
                     "constraint_mean": constraint_stats["mean"],
                     "constraint_min": constraint_stats["min"],
                     "constraint_max": constraint_stats["max"],
@@ -774,7 +977,12 @@ class DPO_KL(Experiment):
                 dual_stats = None
                 dual_stats_win = None
                 dual_stats_loose = None
-                if loss_type in {"aug_dual", "resilient"} or loss_type in both_aug_aliases:
+                dual_stats_gap = None
+                if (
+                    loss_type in {"aug_dual", "resilient"}
+                    or loss_type in both_aug_aliases
+                    or loss_type in three_aug_aliases
+                ):
                     if (
                         self.train_dataset is not None
                         and hasattr(self.train_dataset, "column_names")
@@ -832,9 +1040,46 @@ class DPO_KL(Experiment):
                                     "dual_vars_cvar": dual_stats["dual_vars_cvar"],
                                 }
                             )
-                    else:
+                    elif loss_type in both_aug_aliases:
                         dual_stats_win = _dual_stats_for(self.dual_vars_win)
                         dual_stats_loose = _dual_stats_for(self.dual_vars_loose)
+                        if dual_stats_win is not None:
+                            out.update(
+                                {
+                                    "dual_vars_win_mean": dual_stats_win["dual_vars_mean"],
+                                    "dual_vars_win_min": dual_stats_win["dual_vars_min"],
+                                    "dual_vars_win_max": dual_stats_win["dual_vars_max"],
+                                    "dual_vars_win_q90": dual_stats_win["dual_vars_q90"],
+                                    "dual_vars_win_q99": dual_stats_win["dual_vars_q99"],
+                                    "dual_vars_win_cvar": dual_stats_win["dual_vars_cvar"],
+                                }
+                            )
+                        if dual_stats_loose is not None:
+                            out.update(
+                                {
+                                    "dual_vars_loose_mean": dual_stats_loose["dual_vars_mean"],
+                                    "dual_vars_loose_min": dual_stats_loose["dual_vars_min"],
+                                    "dual_vars_loose_max": dual_stats_loose["dual_vars_max"],
+                                    "dual_vars_loose_q90": dual_stats_loose["dual_vars_q90"],
+                                    "dual_vars_loose_q99": dual_stats_loose["dual_vars_q99"],
+                                    "dual_vars_loose_cvar": dual_stats_loose["dual_vars_cvar"],
+                                }
+                            )
+                    else:
+                        dual_stats_gap = _dual_stats_for(self.dual_vars_three_gap)
+                        dual_stats_win = _dual_stats_for(self.dual_vars_three_win)
+                        dual_stats_loose = _dual_stats_for(self.dual_vars_three_loose)
+                        if dual_stats_gap is not None:
+                            out.update(
+                                {
+                                    "dual_vars_gap_mean": dual_stats_gap["dual_vars_mean"],
+                                    "dual_vars_gap_min": dual_stats_gap["dual_vars_min"],
+                                    "dual_vars_gap_max": dual_stats_gap["dual_vars_max"],
+                                    "dual_vars_gap_q90": dual_stats_gap["dual_vars_q90"],
+                                    "dual_vars_gap_q99": dual_stats_gap["dual_vars_q99"],
+                                    "dual_vars_gap_cvar": dual_stats_gap["dual_vars_cvar"],
+                                }
+                            )
                         if dual_stats_win is not None:
                             out.update(
                                 {
@@ -864,21 +1109,40 @@ class DPO_KL(Experiment):
 
                         if wandb.run is not None:
                             epoch = self.state.epoch
-                            table = wandb.Table(columns=["constraint_slack"])
-                            for s in constraint_values.tolist():
-                                table.add_data(s)
-                            table_win = wandb.Table(columns=["slack_win"])
-                            for s in slack_win_values.tolist():
-                                table_win.add_data(s)
-                            table_loose = wandb.Table(columns=["slack_loose"])
-                            for s in slack_loose_values.tolist():
-                                table_loose.add_data(s)
+                            if preference_strength_values is not None:
+                                table = wandb.Table(columns=["constraint_slack", "preference_strength"])
+                                table_win = wandb.Table(columns=["slack_win", "preference_strength"])
+                                table_loose = wandb.Table(columns=["slack_loose", "preference_strength"])
+                                for s, strength in zip(
+                                    constraint_values.tolist(), preference_strength_values.tolist()
+                                ):
+                                    table.add_data(s, int(strength))
+                                for s, strength in zip(
+                                    slack_win_values.tolist(), preference_strength_values.tolist()
+                                ):
+                                    table_win.add_data(s, int(strength))
+                                for s, strength in zip(
+                                    slack_loose_values.tolist(), preference_strength_values.tolist()
+                                ):
+                                    table_loose.add_data(s, int(strength))
+                            else:
+                                table = wandb.Table(columns=["constraint_slack"])
+                                for s in constraint_values.tolist():
+                                    table.add_data(s)
+                                table_win = wandb.Table(columns=["slack_win"])
+                                for s in slack_win_values.tolist():
+                                    table_win.add_data(s)
+                                table_loose = wandb.Table(columns=["slack_loose"])
+                                for s in slack_loose_values.tolist():
+                                    table_loose.add_data(s)
                             prefix = getattr(self, "_current_eval_prefix", "eval")
                             wandb.log(
                                 {
                                     f"constraint_slacks_epoch_{epoch}_{prefix}": table,
                                     f"constraint_slacks_win_epoch_{epoch}_{prefix}": table_win,
                                     f"constraint_slacks_loose_epoch_{epoch}_{prefix}": table_loose,
+                                    f"gap_positive_count_{prefix}": gap_positive_count,
+                                    f"gap_positive_rate_{prefix}": gap_positive_rate,
                                 }
                             )
                     except Exception as exc:
@@ -920,6 +1184,80 @@ class DPO_KL(Experiment):
                             epoch = self.state.epoch
                             prefix = getattr(self, "_current_eval_prefix", "eval")
                             payload = {}
+
+                            if dual_stats_win is not None:
+                                table_win_dual = wandb.Table(columns=["index", "dual_var_win"])
+                                train_indexes = dual_stats_win["_train_indexes"]
+                                dual_vals = dual_stats_win["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_win_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_win_{prefix}_epoch_{epoch}": table_win_dual,
+                                        f"dual_vars_win_mean_{prefix}": dual_stats_win["dual_vars_mean"],
+                                        f"dual_vars_win_min_{prefix}": dual_stats_win["dual_vars_min"],
+                                        f"dual_vars_win_max_{prefix}": dual_stats_win["dual_vars_max"],
+                                        f"dual_vars_win_q90_{prefix}": dual_stats_win["dual_vars_q90"],
+                                        f"dual_vars_win_q99_{prefix}": dual_stats_win["dual_vars_q99"],
+                                        f"dual_vars_win_cvar_{prefix}": dual_stats_win["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if dual_stats_loose is not None:
+                                table_loose_dual = wandb.Table(columns=["index", "dual_var_loose"])
+                                train_indexes = dual_stats_loose["_train_indexes"]
+                                dual_vals = dual_stats_loose["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_loose_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_loose_{prefix}_epoch_{epoch}": table_loose_dual,
+                                        f"dual_vars_loose_mean_{prefix}": dual_stats_loose["dual_vars_mean"],
+                                        f"dual_vars_loose_min_{prefix}": dual_stats_loose["dual_vars_min"],
+                                        f"dual_vars_loose_max_{prefix}": dual_stats_loose["dual_vars_max"],
+                                        f"dual_vars_loose_q90_{prefix}": dual_stats_loose["dual_vars_q90"],
+                                        f"dual_vars_loose_q99_{prefix}": dual_stats_loose["dual_vars_q99"],
+                                        f"dual_vars_loose_cvar_{prefix}": dual_stats_loose["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if payload:
+                                wandb.log(payload)
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                if loss_type in three_aug_aliases and getattr(cfg.train, "use_wandb", False):
+                    try:
+                        import wandb
+
+                        if wandb.run is not None:
+                            epoch = self.state.epoch
+                            prefix = getattr(self, "_current_eval_prefix", "eval")
+                            payload = {}
+
+                            if dual_stats_gap is not None:
+                                table_gap_dual = wandb.Table(columns=["index", "dual_var_gap"])
+                                train_indexes = dual_stats_gap["_train_indexes"]
+                                dual_vals = dual_stats_gap["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_gap_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_gap_{prefix}_epoch_{epoch}": table_gap_dual,
+                                        f"dual_vars_gap_mean_{prefix}": dual_stats_gap["dual_vars_mean"],
+                                        f"dual_vars_gap_min_{prefix}": dual_stats_gap["dual_vars_min"],
+                                        f"dual_vars_gap_max_{prefix}": dual_stats_gap["dual_vars_max"],
+                                        f"dual_vars_gap_q90_{prefix}": dual_stats_gap["dual_vars_q90"],
+                                        f"dual_vars_gap_q99_{prefix}": dual_stats_gap["dual_vars_q99"],
+                                        f"dual_vars_gap_cvar_{prefix}": dual_stats_gap["dual_vars_cvar"],
+                                    }
+                                )
 
                             if dual_stats_win is not None:
                                 table_win_dual = wandb.Table(columns=["index", "dual_var_win"])
