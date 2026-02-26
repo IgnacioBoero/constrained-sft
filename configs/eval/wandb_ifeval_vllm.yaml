@@ -1,0 +1,33 @@
+# @package _global_
+
+wandb:
+  entity: "alelab"
+  project: "dpo_kl"
+  run_id: "enon78za" #ielb238b" #"hhg5iqf3" # "xqf0jvg6" #"4ylqwdwc" #"hgzznrol" #"cskgxlr5"  #"noh7idnw" #"eqa530cd" # "nt656s5q" #"p0p7a0pf" # "4u508bti" #"d2izon2m" #"i4bpjgs0"
+
+model:
+  # Optional override. If null, inferred from run config (`exp.model_name`).
+  base_model: null # "meta-llama/Llama-3.2-1B-Instruct"
+
+eval:
+  language: "en"
+  max_samples: -1 # <= 0 uses full default IFEval split.
+  max_new_tokens: 1280
+  temperature: 0.0
+  top_p: 1.0
+  greedy: true
+  local_output_dir: "outputs/ifeval_vllm"
+
+vllm:
+  # <= 0 means auto-detect all visible GPUs.
+  tensor_parallel_size: -1
+  dtype: "bfloat16"
+  merge_dtype: "bfloat16"
+  gpu_memory_utilization: 0.9
+  max_model_len: null
+  trust_remote_code: false
+  enforce_eager: false
+
+hydra:
+  run:
+    dir: outputs/eval/wandb_ifeval_vllm/${wandb.project}/${wandb.run_id}
