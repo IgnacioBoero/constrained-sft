@@ -39,6 +39,7 @@ class DPO_KL(Experiment):
       - aug_dual_three: augmented dual with three per-sample constraints
         (win, loose, and pairwise gap)
       - simpo: SimPO objective (no KL regularization), margin gamma = tol
+      - dpo: standard DPO objective against the frozen base policy
     """
     DEFAULT_CHAT_TEMPLATE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
@@ -70,6 +71,16 @@ class DPO_KL(Experiment):
         )
         return tok
 
+    def _should_append_chatml_im_end(self, cfg) -> bool:
+        # Default off: only enable for explicitly ChatML-formatted workflows.
+        return bool(getattr(cfg.train, "append_chatml_im_end", False))
+
+    def _format_answer_text(self, text: str, cfg) -> str:
+        text = text or ""
+        if self._should_append_chatml_im_end(cfg):
+            return text + "<|im_end|>\n"
+        return text
+
     def load_model_and_tok(self, cfg):
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
         tok = self._ensure_chat_template(tok)
@@ -84,8 +95,8 @@ class DPO_KL(Experiment):
         dtype = torch.bfloat16 if getattr(cfg.train.hf_args, "bf16", False) else torch.float16
         model = AutoModelForCausalLM.from_pretrained(
             cfg.exp.model_name,
-            low_cpu_mem_usage=True,
-            torch_dtype=dtype,
+            #low_cpu_mem_usage=True,
+            dtype=dtype,
             attn_implementation="flash_attention_2",
         )
         # Training/eval in this script never uses KV-cache; disable it to reduce GPU memory.
@@ -216,6 +227,9 @@ class DPO_KL(Experiment):
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         tok.padding_side = "right"
+        append_chatml_im_end = self._should_append_chatml_im_end(cfg)
+        if append_chatml_im_end:
+            print("[dpo_kl] train.append_chatml_im_end=True; appending ChatML <|im_end|> to completions")
 
         if dataset_name == "ultra":
             def chatml_format(r):
@@ -225,8 +239,14 @@ class DPO_KL(Experiment):
                 prompt = tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True,
                 )
-                chosen = (r["chosen"][1]["content"] if r.get("chosen") else "") + "<|im_end|>\n"
-                rejected = (r["rejected"][1]["content"] if r.get("rejected") else "") + "<|im_end|>\n"
+                chosen = self._format_answer_text(
+                    (r["chosen"][1]["content"] if r.get("chosen") else ""),
+                    cfg,
+                )
+                rejected = self._format_answer_text(
+                    (r["rejected"][1]["content"] if r.get("rejected") else ""),
+                    cfg,
+                )
                 return {
                     "prompt": prompt,
                     "chosen": chosen,
@@ -252,8 +272,8 @@ class DPO_KL(Experiment):
                 split = "validation" if split_raw in {"val", "validation"} else "train"
                 return {
                     "prompt": prompt,
-                    "chosen": chosen_raw + "<|im_end|>\n",
-                    "rejected": rejected_raw + "<|im_end|>\n",
+                    "chosen": self._format_answer_text(chosen_raw, cfg),
+                    "rejected": self._format_answer_text(rejected_raw, cfg),
                     "split": split,
                     "preference_strength": strength,
                 }
@@ -268,8 +288,8 @@ class DPO_KL(Experiment):
                 prompt = tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True,
                 )
-                chosen = (r.get("chosen") or "") + "<|im_end|>\n"
-                rejected = (r.get("rejected") or "") + "<|im_end|>\n"
+                chosen = self._format_answer_text((r.get("chosen") or ""), cfg)
+                rejected = self._format_answer_text((r.get("rejected") or ""), cfg)
                 return {
                     "prompt": prompt,
                     "chosen": chosen,
@@ -462,6 +482,40 @@ class DPO_KL(Experiment):
                 self._generated_eval_keys = set()
                 self._index_to_preference_strength = None
                 self.compute_metrics = self._compute_metrics
+                self._pbar_objective_sum = 0.0
+                self._pbar_slack_sum = 0.0
+                self._pbar_loss_sum = 0.0
+                self._pbar_objective_count = 0
+                self._pbar_slack_count = 0
+                self._pbar_loss_count = 0
+
+            def _accumulate_pbar_means(
+                self,
+                objective_mean: float = None,
+                slack_mean: float = None,
+                loss_mean: float = None,
+            ) -> None:
+                if objective_mean is not None:
+                    self._pbar_objective_sum += float(objective_mean)
+                    self._pbar_objective_count += 1
+                if slack_mean is not None:
+                    self._pbar_slack_sum += float(slack_mean)
+                    self._pbar_slack_count += 1
+                if loss_mean is not None:
+                    self._pbar_loss_sum += float(loss_mean)
+                    self._pbar_loss_count += 1
+
+            def log(self, logs: Dict[str, float], start_time=None) -> None:
+                logs = dict(logs or {})
+                is_eval_log = any(str(k).startswith("eval_") for k in logs.keys())
+                if not is_eval_log:
+                    if self._pbar_objective_count > 0:
+                        logs["mean_objective"] = self._pbar_objective_sum / self._pbar_objective_count
+                    if self._pbar_slack_count > 0:
+                        logs["mean_slack"] = self._pbar_slack_sum / self._pbar_slack_count
+                    if self._pbar_loss_count > 0:
+                        logs["mean_loss"] = self._pbar_loss_sum / self._pbar_loss_count
+                super().log(logs, start_time=start_time)
 
             def init_dual_vars(self):
                 loss_type = str(self.custom_cfg.exp.loss_type)
@@ -591,7 +645,7 @@ class DPO_KL(Experiment):
                 logp_chosen = avg_logp[:B]
                 logp_rejected = avg_logp[B:]
                 gap = None
-                if loss_type == "simpo" or needs_pairwise_slack:
+                if loss_type in {"simpo", "dpo"} or needs_pairwise_slack:
                     gap = logp_chosen - logp_rejected  # (B,)
 
                 # SimPO objective (no KL regularization / no base model pass):
@@ -607,12 +661,19 @@ class DPO_KL(Experiment):
                     score = beta_simpo * gap - gamma  # (B,)
                     # -log σ(score) == softplus(-score)
                     loss = F.softplus(-score).mean()
+                    if model.training:
+                        slack_simpo = gamma - beta_simpo * gap
+                        self._accumulate_pbar_means(
+                            objective_mean=float(loss.detach().cpu().item()),
+                            slack_mean=float(slack_simpo.mean().detach().cpu().item()),
+                            loss_mean=float(loss.detach().cpu().item()),
+                        )
                     if return_outputs:
                         packed = torch.stack([logp_chosen, logp_rejected, score], dim=-1)
                         return loss, {"logits": packed}
                     return loss
 
-                # KL objective vs pretrained/base (adapters disabled)
+                # Reference model pass vs pretrained/base (adapters disabled)
                 with torch.no_grad():
                     if hasattr(model, "disable_adapter"):
                         with model.disable_adapter():
@@ -630,12 +691,42 @@ class DPO_KL(Experiment):
                             )
                     else:
                         raise RuntimeError(
-                            "KL objective requires PEFT LoRA adapters. "
+                            "KL/DPO objectives require PEFT LoRA adapters. "
                             "Expected model to expose `.disable_adapter()` (PeftModel)."
                         )
                     base_logits = base_out.logits[:, :-1]
                     del base_out
                     base_log_probs = F.log_softmax(base_logits, dim=-1)
+
+                if loss_type == "dpo":
+                    beta_dpo = float(getattr(cfg, "loss_alpha", 1.0))
+                    if gap is None:
+                        gap = logp_chosen - logp_rejected
+
+                    base_token_logp = torch.gather(
+                        base_log_probs,
+                        dim=-1,
+                        index=input_ids[:, 1:].unsqueeze(-1),
+                    ).squeeze(-1)  # (2B, L-1)
+                    base_token_logp = base_token_logp * response_mask[:, 1:]
+                    base_avg_logp = base_token_logp.sum(dim=-1) / num_tokens  # (2B,)
+                    base_logp_chosen = base_avg_logp[:B]
+                    base_logp_rejected = base_avg_logp[B:]
+                    base_gap = base_logp_chosen - base_logp_rejected  # (B,)
+
+                    # Standard DPO score:
+                    #   beta * [ (logπ(y_w)-logπ(y_l)) - (logπ_ref(y_w)-logπ_ref(y_l)) ]
+                    score = beta_dpo * (gap - base_gap)
+                    loss = F.softplus(-score).mean()
+                    if model.training:
+                        self._accumulate_pbar_means(
+                            objective_mean=float(loss.detach().cpu().item()),
+                            loss_mean=float(loss.detach().cpu().item()),
+                        )
+                    if return_outputs:
+                        packed = torch.stack([logp_chosen, logp_rejected, score], dim=-1)
+                        return loss, {"logits": packed}
+                    return loss
 
                 probs = log_probs.exp()
                 kl_token = (probs * (log_probs - base_log_probs)).sum(dim=-1)  # (2B, L-1)
@@ -832,10 +923,24 @@ class DPO_KL(Experiment):
                     raise ValueError(f"Unknown loss_type: {loss_type}")
 
                 loss = loss.mean()
+                if model.training:
+                    objective_mean = float(kl_mean.mean().detach().cpu().item())
+                    slack_mean = None
+                    if slack is not None:
+                        slack_mean = float(slack.mean().detach().cpu().item())
+                    elif slack_win is not None and slack_loose is not None:
+                        slack_mean = float(
+                            (0.5 * (slack_win.mean() + slack_loose.mean())).detach().cpu().item()
+                        )
+                    self._accumulate_pbar_means(
+                        objective_mean=objective_mean,
+                        slack_mean=slack_mean,
+                        loss_mean=float(loss.detach().cpu().item()),
+                    )
 
                 if return_outputs:
                     # Return compact predictions for metrics: [logp_chosen, logp_rejected, third]
-                    # third = KL mean for KL-based methods
+                    # third = KL mean for KL-based methods; score for SimPO/DPO
                     packed = torch.stack([logp_chosen, logp_rejected, kl_mean], dim=-1)
                     return loss, {"logits": packed}
                 return loss
@@ -1318,6 +1423,14 @@ class DPO_KL(Experiment):
                     # softplus(-score) = logaddexp(0, -score)
                     out["objective_simpo_loss"] = float(np.mean(np.logaddexp(0.0, -score)))
                     out["simpo_margin_sat_rate"] = float(np.mean(score >= 0.0))
+                elif loss_type == "dpo":
+                    # third column is the DPO score used inside logsigmoid
+                    score = arr[:, 2]
+                    # logsigmoid(score) = -softplus(-score) = -logaddexp(0, -score)
+                    out["objective_dpo_logsigmoid"] = float(np.mean(-np.logaddexp(0.0, -score)))
+                    # softplus(-score) = logaddexp(0, -score)
+                    out["objective_dpo_loss"] = float(np.mean(np.logaddexp(0.0, -score)))
+                    out["dpo_pref_sat_rate"] = float(np.mean(score >= 0.0))
                 else:
                     kl_mean = arr[:, 2]
                     out["objective_kl"] = float(np.mean(kl_mean))
