@@ -1,5 +1,9 @@
 import json
 import os
+import re
+import shutil
+import tempfile
+import atexit
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from types import SimpleNamespace
@@ -13,7 +17,7 @@ from accelerate.utils import extract_model_from_parallel
 from datasets import load_dataset, concatenate_datasets
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer
 
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 
 from .base import Experiment
 from utils import right_padding
@@ -81,8 +85,175 @@ class DPO_KL(Experiment):
             return text + "<|im_end|>\n"
         return text
 
+    def _optional_str(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s or s.lower() in {"none", "null"}:
+            return None
+        return s
+
+    def _parse_wandb_run_reference(self, value: str, cfg) -> Dict[str, str] | None:
+        """
+        Supported formats:
+          - wandb://<run_id>
+          - wandb://<entity>/<project>/<run_id>
+          - <run_id>                    (must look like a W&B run id, e.g. 8-char alnum)
+          - <entity>/<project>/<run_id> (only if run_id token looks like a run id)
+        """
+        raw = self._optional_str(value)
+        if raw is None:
+            return None
+
+        is_explicit_wandb = raw.startswith("wandb://")
+        target = raw[len("wandb://") :] if is_explicit_wandb else raw
+        parts = [p.strip() for p in target.split("/") if p.strip()]
+
+        # Typical W&B run ids are 8-char base62-ish tokens.
+        def _looks_like_run_id(x: str) -> bool:
+            return bool(re.fullmatch(r"[A-Za-z0-9]{8}", x))
+
+        entity = self._optional_str(getattr(cfg.train, "wandb_entity", None)) or self._optional_str(
+            os.environ.get("WANDB_ENTITY")
+        )
+        project = self._optional_str(getattr(cfg.train, "wandb_project", None))
+
+        if len(parts) == 1 and (is_explicit_wandb or _looks_like_run_id(parts[0])):
+            run_id = parts[0]
+            if entity and project:
+                return {"entity": entity, "project": project, "run_id": run_id}
+            raise ValueError(
+                "W&B run-id base model requested but entity/project are missing. "
+                "Set `train.wandb_entity` and `train.wandb_project` (or WANDB_ENTITY env var)."
+            )
+
+        if len(parts) == 3 and (is_explicit_wandb or _looks_like_run_id(parts[2])):
+            return {"entity": parts[0], "project": parts[1], "run_id": parts[2]}
+
+        # Anything else is treated as a normal model id/path.
+        return None
+
+    def _extract_field(self, config: Any, key: str) -> Any:
+        if config is None:
+            return None
+        if isinstance(config, dict):
+            return config.get(key)
+        if hasattr(config, key):
+            return getattr(config, key)
+        return None
+
+    def _pick_base_model_from_run(self, run_obj: Any, override: str | None = None) -> str:
+        if override:
+            return override
+        cfg = getattr(run_obj, "config", {}) or {}
+        candidates = [
+            self._extract_field(self._extract_field(cfg, "exp"), "model_name"),
+            self._extract_field(cfg, "exp.model_name"),
+            self._extract_field(cfg, "model_name"),
+        ]
+        for c in candidates:
+            if isinstance(c, str) and c.strip():
+                return c.strip()
+        raise RuntimeError(
+            "Could not infer base model from W&B run config. "
+            "Set `exp.base_model_override` to a valid base model."
+        )
+
+    def _artifact_aliases(self, artifact_obj: Any) -> set[str]:
+        aliases = getattr(artifact_obj, "aliases", None) or []
+        out: set[str] = set()
+        for x in aliases:
+            out.add(x if isinstance(x, str) else getattr(x, "name", str(x)))
+        return out
+
+    def _pick_lora_artifact_for_run(self, run_obj: Any) -> Any:
+        run_id = str(getattr(run_obj, "id"))
+        candidates = []
+        for art in run_obj.logged_artifacts():
+            if getattr(art, "type", None) != "lora_adapters":
+                continue
+            name = str(getattr(art, "name", ""))
+            if not name.startswith(f"{run_id}-lora_adapters:"):
+                continue
+            aliases = self._artifact_aliases(art)
+            has_latest = "latest" in aliases
+            created = getattr(art, "created_at", None) or getattr(art, "updated_at", None)
+            candidates.append((1 if has_latest else 0, created, art))
+        if not candidates:
+            raise RuntimeError(
+                f"No logged lora_adapters artifact found on run {run_id}. "
+                "Expected '<run_id>-lora_adapters:...'."
+            )
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[-1][2]
+
+    def _merge_lora_to_local_model(
+        self,
+        base_model: str,
+        adapter_dir: Path,
+        merged_dir: Path,
+        torch_dtype: torch.dtype,
+    ) -> None:
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        tok = AutoTokenizer.from_pretrained(base_model, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "right"
+
+        base = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            device_map="cpu",
+        )
+        peft_model = PeftModel.from_pretrained(base, str(adapter_dir))
+        merged = peft_model.merge_and_unload()
+        merged.save_pretrained(str(merged_dir), safe_serialization=True)
+        tok.save_pretrained(str(merged_dir))
+
+    def _resolve_model_source(self, cfg, torch_dtype: torch.dtype) -> str:
+        model_ref = str(cfg.exp.model_name)
+        run_ref = self._parse_wandb_run_reference(model_ref, cfg)
+        if run_ref is None:
+            return model_ref
+
+        import wandb
+
+        run_path = f"{run_ref['entity']}/{run_ref['project']}/{run_ref['run_id']}"
+        api = wandb.Api()
+        run_obj = api.run(run_path)
+        base_override = self._optional_str(getattr(cfg.exp, "base_model_override", None))
+        base_model = self._pick_base_model_from_run(run_obj=run_obj, override=base_override)
+        artifact = self._pick_lora_artifact_for_run(run_obj)
+
+        work_root = Path(
+            tempfile.mkdtemp(prefix=f"dpo_kl_wandb_base_{run_ref['run_id']}_")
+        )
+        adapter_dir = Path(artifact.download(root=str(work_root / "adapter")))
+        merged_dir = work_root / "merged_model"
+        self._merge_lora_to_local_model(
+            base_model=base_model,
+            adapter_dir=adapter_dir,
+            merged_dir=merged_dir,
+            torch_dtype=torch_dtype,
+        )
+
+        # Keep merged model around for the full process lifetime.
+        self._wandb_merged_base_dir = str(work_root)
+        atexit.register(lambda p=str(work_root): shutil.rmtree(p, ignore_errors=True))
+        print(
+            "[dpo_kl] Resolved base model from W&B run "
+            f"{run_path} using artifact {getattr(artifact, 'name', '')}; "
+            f"merged model at {merged_dir}"
+        )
+        return str(merged_dir)
+
     def load_model_and_tok(self, cfg):
-        tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
+        dtype = torch.bfloat16 if getattr(cfg.train.hf_args, "bf16", False) else torch.float16
+        model_source = self._resolve_model_source(cfg, torch_dtype=dtype)
+        self._resolved_model_source = model_source
+
+        tok = AutoTokenizer.from_pretrained(model_source, use_fast=True)
         tok = self._ensure_chat_template(tok)
         tok.model_max_length = int(getattr(cfg.train, "max_length", 2048))
 
@@ -92,9 +263,8 @@ class DPO_KL(Experiment):
         # Right padding keeps response masks aligned with shifted labels in training.
         tok.padding_side = "right"
 
-        dtype = torch.bfloat16 if getattr(cfg.train.hf_args, "bf16", False) else torch.float16
         model = AutoModelForCausalLM.from_pretrained(
-            cfg.exp.model_name,
+            model_source,
             #low_cpu_mem_usage=True,
             dtype=dtype,
             attn_implementation="flash_attention_2",
@@ -222,7 +392,8 @@ class DPO_KL(Experiment):
         # Remove unused / heavy columns up-front (keeps behavior similar to the provided snippet)
         original_columns = ds.column_names
 
-        tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
+        tok_source = getattr(self, "_resolved_model_source", cfg.exp.model_name)
+        tok = AutoTokenizer.from_pretrained(tok_source, use_fast=True)
         tok = self._ensure_chat_template(tok)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
@@ -698,25 +869,26 @@ class DPO_KL(Experiment):
                     del base_out
                     base_log_probs = F.log_softmax(base_logits, dim=-1)
 
+                base_token_logp = torch.gather(
+                    base_log_probs,
+                    dim=-1,
+                    index=input_ids[:, 1:].unsqueeze(-1),
+                ).squeeze(-1)  # (2B, L-1)
+                base_token_logp = base_token_logp * response_mask[:, 1:]
+                base_avg_logp = base_token_logp.sum(dim=-1) / num_tokens  # (2B,)
+                base_logp_chosen = base_avg_logp[:B]
+                base_logp_rejected = base_avg_logp[B:]
+
+                # Reference-adjusted sequence log-probs used by training constraints.
+                rel_logp_chosen = logp_chosen - base_logp_chosen
+                rel_logp_rejected = logp_rejected - base_logp_rejected
+                rel_gap = rel_logp_chosen - rel_logp_rejected
+
                 if loss_type == "dpo":
                     beta_dpo = float(getattr(cfg, "loss_alpha", 1.0))
-                    if gap is None:
-                        gap = logp_chosen - logp_rejected
-
-                    base_token_logp = torch.gather(
-                        base_log_probs,
-                        dim=-1,
-                        index=input_ids[:, 1:].unsqueeze(-1),
-                    ).squeeze(-1)  # (2B, L-1)
-                    base_token_logp = base_token_logp * response_mask[:, 1:]
-                    base_avg_logp = base_token_logp.sum(dim=-1) / num_tokens  # (2B,)
-                    base_logp_chosen = base_avg_logp[:B]
-                    base_logp_rejected = base_avg_logp[B:]
-                    base_gap = base_logp_chosen - base_logp_rejected  # (B,)
-
                     # Standard DPO score:
                     #   beta * [ (logπ(y_w)-logπ(y_l)) - (logπ_ref(y_w)-logπ_ref(y_l)) ]
-                    score = beta_dpo * (gap - base_gap)
+                    score = beta_dpo * rel_gap
                     loss = F.softplus(-score).mean()
                     if model.training:
                         self._accumulate_pbar_means(
@@ -724,7 +896,7 @@ class DPO_KL(Experiment):
                             loss_mean=float(loss.detach().cpu().item()),
                         )
                     if return_outputs:
-                        packed = torch.stack([logp_chosen, logp_rejected, score], dim=-1)
+                        packed = torch.stack([rel_logp_chosen, rel_logp_rejected, score], dim=-1)
                         return loss, {"logits": packed}
                     return loss
 
@@ -741,8 +913,7 @@ class DPO_KL(Experiment):
 
                 slack = None
                 if needs_pairwise_slack:
-                    if gap is None:
-                        gap = logp_chosen - logp_rejected
+                    gap = rel_gap
                     # Constraint slack: tol + logp(rejected) - logp(chosen) == tol - (logp_chosen - logp_rejected)
                     slack = cfg.tol - gap  # (B,)
 
@@ -766,8 +937,8 @@ class DPO_KL(Experiment):
                             getattr(cfg, "epsilon_loose", getattr(cfg, "tol2", getattr(cfg, "tol", 0.0))),
                         )
                     )
-                    slack_win = eps_win - logp_chosen
-                    slack_loose = logp_rejected - eps_loose
+                    slack_win = eps_win - rel_logp_chosen
+                    slack_loose = rel_logp_rejected - eps_loose
 
                 # Loss schemes (as in SAFETY)
                 if loss_type == "erm":
@@ -941,6 +1112,7 @@ class DPO_KL(Experiment):
                 if return_outputs:
                     # Return compact predictions for metrics: [logp_chosen, logp_rejected, third]
                     # third = KL mean for KL-based methods; score for SimPO/DPO
+                    # Use raw policy log-probs here so eval slacks are not reference-normalized.
                     packed = torch.stack([logp_chosen, logp_rejected, kl_mean], dim=-1)
                     return loss, {"logits": packed}
                 return loss
