@@ -1,0 +1,32 @@
+# @package _global_
+
+wandb:
+  entity: "alelab"
+  project: "dpo_kl"
+  run_id: null
+
+model:
+  # Optional override. If null, inferred from run config (`exp.model_name`).
+  base_model: null
+
+lm_eval:
+  backend: "vllm"
+  task_name: "when2call-llama3_2"
+  batch_size: "1"
+  use_cache: true
+  fallback_to_hf_on_vllm_import_error: false
+  local_output_dir: "outputs/when2call_lm_eval_vllm"
+
+vllm:
+  # <= 0 means auto-detect all visible GPUs.
+  tensor_parallel_size: -1
+  dtype: "bfloat16"
+  merge_dtype: "bfloat16"
+  gpu_memory_utilization: 0.8
+  max_model_len: 4096
+  trust_remote_code: false
+
+hydra:
+  run:
+    dir: outputs/eval/wandb_when2call_lm_eval_vllm/${wandb.project}/${wandb.run_id}
+

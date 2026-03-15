@@ -85,6 +85,176 @@ class DPO_KL(Experiment):
             return text + "<|im_end|>\n"
         return text
 
+    WHEN2CALL_LLAMA32_SYSTEM_PROMPT = (
+        "You are an expert in composing functions. You are given a question and a set of "
+        "possible functions.\nBased on the question, you will need to make one or more "
+        "function/tool calls to achieve the purpose.\nIf none of the functions can be used, "
+        "point it out. If the given question lacks the parameters required by the function,"
+        "also point it out. You should only return the function call in tools call sections.\n"
+        "If you decide to invoke any of the function(s), you MUST put it in the format of "
+        "[func_name1(params_name1=params_value1, params_name2=params_value2...), "
+        "func_name2(params)]\nYou SHOULD NOT include any other text in the response.\n"
+        "Here is a list of functions in JSON format that you can invoke."
+    )
+
+    def _normalize_when2call_messages(self, value: Any) -> List[Dict[str, str]]:
+        if value is None:
+            return []
+        raw = value
+        if isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                return []
+            try:
+                raw = json.loads(s)
+            except Exception:
+                return []
+        if not isinstance(raw, list):
+            return []
+        normalized: List[Dict[str, str]] = []
+        for msg in raw:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip()
+            content = msg.get("content")
+            if not role:
+                continue
+            if content is None:
+                content = ""
+            normalized.append({"role": role, "content": str(content)})
+        return normalized
+
+    def _parse_when2call_tool(self, tool: Any) -> Any | None:
+        if isinstance(tool, str):
+            s = tool.strip()
+            if not s:
+                return None
+            try:
+                return json.loads(s)
+            except Exception:
+                return s
+        if isinstance(tool, (dict, list)):
+            return tool
+        return None
+
+    def _format_when2call_tools_json(self, tools_value: Any) -> str:
+        tools_raw = tools_value
+        if isinstance(tools_raw, str):
+            s = tools_raw.strip()
+            if s:
+                try:
+                    tools_raw = json.loads(s)
+                except Exception:
+                    tools_raw = s
+            else:
+                tools_raw = []
+
+        if isinstance(tools_raw, list):
+            items = tools_raw
+        elif tools_raw in (None, ""):
+            items = []
+        else:
+            items = [tools_raw]
+
+        parsed_tools: List[Any] = []
+        for item in items:
+            parsed = self._parse_when2call_tool(item)
+            if parsed is not None:
+                parsed_tools.append(parsed)
+        return json.dumps(parsed_tools, ensure_ascii=False)
+
+    def _build_when2call_system_message(self, tools_value: Any) -> str:
+        tools_json = self._format_when2call_tools_json(tools_value)
+        return f"{self.WHEN2CALL_LLAMA32_SYSTEM_PROMPT}\n{tools_json}"
+
+    def _is_when2call_strict_prompt(self, cfg) -> bool:
+        return bool(getattr(cfg.train, "when2call_strict_prompt", False))
+
+    def _extract_when2call_user_query(self, messages: List[Dict[str, str]]) -> str:
+        # Prefer the last user turn if available; fallback to the last message content.
+        for msg in reversed(messages):
+            if str(msg.get("role") or "").strip().lower() == "user":
+                return str(msg.get("content") or "")
+        if messages:
+            return str(messages[-1].get("content") or "")
+        return ""
+
+    def _build_when2call_strict_prompt(self, tools_value: Any, user_query: str) -> str:
+        tools_json = self._format_when2call_tools_json(tools_value)
+        # Match NVIDIA's lm_eval_harness `process_docs_llama3_2` prompt format.
+        return (
+            "<|start_header_id|>system<|end_header_id|>\n\n"
+            "You are an expert in composing functions. You are given a question and a set of possible functions. \n"
+            "Based on the question, you will need to make one or more function/tool calls to achieve the purpose. \n"
+            "If none of the functions can be used, point it out. If the given question lacks the parameters required by the function,also point it out. You should only return the function call in tools call sections.\n"
+            "If you decide to invoke any of the function(s), you MUST put it in the format of [func_name1(params_name1=params_value1, params_name2=params_value2...), func_name2(params)]\n"
+            "You SHOULD NOT include any other text in the response.\n"
+            "Here is a list of functions in JSON format that you can invoke.\n"
+            f"{tools_json}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+            f"{user_query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+
+    def _extract_when2call_response_text(self, response_value: Any) -> str:
+        if response_value is None:
+            return ""
+        if isinstance(response_value, dict):
+            content = response_value.get("content")
+            return "" if content is None else str(content)
+        return str(response_value)
+
+    def _format_when2call_tool_call(self, tool_call: Any) -> str:
+        if not isinstance(tool_call, dict):
+            return ""
+        name = str(tool_call.get("name") or "").strip()
+        if not name:
+            return ""
+        arguments = tool_call.get("arguments", tool_call.get("parameters", {}))
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        arg_parts: List[str] = []
+        for arg_name, arg_value in arguments.items():
+            arg_key = str(arg_name)
+            if isinstance(arg_value, str):
+                arg_val = json.dumps(arg_value, ensure_ascii=False)
+            else:
+                # Match NVIDIA lm-eval formatting behavior in utils.process_docs_llama3_2.
+                arg_val = str(arg_value)
+            arg_parts.append(f"{arg_key}={arg_val}")
+        if arg_parts:
+            return f"{name}({', '.join(arg_parts)})"
+        return f"{name}()"
+
+    def _normalize_when2call_response_text(self, text: str) -> str:
+        text = text or ""
+        pattern = re.compile(r"<TOOLCALL>\s*(.*?)\s*</TOOLCALL>", flags=re.DOTALL)
+
+        def _replace(match: re.Match) -> str:
+            payload = (match.group(1) or "").strip()
+            if not payload:
+                return "[]"
+            try:
+                parsed = json.loads(payload)
+            except Exception:
+                return payload
+
+            if isinstance(parsed, dict):
+                calls = [parsed]
+            elif isinstance(parsed, list):
+                calls = parsed
+            else:
+                return payload
+
+            formatted_calls = [
+                self._format_when2call_tool_call(call)
+                for call in calls
+                if isinstance(call, dict)
+            ]
+            formatted_calls = [c for c in formatted_calls if c]
+            return f"[{', '.join(formatted_calls)}]" if formatted_calls else "[]"
+
+        return pattern.sub(_replace, text)
+
     def _optional_str(self, value: Any) -> str | None:
         if value is None:
             return None
@@ -314,7 +484,14 @@ class DPO_KL(Experiment):
             "helpsteer2_preference",
             "helpsteer2_preferences",
         }
+        when2call_pref_aliases = {
+            "when2call",
+            "when2call_pref",
+            "when2call_preference",
+            "when2call_preferences",
+        }
         is_helpsteer_pref = dataset_name in helpsteer_pref_aliases
+        is_when2call_pref = dataset_name in when2call_pref_aliases
 
         if dataset_name == "ultra":
             ds = load_dataset(
@@ -367,6 +544,14 @@ class DPO_KL(Experiment):
 
             # Drop ties; this trainer expects strict chosen vs rejected pairs.
             ds = ds.filter(lambda r: int(r["preference_strength"]) != 0)
+        elif is_when2call_pref:
+            ds = load_dataset(
+                "nvidia/When2Call",
+                "train_pref",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            print(f"[dpo_kl] When2Call train_pref columns: {ds.column_names}")
         else:
             # Default: Orca DPO pairs
             ds = load_dataset(
@@ -447,6 +632,35 @@ class DPO_KL(Experiment):
                     "rejected": self._format_answer_text(rejected_raw, cfg),
                     "split": split,
                     "preference_strength": strength,
+                }
+        elif is_when2call_pref:
+            def chatml_format(r):
+                messages = self._normalize_when2call_messages(r.get("messages"))
+                user_query = self._extract_when2call_user_query(messages)
+                if self._is_when2call_strict_prompt(cfg):
+                    prompt = self._build_when2call_strict_prompt(
+                        tools_value=r.get("tools"),
+                        user_query=user_query,
+                    )
+                else:
+                    tool_system_message = self._build_when2call_system_message(r.get("tools"))
+                    msgs = [
+                        {"role": "system", "content": tool_system_message},
+                        {"role": "user", "content": user_query},
+                    ]
+                    prompt = tok.apply_chat_template(
+                        msgs, tokenize=False, add_generation_prompt=True,
+                    )
+                chosen_text = self._normalize_when2call_response_text(
+                    self._extract_when2call_response_text(r.get("chosen_response"))
+                )
+                rejected_text = self._normalize_when2call_response_text(
+                    self._extract_when2call_response_text(r.get("rejected_response"))
+                )
+                return {
+                    "prompt": prompt,
+                    "chosen": self._format_answer_text(chosen_text, cfg),
+                    "rejected": self._format_answer_text(rejected_text, cfg),
                 }
         else:
             def chatml_format(r):
@@ -883,6 +1097,14 @@ class DPO_KL(Experiment):
                 rel_logp_chosen = logp_chosen - base_logp_chosen
                 rel_logp_rejected = logp_rejected - base_logp_rejected
                 rel_gap = rel_logp_chosen - rel_logp_rejected
+                use_pretrained_slacks = bool(getattr(cfg, "use_pretrained_slacks", True))
+                if use_pretrained_slacks:
+                    slack_logp_chosen = rel_logp_chosen
+                    slack_logp_rejected = rel_logp_rejected
+                else:
+                    slack_logp_chosen = logp_chosen
+                    slack_logp_rejected = logp_rejected
+                slack_gap = slack_logp_chosen - slack_logp_rejected
 
                 if loss_type == "dpo":
                     beta_dpo = float(getattr(cfg, "loss_alpha", 1.0))
@@ -913,7 +1135,7 @@ class DPO_KL(Experiment):
 
                 slack = None
                 if needs_pairwise_slack:
-                    gap = rel_gap
+                    gap = slack_gap
                     # Constraint slack: tol + logp(rejected) - logp(chosen) == tol - (logp_chosen - logp_rejected)
                     slack = cfg.tol - gap  # (B,)
 
@@ -937,8 +1159,8 @@ class DPO_KL(Experiment):
                             getattr(cfg, "epsilon_loose", getattr(cfg, "tol2", getattr(cfg, "tol", 0.0))),
                         )
                     )
-                    slack_win = eps_win - rel_logp_chosen
-                    slack_loose = rel_logp_rejected - eps_loose
+                    slack_win = eps_win - slack_logp_chosen
+                    slack_loose = slack_logp_rejected - eps_loose
 
                 # Loss schemes (as in SAFETY)
                 if loss_type == "erm":
