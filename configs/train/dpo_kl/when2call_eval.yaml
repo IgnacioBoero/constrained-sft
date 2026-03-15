@@ -16,8 +16,8 @@ train:
   wandb_project: "when2call"
   wandb_entity: "alelab"
   run_name: "dpo_kl-${train.dataset}-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
-  eval_at_end: true
-  eval_on_train: true
+  eval_at_end: false
+  eval_on_train: false
 
   # Dataset / preprocessing
   cache_dir: "./cache"
