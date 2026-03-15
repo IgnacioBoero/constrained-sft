@@ -78,7 +78,7 @@ def _run_post_train_when2call_lm_eval(cfg: DictConfig, wandb_run_id: str | None)
         f"lm_eval.backend={str(getattr(post_cfg, 'backend', 'hf'))}",
         f"lm_eval.batch_size={str(getattr(post_cfg, 'batch_size', '1'))}",
         f"lm_eval.use_cache={bool(getattr(post_cfg, 'use_cache', True))}",
-        f"lm_eval.fallback_to_hf_on_vllm_import_error={bool(getattr(post_cfg, 'fallback_to_hf_on_vllm_import_error', True))}",
+        f"lm_eval.fallback_to_hf_on_vllm_import_error={bool(getattr(post_cfg, 'fallback_to_hf_on_vllm_import_error', False))}",
         f"lm_eval.local_output_dir={str(getattr(post_cfg, 'local_output_dir', 'outputs/when2call_lm_eval_vllm'))}",
         f"vllm.tensor_parallel_size={int(getattr(post_cfg, 'tensor_parallel_size', -1))}",
         f"vllm.dtype={str(getattr(post_cfg, 'dtype', 'bfloat16'))}",

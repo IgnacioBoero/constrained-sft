@@ -254,6 +254,7 @@ def _run_lm_eval_command(
     ]
     last_err = None
     last_stderr = ""
+    last_cmd = ""
     for cmd in attempts:
         proc = subprocess.run(
             cmd,
@@ -270,12 +271,21 @@ def _run_lm_eval_command(
                 "backend": backend,
             }
         last_stderr = proc.stderr or ""
+        last_cmd = " ".join(cmd)
         last_err = (
             f"cmd={' '.join(cmd)}\n"
             f"exit={proc.returncode}\n"
             f"stdout:\n{proc.stdout[-8000:]}\n"
             f"stderr:\n{proc.stderr[-8000:]}\n"
         )
+
+    if last_cmd:
+        print(f"[lm-eval] Last failed command: {last_cmd}")
+    if last_stderr.strip():
+        print("[lm-eval] stderr from failed command:")
+        print(last_stderr)
+    else:
+        print("[lm-eval] stderr from failed command is empty.")
 
     # Retry with safe batch size on known HF auto-batching CUDA failures.
     is_hf_backend = backend == "hf"
@@ -321,7 +331,7 @@ def _run_lm_eval_command(
     )
     if allow_hf_fallback and vllm_import_mismatch:
         hf_model_args = _build_hf_model_args(cfg, model_ref=model_ref)
-        hf_base_args = _base_args_for("hf", hf_model_args)
+        hf_base_args = _base_args_for("hf", hf_model_args, configured_batch_size)
         if cache_path is not None:
             hf_base_args.extend(["--use_cache", str(cache_path)])
         hf_attempts = [
