@@ -17,13 +17,13 @@ train:
   wandb_entity: "alelab"
   run_name: "dpo_kl-${train.dataset}-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
   eval_at_end: true
-  eval_on_train: true
+  eval_on_train: false
 
   # Dataset / preprocessing
   cache_dir: "./cache"
   dataset: when2call
   when2call_strict_prompt: true
-  val_fraction: 0.05
+  val_fraction: 0.0
   shuffle: true
   sanity_check: false
   data_proportion: 1.0
