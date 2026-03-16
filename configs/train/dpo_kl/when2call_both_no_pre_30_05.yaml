@@ -23,7 +23,7 @@ train:
   cache_dir: "./cache"
   dataset: when2call
   when2call_strict_prompt: true
-  val_fraction: 0.0
+  val_fraction: 0.001
   shuffle: true
   sanity_check: false
   data_proportion: 1.0
