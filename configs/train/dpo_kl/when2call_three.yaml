@@ -34,7 +34,7 @@ train:
   # Train-end generation: sample validation prompts
   max_gen: 0
   post_train_when2call_lm_eval:
-    enabled: true
+    enabled: false
     backend: "vllm"
     task_name: "when2call-llama3_2"
     batch_size: "1"

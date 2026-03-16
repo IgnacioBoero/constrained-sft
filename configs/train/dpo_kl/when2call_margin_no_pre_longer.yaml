@@ -57,7 +57,7 @@ train:
     per_device_eval_batch_size: 1
     gradient_accumulation_steps: 32
     eval_accumulation_steps: 4
-    num_train_epochs: 5
+    num_train_epochs: 10
     learning_rate: 5e-5
     lr_scheduler_type: "cosine"
     warmup_ratio: 0.0
@@ -78,7 +78,7 @@ exp:
   tol: 2.0
 
   # Loss/optimizer hyperparams
-  loss_type: aug_dual_both
+  loss_type: aug_dual
   loss_alpha: 10.0
   loss_alpha_win: 10.0
   loss_alpha_loose: 10.0
