@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from accelerate.utils import extract_model_from_parallel
-from datasets import load_dataset, concatenate_datasets
+from datasets import Dataset, load_dataset, concatenate_datasets
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer
 
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -490,8 +490,29 @@ class DPO_KL(Experiment):
             "when2call_preference",
             "when2call_preferences",
         }
+        when2call_request_aliases = {
+            "when2call_request",
+            "when2call_imbalanced_request",
+        }
+        when2call_refusal_aliases = {
+            "when2call_refusal",
+            "when2call_imbalanced_refusal",
+        }
+        when2call_toolcall_aliases = {
+            "when2call_toolcall",
+            "when2call_imbalanced_toolcall",
+        }
         is_helpsteer_pref = dataset_name in helpsteer_pref_aliases
         is_when2call_pref = dataset_name in when2call_pref_aliases
+        is_when2call_request = dataset_name in when2call_request_aliases
+        is_when2call_refusal = dataset_name in when2call_refusal_aliases
+        is_when2call_toolcall = dataset_name in when2call_toolcall_aliases
+        is_when2call_variant = (
+            is_when2call_pref
+            or is_when2call_request
+            or is_when2call_refusal
+            or is_when2call_toolcall
+        )
 
         if dataset_name == "ultra":
             ds = load_dataset(
@@ -544,14 +565,62 @@ class DPO_KL(Experiment):
 
             # Drop ties; this trainer expects strict chosen vs rejected pairs.
             ds = ds.filter(lambda r: int(r["preference_strength"]) != 0)
-        elif is_when2call_pref:
-            ds = load_dataset(
-                "nvidia/When2Call",
-                "train_pref",
-                split="train",
-                cache_dir=cache_dir,
+        elif is_when2call_variant:
+            dataset_repo = "nvidia/When2Call"
+            data_dir = "train_pref"
+            if is_when2call_request:
+                dataset_repo = "ihounie/when2call_imbalanced_request"
+            elif is_when2call_refusal:
+                dataset_repo = "ihounie/when2call_imbalanced_refusal"
+            elif is_when2call_toolcall:
+                dataset_repo = "ihounie/when2call_imbalanced_toolcall"
+
+            try:
+                ds = load_dataset(
+                    dataset_repo,
+                    "train_pref" if dataset_repo == "nvidia/When2Call" else None,
+                    split="train",
+                    cache_dir=cache_dir,
+                    data_dir=None if dataset_repo == "nvidia/When2Call" else data_dir,
+                )
+            except Exception as exc:
+                # Fallback for parquet-only repos with incompatible embedded feature metadata.
+                if dataset_repo == "nvidia/When2Call":
+                    raise
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                from huggingface_hub import hf_hub_download, list_repo_files
+
+                repo_files = list_repo_files(dataset_repo, repo_type="dataset")
+                parquet_files = sorted(
+                    f
+                    for f in repo_files
+                    if f.startswith(f"{data_dir}/") and f.endswith(".parquet")
+                )
+                if not parquet_files:
+                    raise ValueError(
+                        f"No parquet files found in {dataset_repo}/{data_dir} for fallback loading."
+                    ) from exc
+
+                tables = []
+                for file_path in parquet_files:
+                    local_path = hf_hub_download(
+                        repo_id=dataset_repo,
+                        repo_type="dataset",
+                        filename=file_path,
+                        cache_dir=cache_dir,
+                    )
+                    tables.append(pq.read_table(local_path))
+                ds = Dataset.from_pyarrow(pa.concat_tables(tables))
+                print(
+                    "[dpo_kl] Falling back to parquet loader for "
+                    f"{dataset_repo} due to: {exc}"
+                )
+
+            print(
+                f"[dpo_kl] When2Call dataset source: {dataset_repo}, "
+                f"columns: {ds.column_names}"
             )
-            print(f"[dpo_kl] When2Call train_pref columns: {ds.column_names}")
         else:
             # Default: Orca DPO pairs
             ds = load_dataset(
@@ -633,7 +702,7 @@ class DPO_KL(Experiment):
                     "split": split,
                     "preference_strength": strength,
                 }
-        elif is_when2call_pref:
+        elif is_when2call_variant:
             def chatml_format(r):
                 messages = self._normalize_when2call_messages(r.get("messages"))
                 user_query = self._extract_when2call_user_query(messages)
