@@ -7,7 +7,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: avg_both
-      train.hf_args.num_train_epochs: [10]
+      train.hf_args.num_train_epochs: 10
 
 train:
   seed: 42
