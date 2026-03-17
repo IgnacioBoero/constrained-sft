@@ -1,7 +1,6 @@
 # @package _global_
 
 hydra:
-hydra:
   mode: MULTIRUN
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
