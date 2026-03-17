@@ -7,6 +7,9 @@ hydra:
     params:
       exp.loss_type: avg_both
       train.hf_args.num_train_epochs: 10
+      exp.loss_alpha: 10.0, 100.0
+      exp.tol_win: -2.0, -1.0
+      exp.tol_loose: -20.0, -40.0
 
 train:
   seed: 42
