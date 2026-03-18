@@ -569,7 +569,7 @@ class DPO_KL(Experiment):
             dataset_repo = "nvidia/When2Call"
             data_dir = "train_pref"
             if is_when2call_request:
-                dataset_repo = "ihounie/when2call_imbalanced_request"
+                dataset_repo = "ihounie/when2call_imbalanced_request_10"
             elif is_when2call_refusal:
                 dataset_repo = "ihounie/when2call_imbalanced_refusal"
             elif is_when2call_toolcall:
