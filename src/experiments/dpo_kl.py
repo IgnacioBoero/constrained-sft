@@ -85,6 +85,185 @@ class DPO_KL(Experiment):
             return text + "<|im_end|>\n"
         return text
 
+    XLAM_DEFAULT_SYSTEM_PROMPT = (
+        "You are a helpful assistant that can use tools. You are developed by Salesforce xLAM team."
+    )
+    XLAM_TOOL_FORMAT_INSTRUCTION = (
+        "You have access to a set of tools. When using tools, make calls in a single JSON array:\n\n"
+        "[{\"name\": \"tool_call_name\", \"arguments\": {\"arg1\": \"value1\", \"arg2\": \"value2\"}}, "
+        "... (additional parallel tool calls as needed)]\n\n"
+        "If no tool is suitable, state that explicitly. If the user's input lacks required parameters, "
+        "ask for clarification. Do not interpret or respond until tool results are returned. Once they are "
+        "available, process them or make additional calls if needed. For tasks that don't require tools, "
+        "such as casual conversation or general advice, respond directly in plain text. The available tools are:"
+    )
+
+    def _is_xlam_model(self, cfg) -> bool:
+        model_name = str(getattr(getattr(cfg, "exp", object()), "model_name", "")).lower()
+        return ("salesforce/xlam" in model_name) or ("salesforce/llama-xlam" in model_name)
+
+    def _parse_json_maybe(self, value: Any) -> Any:
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return value
+            try:
+                return json.loads(s)
+            except Exception:
+                return value
+        return value
+
+    def _normalize_tools_for_xlam(self, tools_value: Any) -> List[Dict[str, Any]]:
+        tools_raw = self._parse_json_maybe(tools_value)
+        if isinstance(tools_raw, list):
+            items = tools_raw
+        elif tools_raw in (None, ""):
+            items = []
+        else:
+            items = [tools_raw]
+
+        normalized: List[Dict[str, Any]] = []
+        for item in items:
+            parsed = self._parse_when2call_tool(item)
+            parsed = self._parse_json_maybe(parsed)
+            if isinstance(parsed, dict):
+                normalized.append(parsed)
+        return normalized
+
+    def _normalize_xlam_tool_call_dict(self, call: Any) -> Dict[str, Any] | None:
+        if not isinstance(call, dict):
+            return None
+        if isinstance(call.get("function"), dict):
+            call = call["function"]
+
+        name = str(call.get("name") or "").strip()
+        if not name:
+            return None
+
+        arguments = call.get("arguments", call.get("parameters", {}))
+        arguments = self._parse_json_maybe(arguments)
+        if not isinstance(arguments, dict):
+            arguments = {}
+        return {"name": name, "arguments": arguments}
+
+    def _normalize_xlam_tool_calls_array(self, value: Any) -> List[Dict[str, Any]]:
+        raw = self._parse_json_maybe(value)
+        if isinstance(raw, dict) and isinstance(raw.get("tool_calls"), list):
+            raw = raw["tool_calls"]
+
+        if isinstance(raw, dict):
+            calls = [raw]
+        elif isinstance(raw, list):
+            calls = raw
+        else:
+            calls = []
+
+        normalized: List[Dict[str, Any]] = []
+        for call in calls:
+            norm = self._normalize_xlam_tool_call_dict(call)
+            if norm is not None:
+                normalized.append(norm)
+        return normalized
+
+    def _normalize_tool_call_response_for_xlam(self, text: str) -> str:
+        text = text or ""
+        pattern = re.compile(r"<TOOLCALL>\s*(.*?)\s*</TOOLCALL>", flags=re.DOTALL)
+
+        def _replace(match: re.Match) -> str:
+            payload = (match.group(1) or "").strip()
+            if not payload:
+                return "[]"
+            parsed = self._parse_json_maybe(payload)
+            calls = self._normalize_xlam_tool_calls_array(parsed)
+            return json.dumps(calls, ensure_ascii=False) if calls else "[]"
+
+        normalized = pattern.sub(_replace, text).strip()
+        parsed = self._parse_json_maybe(normalized)
+        calls = self._normalize_xlam_tool_calls_array(parsed)
+        if calls:
+            return json.dumps(calls, ensure_ascii=False)
+        return normalized
+
+    def _normalize_apigen_conversations(self, value: Any) -> List[Dict[str, Any]]:
+        raw = self._parse_json_maybe(value)
+        if not isinstance(raw, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for turn in raw:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("from") or "").strip().lower()
+            if not role:
+                continue
+            out.append({"from": role, "value": turn.get("value")})
+        return out
+
+    def _build_xlam_prompt(
+        self,
+        tok,
+        messages: List[Dict[str, Any]],
+        tools_value: Any,
+        force_tool_instruction: bool = False,
+    ) -> str:
+        tools = self._normalize_tools_for_xlam(tools_value)
+
+        normalized_messages: List[Dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if not role:
+                continue
+            if role == "assistant" and isinstance(message.get("tool_calls"), list):
+                norm_calls: List[Dict[str, Any]] = []
+                for call in self._normalize_xlam_tool_calls_array(message.get("tool_calls")):
+                    norm_calls.append({"function": call})
+                normalized_messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": norm_calls,
+                        "content": str(message.get("content") or ""),
+                    }
+                )
+                continue
+            if role == "tool":
+                content = message.get("content")
+                parsed_content = self._parse_json_maybe(content)
+                if isinstance(parsed_content, (dict, list)):
+                    content = parsed_content
+                else:
+                    content = "" if content is None else str(content)
+                normalized_messages.append({"role": "tool", "content": content})
+                continue
+            normalized_messages.append(
+                {"role": role, "content": "" if message.get("content") is None else str(message.get("content"))}
+            )
+
+        if not normalized_messages:
+            normalized_messages = [{"role": "user", "content": ""}]
+
+        if (
+            force_tool_instruction
+            and tools
+            and normalized_messages
+            and normalized_messages[0].get("role") == "system"
+        ):
+            sys_text = str(normalized_messages[0].get("content") or "").strip()
+            if self.XLAM_TOOL_FORMAT_INSTRUCTION not in sys_text:
+                sys_text = (
+                    f"{sys_text}\n\n{self.XLAM_TOOL_FORMAT_INSTRUCTION}"
+                    if sys_text
+                    else self.XLAM_TOOL_FORMAT_INSTRUCTION
+                )
+                normalized_messages[0] = {"role": "system", "content": sys_text}
+
+        return tok.apply_chat_template(
+            normalized_messages,
+            tools=tools if tools else None,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     WHEN2CALL_LLAMA32_SYSTEM_PROMPT = (
         "You are an expert in composing functions. You are given a question and a set of "
         "possible functions.\nBased on the question, you will need to make one or more "
@@ -502,17 +681,267 @@ class DPO_KL(Experiment):
             "when2call_toolcall",
             "when2call_imbalanced_toolcall",
         }
+        mixed_apigen_when2call_aliases = {
+            "when2call_apigen_xlam",
+            "apigen_when2call_xlam",
+            "when2call_apigen",
+            "apigen_when2call",
+        }
         is_helpsteer_pref = dataset_name in helpsteer_pref_aliases
         is_when2call_pref = dataset_name in when2call_pref_aliases
         is_when2call_request = dataset_name in when2call_request_aliases
         is_when2call_refusal = dataset_name in when2call_refusal_aliases
         is_when2call_toolcall = dataset_name in when2call_toolcall_aliases
+        is_mixed_apigen_when2call = dataset_name in mixed_apigen_when2call_aliases
+        use_xlam_prompt_format = bool(getattr(cfg.train, "use_xlam_prompt_format", False)) or self._is_xlam_model(cfg)
         is_when2call_variant = (
             is_when2call_pref
             or is_when2call_request
             or is_when2call_refusal
             or is_when2call_toolcall
         )
+
+        if is_mixed_apigen_when2call:
+            tok_source = getattr(self, "_resolved_model_source", cfg.exp.model_name)
+            tok = AutoTokenizer.from_pretrained(tok_source, use_fast=True)
+            tok = self._ensure_chat_template(tok)
+            if tok.pad_token is None:
+                tok.pad_token = tok.eos_token
+            tok.padding_side = "right"
+
+            data_prop = float(getattr(cfg.train, "data_proportion", 1.0))
+            objective_prop = float(getattr(cfg.train, "objective_data_proportion", data_prop))
+            constraint_prop = float(getattr(cfg.train, "constraint_data_proportion", data_prop))
+            objective_val_fraction = float(getattr(cfg.train, "objective_val_fraction", val_fraction))
+            constraint_val_fraction = float(getattr(cfg.train, "constraint_val_fraction", val_fraction))
+
+            def _validate_fraction(name: str, value: float) -> None:
+                if not (0.0 < value < 1.0):
+                    raise ValueError(f"{name} must be in (0,1), got {value}")
+
+            def _validate_proportion(name: str, value: float) -> None:
+                if not (0.0 < value <= 1.0):
+                    raise ValueError(f"{name} must be in (0,1], got {value}")
+
+            _validate_fraction("cfg.train.val_fraction", val_fraction)
+            _validate_fraction("cfg.train.objective_val_fraction", objective_val_fraction)
+            _validate_fraction("cfg.train.constraint_val_fraction", constraint_val_fraction)
+            _validate_proportion("cfg.train.data_proportion", data_prop)
+            _validate_proportion("cfg.train.objective_data_proportion", objective_prop)
+            _validate_proportion("cfg.train.constraint_data_proportion", constraint_prop)
+
+            def _split_dataset(raw_ds: Dataset, frac: float) -> Tuple[Dataset, Dataset]:
+                if len(raw_ds) == 0:
+                    return raw_ds, raw_ds
+                n_val = max(1, int(len(raw_ds) * frac))
+                n_val = min(n_val, len(raw_ds))
+                ev_part = raw_ds.select(range(n_val))
+                tr_part = raw_ds.select(range(n_val, len(raw_ds)))
+                return tr_part, ev_part
+
+            def _add_split_col(raw_ds: Dataset, split_name: str) -> Dataset:
+                return raw_ds.add_column("split", [split_name] * len(raw_ds))
+
+            def _select_proportion(raw_ds: Dataset, prop: float) -> Dataset:
+                if prop >= 1.0:
+                    return raw_ds
+                keep = max(1, int(prop * len(raw_ds)))
+                keep = min(keep, len(raw_ds))
+                return raw_ds.select(range(keep))
+
+            # Constraint source: When2Call preference pairs.
+            constraint_ds = load_dataset(
+                "nvidia/When2Call",
+                "train_pref",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            constraint_ds = _select_proportion(constraint_ds, constraint_prop)
+            if sanity_check:
+                constraint_ds = constraint_ds.select(range(min(len(constraint_ds), 256)))
+
+            def _format_constraint_row(row: Dict[str, Any]) -> Dict[str, Any]:
+                messages = self._normalize_when2call_messages(row.get("messages"))
+                prompt = self._build_xlam_prompt(tok, messages, row.get("tools"))
+                chosen_text = self._normalize_tool_call_response_for_xlam(
+                    self._extract_when2call_response_text(row.get("chosen_response"))
+                )
+                rejected_text = self._normalize_tool_call_response_for_xlam(
+                    self._extract_when2call_response_text(row.get("rejected_response"))
+                )
+                return {
+                    "prompt": prompt,
+                    "chosen": self._format_answer_text(chosen_text, cfg),
+                    "rejected": self._format_answer_text(rejected_text, cfg),
+                    "is_constraint": True,
+                    "is_objective": False,
+                    "objective_use_chosen_only": False,
+                    "source": "when2call",
+                }
+
+            constraint_ds = constraint_ds.map(
+                _format_constraint_row,
+                remove_columns=constraint_ds.column_names,
+            )
+            tr_constraint, ev_constraint = _split_dataset(constraint_ds, constraint_val_fraction)
+            tr_constraint = _add_split_col(tr_constraint, "train")
+            ev_constraint = _add_split_col(ev_constraint, "validation")
+
+            # Objective source: APIGen-MT (non-pair trajectory data).
+            apigen_raw = load_dataset(
+                "Salesforce/APIGen-MT-5k",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            apigen_raw = _select_proportion(apigen_raw, objective_prop)
+            if sanity_check:
+                apigen_raw = apigen_raw.select(range(min(len(apigen_raw), 64)))
+
+            objective_records: List[Dict[str, Any]] = []
+            for row in apigen_raw:
+                conversations = self._normalize_apigen_conversations(row.get("conversations"))
+                tools_value = row.get("tools")
+                system_text = str(row.get("system") or "").strip()
+                history: List[Dict[str, Any]] = []
+                if system_text:
+                    history.append({"role": "system", "content": system_text})
+
+                for turn in conversations:
+                    turn_type = str(turn.get("from") or "").strip().lower()
+                    value = turn.get("value")
+                    if turn_type == "human":
+                        history.append({"role": "user", "content": "" if value is None else str(value)})
+                        continue
+
+                    if turn_type == "observation":
+                        content = self._parse_json_maybe(value)
+                        if not isinstance(content, (dict, list)):
+                            content = "" if value is None else str(value)
+                        history.append({"role": "tool", "content": content})
+                        continue
+
+                    if turn_type == "function_call":
+                        tool_calls = self._normalize_xlam_tool_calls_array(value)
+                        if not tool_calls:
+                            continue
+                        prompt = self._build_xlam_prompt(
+                            tok,
+                            history,
+                            tools_value,
+                            force_tool_instruction=True,
+                        )
+                        objective_records.append(
+                            {
+                                "prompt": prompt,
+                                "chosen": self._format_answer_text(
+                                    json.dumps(tool_calls, ensure_ascii=False),
+                                    cfg,
+                                ),
+                                "rejected": "",
+                                "is_constraint": False,
+                                "is_objective": True,
+                                "objective_use_chosen_only": True,
+                                "source": "apigen_mt",
+                            }
+                        )
+                        history.append(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [{"function": c} for c in tool_calls],
+                                "content": "",
+                            }
+                        )
+                        continue
+
+                    if turn_type == "gpt":
+                        assistant_text = "" if value is None else str(value)
+                        prompt = self._build_xlam_prompt(
+                            tok,
+                            history,
+                            tools_value,
+                            force_tool_instruction=True,
+                        )
+                        objective_records.append(
+                            {
+                                "prompt": prompt,
+                                "chosen": self._format_answer_text(assistant_text, cfg),
+                                "rejected": "",
+                                "is_constraint": False,
+                                "is_objective": True,
+                                "objective_use_chosen_only": True,
+                                "source": "apigen_mt",
+                            }
+                        )
+                        history.append({"role": "assistant", "content": assistant_text})
+
+            if not objective_records:
+                raise ValueError(
+                    "No objective APIGen assistant-turn samples were produced. "
+                    "Check APIGen conversation parsing and dataset availability."
+                )
+
+            objective_ds = Dataset.from_list(objective_records)
+            tr_objective, ev_objective = _split_dataset(objective_ds, objective_val_fraction)
+            tr_objective = _add_split_col(tr_objective, "train")
+            ev_objective = _add_split_col(ev_objective, "validation")
+
+            train_parts = [d for d in [tr_constraint, tr_objective] if len(d) > 0]
+            eval_parts = [d for d in [ev_constraint, ev_objective] if len(d) > 0]
+
+            if not train_parts:
+                raise ValueError("Mixed dataset build produced no training samples.")
+            if not eval_parts:
+                raise ValueError("Mixed dataset build produced no evaluation samples.")
+
+            tr_raw = concatenate_datasets(train_parts) if len(train_parts) > 1 else train_parts[0]
+            ev_raw = concatenate_datasets(eval_parts) if len(eval_parts) > 1 else eval_parts[0]
+
+            complete_ds = concatenate_datasets([tr_raw, ev_raw])
+            complete_ds = complete_ds.add_column("index", list(range(len(complete_ds))))
+
+            tr = complete_ds.filter(lambda x: x["split"] == "train")
+            ev = complete_ds.filter(lambda x: x["split"] == "validation")
+            if do_shuffle:
+                tr = tr.shuffle(seed=int(cfg.train.seed))
+                ev = ev.shuffle(seed=int(cfg.train.seed))
+
+            filter_shortest = float(getattr(cfg.train, "filter_shortest_train", 1.0))
+            if not (0.0 < filter_shortest <= 1.0):
+                raise ValueError(
+                    f"cfg.train.filter_shortest_train must be in (0,1], got {filter_shortest}"
+                )
+            if filter_shortest < 1.0 and len(tr) > 0:
+                is_objective_rows = [bool(v) for v in tr["is_objective"]]
+                objective_indices = [i for i, flag in enumerate(is_objective_rows) if flag]
+                constraint_indices = [i for i, flag in enumerate(is_objective_rows) if not flag]
+
+                if objective_indices:
+                    keep_obj_n = max(1, int(filter_shortest * len(objective_indices)))
+                    objective_sorted = sorted(
+                        objective_indices,
+                        key=lambda i: len(tr[i]["chosen"]),
+                    )
+                    keep_objective = set(objective_sorted[:keep_obj_n])
+                    keep_constraints = set(constraint_indices)
+                    keep_indices = [
+                        i
+                        for i in range(len(tr))
+                        if (i in keep_objective) or (i in keep_constraints)
+                    ]
+                    tr = tr.select(keep_indices)
+                    print(
+                        "[dpo_kl] filter_shortest_train (mixed): "
+                        f"kept objective={keep_obj_n}/{len(objective_indices)} shortest, "
+                        f"kept constraints={len(constraint_indices)}/{len(constraint_indices)}"
+                    )
+
+            print(
+                f"[dpo_kl] Mixed dataset source counts: "
+                f"train_constraint={len(tr_constraint)}, train_objective={len(tr_objective)}, "
+                f"eval_constraint={len(ev_constraint)}, eval_objective={len(ev_objective)}"
+            )
+            print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
+            return tr, ev, complete_ds
 
         if dataset_name == "ultra":
             ds = load_dataset(
@@ -705,27 +1134,32 @@ class DPO_KL(Experiment):
         elif is_when2call_variant:
             def chatml_format(r):
                 messages = self._normalize_when2call_messages(r.get("messages"))
-                user_query = self._extract_when2call_user_query(messages)
-                if self._is_when2call_strict_prompt(cfg):
-                    prompt = self._build_when2call_strict_prompt(
-                        tools_value=r.get("tools"),
-                        user_query=user_query,
-                    )
+                if use_xlam_prompt_format:
+                    prompt = self._build_xlam_prompt(tok, messages, r.get("tools"))
                 else:
-                    tool_system_message = self._build_when2call_system_message(r.get("tools"))
-                    msgs = [
-                        {"role": "system", "content": tool_system_message},
-                        {"role": "user", "content": user_query},
-                    ]
-                    prompt = tok.apply_chat_template(
-                        msgs, tokenize=False, add_generation_prompt=True,
-                    )
-                chosen_text = self._normalize_when2call_response_text(
-                    self._extract_when2call_response_text(r.get("chosen_response"))
-                )
-                rejected_text = self._normalize_when2call_response_text(
-                    self._extract_when2call_response_text(r.get("rejected_response"))
-                )
+                    user_query = self._extract_when2call_user_query(messages)
+                    if self._is_when2call_strict_prompt(cfg):
+                        prompt = self._build_when2call_strict_prompt(
+                            tools_value=r.get("tools"),
+                            user_query=user_query,
+                        )
+                    else:
+                        tool_system_message = self._build_when2call_system_message(r.get("tools"))
+                        msgs = [
+                            {"role": "system", "content": tool_system_message},
+                            {"role": "user", "content": user_query},
+                        ]
+                        prompt = tok.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                        )
+                raw_chosen = self._extract_when2call_response_text(r.get("chosen_response"))
+                raw_rejected = self._extract_when2call_response_text(r.get("rejected_response"))
+                if use_xlam_prompt_format:
+                    chosen_text = self._normalize_tool_call_response_for_xlam(raw_chosen)
+                    rejected_text = self._normalize_tool_call_response_for_xlam(raw_rejected)
+                else:
+                    chosen_text = self._normalize_when2call_response_text(raw_chosen)
+                    rejected_text = self._normalize_when2call_response_text(raw_rejected)
                 return {
                     "prompt": prompt,
                     "chosen": self._format_answer_text(chosen_text, cfg),
@@ -751,6 +1185,17 @@ class DPO_KL(Experiment):
                 }
 
         ds = ds.map(chatml_format, remove_columns=original_columns)
+
+        # Backward-compatible defaults: for legacy datasets objective and constraints
+        # are both computed on the same rows.
+        if "is_constraint" not in ds.column_names:
+            ds = ds.add_column("is_constraint", [True] * len(ds))
+        if "is_objective" not in ds.column_names:
+            ds = ds.add_column("is_objective", [True] * len(ds))
+        if "objective_use_chosen_only" not in ds.column_names:
+            ds = ds.add_column("objective_use_chosen_only", [False] * len(ds))
+        if "source" not in ds.column_names:
+            ds = ds.add_column("source", [dataset_name] * len(ds))
 
         if is_helpsteer_pref:
             tr_raw = ds.filter(lambda x: x["split"] == "train")
@@ -860,6 +1305,9 @@ class DPO_KL(Experiment):
                 "chosen_response_mask": chosen_mask,
                 "rejected_response_mask": rejected_mask,
                 "index": int(sample["index"]),
+                "is_constraint": bool(sample.get("is_constraint", True)),
+                "is_objective": bool(sample.get("is_objective", True)),
+                "objective_use_chosen_only": bool(sample.get("objective_use_chosen_only", False)),
             }
             if "preference_strength" in sample and sample.get("preference_strength") is not None:
                 out["preference_strength"] = int(sample["preference_strength"])
@@ -902,6 +1350,18 @@ class DPO_KL(Experiment):
                 rejected_attn = rejected_input_ids.ne(self.pad_token_id)
 
                 index = torch.tensor([s["index"] for s in samples], dtype=torch.long)
+                is_constraint = torch.tensor(
+                    [bool(s.get("is_constraint", True)) for s in samples],
+                    dtype=torch.bool,
+                )
+                is_objective = torch.tensor(
+                    [bool(s.get("is_objective", True)) for s in samples],
+                    dtype=torch.bool,
+                )
+                objective_use_chosen_only = torch.tensor(
+                    [bool(s.get("objective_use_chosen_only", False)) for s in samples],
+                    dtype=torch.bool,
+                )
 
                 return {
                     "chosen_input_ids": chosen_input_ids,
@@ -911,6 +1371,9 @@ class DPO_KL(Experiment):
                     "chosen_response_mask": chosen_response_mask,
                     "rejected_response_mask": rejected_response_mask,
                     "index": index,
+                    "is_constraint": is_constraint,
+                    "is_objective": is_objective,
+                    "objective_use_chosen_only": objective_use_chosen_only,
                 }
 
         return Collator(pad_id)
@@ -935,6 +1398,8 @@ class DPO_KL(Experiment):
                 self._generated_eval_answers = False
                 self._generated_eval_keys = set()
                 self._index_to_preference_strength = None
+                self._index_to_is_constraint = None
+                self._index_to_is_objective = None
                 self.compute_metrics = self._compute_metrics
                 self._pbar_objective_sum = 0.0
                 self._pbar_slack_sum = 0.0
@@ -1071,6 +1536,30 @@ class DPO_KL(Experiment):
                 chosen_resp = inputs["chosen_response_mask"]
                 rejected_resp = inputs["rejected_response_mask"]
                 index = inputs["index"]
+                is_constraint = inputs.get("is_constraint")
+                is_objective = inputs.get("is_objective")
+                objective_use_chosen_only = inputs.get("objective_use_chosen_only")
+
+                if is_constraint is None:
+                    is_constraint = torch.ones_like(index, dtype=torch.bool)
+                if is_objective is None:
+                    is_objective = torch.ones_like(index, dtype=torch.bool)
+                if objective_use_chosen_only is None:
+                    objective_use_chosen_only = torch.zeros_like(index, dtype=torch.bool)
+
+                is_constraint = is_constraint.to(index.device).bool()
+                is_objective = is_objective.to(index.device).bool()
+                objective_use_chosen_only = objective_use_chosen_only.to(index.device).bool()
+
+                def _masked_mean(values: torch.Tensor | None, mask: torch.Tensor | None) -> torch.Tensor:
+                    if values is None:
+                        return torch.tensor(0.0, device=index.device, dtype=torch.float)
+                    if mask is None:
+                        return values.mean()
+                    if bool(mask.any()):
+                        return values[mask].mean()
+                    # Keep a valid grad path when no rows are active.
+                    return values.sum() * 0.0
 
                 B = chosen_ids.shape[0]
 
@@ -1114,12 +1603,14 @@ class DPO_KL(Experiment):
                         gap = logp_chosen - logp_rejected
                     score = beta_simpo * gap - gamma  # (B,)
                     # -log σ(score) == softplus(-score)
-                    loss = F.softplus(-score).mean()
+                    active_mask = is_constraint
+                    loss_vec = F.softplus(-score)
+                    loss = _masked_mean(loss_vec, active_mask)
                     if model.training:
                         slack_simpo = gamma - beta_simpo * gap
                         self._accumulate_pbar_means(
                             objective_mean=float(loss.detach().cpu().item()),
-                            slack_mean=float(slack_simpo.mean().detach().cpu().item()),
+                            slack_mean=float(_masked_mean(slack_simpo, active_mask).detach().cpu().item()),
                             loss_mean=float(loss.detach().cpu().item()),
                         )
                     if return_outputs:
@@ -1180,7 +1671,9 @@ class DPO_KL(Experiment):
                     # Standard DPO score:
                     #   beta * [ (logπ(y_w)-logπ(y_l)) - (logπ_ref(y_w)-logπ_ref(y_l)) ]
                     score = beta_dpo * rel_gap
-                    loss = F.softplus(-score).mean()
+                    active_mask = is_constraint
+                    loss_vec = F.softplus(-score)
+                    loss = _masked_mean(loss_vec, active_mask)
                     if model.training:
                         self._accumulate_pbar_means(
                             objective_mean=float(loss.detach().cpu().item()),
@@ -1198,15 +1691,17 @@ class DPO_KL(Experiment):
                 kl_chosen = kl_seq[:B]
                 kl_rejected = kl_seq[B:]
                 kl_mean = 0.5 * (kl_chosen + kl_rejected)  # (B,)
+                kl_objective = torch.where(objective_use_chosen_only, kl_chosen, kl_mean)
 
                 # Objective: minimize KL (matches `SAFETY`; no separate beta scaling)
-                loss = kl_mean
+                loss = torch.where(is_objective, kl_objective, kl_objective * 0.0)
 
                 slack = None
                 if needs_pairwise_slack:
                     gap = slack_gap
                     # Constraint slack: tol + logp(rejected) - logp(chosen) == tol - (logp_chosen - logp_rejected)
                     slack = cfg.tol - gap  # (B,)
+                    slack = torch.where(is_constraint, slack, slack * 0.0)
 
                 slack_win = None
                 slack_loose = None
@@ -1230,6 +1725,8 @@ class DPO_KL(Experiment):
                     )
                     slack_win = eps_win - slack_logp_chosen
                     slack_loose = slack_logp_rejected - eps_loose
+                    slack_win = torch.where(is_constraint, slack_win, slack_win * 0.0)
+                    slack_loose = torch.where(is_constraint, slack_loose, slack_loose * 0.0)
 
                 # Loss schemes (as in SAFETY)
                 if loss_type == "erm":
@@ -1240,40 +1737,48 @@ class DPO_KL(Experiment):
                         with torch.no_grad():
                             dual_avg = self.avg_dual.clone()
                             dual_avg = torch.clamp(
-                                dual_avg + cfg.dual_step_size * slack.mean(),
+                                dual_avg + cfg.dual_step_size * _masked_mean(slack, is_constraint),
                                 min=0.0,
                             )
                         self.avg_dual = dual_avg.detach()
                     loss = loss + self.avg_dual * slack
 
                 elif loss_type == "aug_dual":
-                    dual_var = self.dual_vars[index].clone()
-                    a = slack
-                    b = dual_var / (cfg.loss_alpha)
-                    z = 2 * a + b
-                    with torch.no_grad():
-                        dual_grad = torch.where(z > 0, a, -0.5 * b)
-                        if model.training:
-                            dual_var = dual_var + cfg.dual_step_size * dual_grad
-                            self.dual_vars[index] = dual_var.detach()
-                    loss = loss + cfg.loss_alpha / 4 * (torch.clamp(z, min=0.0) ** 2 - b**2)
-                    loss = loss.mean()
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
+                        dual_var = self.dual_vars[constrained_indexes].clone()
+                        a = slack[is_constraint]
+                        b = dual_var / (cfg.loss_alpha)
+                        z = 2 * a + b
+                        with torch.no_grad():
+                            dual_grad = torch.where(z > 0, a, -0.5 * b)
+                            if model.training:
+                                dual_var = dual_var + cfg.dual_step_size * dual_grad
+                                self.dual_vars[constrained_indexes] = dual_var.detach()
+                        aug_term = slack * 0.0
+                        aug_update = cfg.loss_alpha / 4 * (torch.clamp(z, min=0.0) ** 2 - b**2)
+                        aug_term[is_constraint] = aug_update.to(dtype=aug_term.dtype)
+                        loss = loss + aug_term
                 elif loss_type == "resilient":
-                    
-                    dual_var = self.dual_vars[index].clone()
-                    a = slack
-                    a_resilient = slack - dual_var / 2 * (cfg.resilient_coef)
-                    b = dual_var / (cfg.loss_alpha)
-                    coef = (cfg.resilient_coef) / (cfg.loss_alpha + cfg.resilient_coef)
-                    z = 2 * a + b
-                    with torch.no_grad():
-                        dual_grad = torch.where(z > 0, coef * a_resilient, -0.5 * b)
-                        if model.training:
-                            dual_var += cfg.dual_step_size * dual_grad
-                            self.dual_vars[index] = dual_var.detach()
-                    loss = loss + cfg.loss_alpha / 4 * (
-                        coef * torch.clamp(z, min=0.0) ** 2 - b**2
-                    )
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
+                        dual_var = self.dual_vars[constrained_indexes].clone()
+                        a = slack[is_constraint]
+                        a_resilient = a - dual_var / 2 * (cfg.resilient_coef)
+                        b = dual_var / (cfg.loss_alpha)
+                        coef = (cfg.resilient_coef) / (cfg.loss_alpha + cfg.resilient_coef)
+                        z = 2 * a + b
+                        with torch.no_grad():
+                            dual_grad = torch.where(z > 0, coef * a_resilient, -0.5 * b)
+                            if model.training:
+                                dual_var += cfg.dual_step_size * dual_grad
+                                self.dual_vars[constrained_indexes] = dual_var.detach()
+                        resilient_term = slack * 0.0
+                        resilient_update = cfg.loss_alpha / 4 * (
+                            coef * torch.clamp(z, min=0.0) ** 2 - b**2
+                        )
+                        resilient_term[is_constraint] = resilient_update.to(dtype=resilient_term.dtype)
+                        loss = loss + resilient_term
 
                 elif loss_type == "penalty":
                     loss = loss + cfg.loss_alpha * slack
@@ -1285,14 +1790,14 @@ class DPO_KL(Experiment):
                         if model.training:
                             dual_avg_win = self.avg_dual_win.clone()
                             dual_avg_win = torch.clamp(
-                                dual_avg_win + cfg.dual_step_size * slack_win.mean(),
+                                dual_avg_win + cfg.dual_step_size * _masked_mean(slack_win, is_constraint),
                                 min=0.0,
                             )
                             self.avg_dual_win = dual_avg_win.detach()
 
                             dual_avg_loose = self.avg_dual_loose.clone()
                             dual_avg_loose = torch.clamp(
-                                dual_avg_loose + cfg.dual_step_size * slack_loose.mean(),
+                                dual_avg_loose + cfg.dual_step_size * _masked_mean(slack_loose, is_constraint),
                                 min=0.0,
                             )
                             self.avg_dual_loose = dual_avg_loose.detach()
@@ -1309,27 +1814,37 @@ class DPO_KL(Experiment):
                     alpha_win = max(alpha_win, 1e-12)
                     alpha_loose = max(alpha_loose, 1e-12)
 
-                    dual_var_win = self.dual_vars_win[index].clone()
-                    a_win = slack_win
-                    b_win = dual_var_win / alpha_win
-                    z_win = 2 * a_win + b_win
-                    with torch.no_grad():
-                        dual_grad_win = torch.where(z_win > 0, a_win, -0.5 * b_win)
-                        if model.training:
-                            dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
-                            self.dual_vars_win[index] = dual_var_win.detach()
-                    loss = loss + alpha_win / 4 * (torch.clamp(z_win, min=0.0) ** 2 - b_win**2)
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
+                        dual_var_win = self.dual_vars_win[constrained_indexes].clone()
+                        a_win = slack_win[is_constraint]
+                        b_win = dual_var_win / alpha_win
+                        z_win = 2 * a_win + b_win
+                        with torch.no_grad():
+                            dual_grad_win = torch.where(z_win > 0, a_win, -0.5 * b_win)
+                            if model.training:
+                                dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
+                                self.dual_vars_win[constrained_indexes] = dual_var_win.detach()
+                        win_term = slack_win * 0.0
+                        win_update = alpha_win / 4 * (torch.clamp(z_win, min=0.0) ** 2 - b_win**2)
+                        win_term[is_constraint] = win_update.to(dtype=win_term.dtype)
+                        loss = loss + win_term
 
-                    dual_var_loose = self.dual_vars_loose[index].clone()
-                    a_loose = slack_loose
-                    b_loose = dual_var_loose / alpha_loose
-                    z_loose = 2 * a_loose + b_loose
-                    with torch.no_grad():
-                        dual_grad_loose = torch.where(z_loose > 0, a_loose, -0.5 * b_loose)
-                        if model.training:
-                            dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
-                            self.dual_vars_loose[index] = dual_var_loose.detach()
-                    loss = loss + alpha_loose / 4 * (torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2)
+                        dual_var_loose = self.dual_vars_loose[constrained_indexes].clone()
+                        a_loose = slack_loose[is_constraint]
+                        b_loose = dual_var_loose / alpha_loose
+                        z_loose = 2 * a_loose + b_loose
+                        with torch.no_grad():
+                            dual_grad_loose = torch.where(z_loose > 0, a_loose, -0.5 * b_loose)
+                            if model.training:
+                                dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
+                                self.dual_vars_loose[constrained_indexes] = dual_var_loose.detach()
+                        loose_term = slack_loose * 0.0
+                        loose_update = alpha_loose / 4 * (
+                            torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2
+                        )
+                        loose_term[is_constraint] = loose_update.to(dtype=loose_term.dtype)
+                        loss = loss + loose_term
 
                 elif loss_type in three_aug_aliases:
                     alpha_gap = float(getattr(cfg, "loss_alpha_gap", getattr(cfg, "loss_alpha", 1.0)))
@@ -1341,40 +1856,52 @@ class DPO_KL(Experiment):
                     alpha_win = max(alpha_win, 1e-12)
                     alpha_loose = max(alpha_loose, 1e-12)
 
-                    dual_var_gap = self.dual_vars_three_gap[index].clone()
-                    a_gap = slack
-                    b_gap = dual_var_gap / alpha_gap
-                    z_gap = 2 * a_gap + b_gap
-                    with torch.no_grad():
-                        dual_grad_gap = torch.where(z_gap > 0, a_gap, -0.5 * b_gap)
-                        if model.training:
-                            dual_var_gap = dual_var_gap + cfg.dual_step_size * dual_grad_gap
-                            self.dual_vars_three_gap[index] = dual_var_gap.detach()
-                    loss = loss + alpha_gap / 4 * (torch.clamp(z_gap, min=0.0) ** 2 - b_gap**2)
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
 
-                    dual_var_win = self.dual_vars_three_win[index].clone()
-                    a_win = slack_win
-                    b_win = dual_var_win / alpha_win
-                    z_win = 2 * a_win + b_win
-                    with torch.no_grad():
-                        dual_grad_win = torch.where(z_win > 0, a_win, -0.5 * b_win)
-                        if model.training:
-                            dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
-                            self.dual_vars_three_win[index] = dual_var_win.detach()
-                    loss = loss + alpha_win / 4 * (torch.clamp(z_win, min=0.0) ** 2 - b_win**2)
+                        dual_var_gap = self.dual_vars_three_gap[constrained_indexes].clone()
+                        a_gap = slack[is_constraint]
+                        b_gap = dual_var_gap / alpha_gap
+                        z_gap = 2 * a_gap + b_gap
+                        with torch.no_grad():
+                            dual_grad_gap = torch.where(z_gap > 0, a_gap, -0.5 * b_gap)
+                            if model.training:
+                                dual_var_gap = dual_var_gap + cfg.dual_step_size * dual_grad_gap
+                                self.dual_vars_three_gap[constrained_indexes] = dual_var_gap.detach()
+                        gap_term = slack * 0.0
+                        gap_update = alpha_gap / 4 * (torch.clamp(z_gap, min=0.0) ** 2 - b_gap**2)
+                        gap_term[is_constraint] = gap_update.to(dtype=gap_term.dtype)
+                        loss = loss + gap_term
 
-                    dual_var_loose = self.dual_vars_three_loose[index].clone()
-                    a_loose = slack_loose
-                    b_loose = dual_var_loose / alpha_loose
-                    z_loose = 2 * a_loose + b_loose
-                    with torch.no_grad():
-                        dual_grad_loose = torch.where(z_loose > 0, a_loose, -0.5 * b_loose)
-                        if model.training:
-                            dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
-                            self.dual_vars_three_loose[index] = dual_var_loose.detach()
-                    loss = loss + alpha_loose / 4 * (
-                        torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2
-                    )
+                        dual_var_win = self.dual_vars_three_win[constrained_indexes].clone()
+                        a_win = slack_win[is_constraint]
+                        b_win = dual_var_win / alpha_win
+                        z_win = 2 * a_win + b_win
+                        with torch.no_grad():
+                            dual_grad_win = torch.where(z_win > 0, a_win, -0.5 * b_win)
+                            if model.training:
+                                dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
+                                self.dual_vars_three_win[constrained_indexes] = dual_var_win.detach()
+                        win_term = slack_win * 0.0
+                        win_update = alpha_win / 4 * (torch.clamp(z_win, min=0.0) ** 2 - b_win**2)
+                        win_term[is_constraint] = win_update.to(dtype=win_term.dtype)
+                        loss = loss + win_term
+
+                        dual_var_loose = self.dual_vars_three_loose[constrained_indexes].clone()
+                        a_loose = slack_loose[is_constraint]
+                        b_loose = dual_var_loose / alpha_loose
+                        z_loose = 2 * a_loose + b_loose
+                        with torch.no_grad():
+                            dual_grad_loose = torch.where(z_loose > 0, a_loose, -0.5 * b_loose)
+                            if model.training:
+                                dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
+                                self.dual_vars_three_loose[constrained_indexes] = dual_var_loose.detach()
+                        loose_term = slack_loose * 0.0
+                        loose_update = alpha_loose / 4 * (
+                            torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2
+                        )
+                        loose_term[is_constraint] = loose_update.to(dtype=loose_term.dtype)
+                        loss = loss + loose_term
 
                 elif loss_type in both_penalty_aliases:
                     alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
@@ -1386,13 +1913,22 @@ class DPO_KL(Experiment):
 
                 loss = loss.mean()
                 if model.training:
-                    objective_mean = float(kl_mean.mean().detach().cpu().item())
+                    objective_mean = float(_masked_mean(kl_objective, is_objective).detach().cpu().item())
                     slack_mean = None
                     if slack is not None:
-                        slack_mean = float(slack.mean().detach().cpu().item())
+                        slack_mean = float(_masked_mean(slack, is_constraint).detach().cpu().item())
                     elif slack_win is not None and slack_loose is not None:
                         slack_mean = float(
-                            (0.5 * (slack_win.mean() + slack_loose.mean())).detach().cpu().item()
+                            (
+                                0.5
+                                * (
+                                    _masked_mean(slack_win, is_constraint)
+                                    + _masked_mean(slack_loose, is_constraint)
+                                )
+                            )
+                            .detach()
+                            .cpu()
+                            .item()
                         )
                     self._accumulate_pbar_means(
                         objective_mean=objective_mean,
@@ -1404,7 +1940,7 @@ class DPO_KL(Experiment):
                     # Return compact predictions for metrics: [logp_chosen, logp_rejected, third]
                     # third = KL mean for KL-based methods; score for SimPO/DPO
                     # Use raw policy log-probs here so eval slacks are not reference-normalized.
-                    packed = torch.stack([logp_chosen, logp_rejected, kl_mean], dim=-1)
+                    packed = torch.stack([logp_chosen, logp_rejected, kl_objective], dim=-1)
                     return loss, {"logits": packed}
                 return loss
 
@@ -1467,6 +2003,39 @@ class DPO_KL(Experiment):
                             preference_strength_values = np.asarray(mapped_strengths, dtype=np.int64)
                     except Exception:
                         preference_strength_values = None
+
+                constraint_mask = np.ones_like(indexes, dtype=bool)
+                objective_mask = np.ones_like(indexes, dtype=bool)
+                if self.complete_ds is not None and hasattr(self.complete_ds, "column_names"):
+                    try:
+                        if "is_constraint" in self.complete_ds.column_names:
+                            if self._index_to_is_constraint is None:
+                                full_indexes = np.asarray(self.complete_ds["index"], dtype=np.int64)
+                                full_values = np.asarray(self.complete_ds["is_constraint"], dtype=bool)
+                                self._index_to_is_constraint = {
+                                    int(i): bool(v)
+                                    for i, v in zip(full_indexes.tolist(), full_values.tolist())
+                                }
+                            mapped = [self._index_to_is_constraint.get(int(idx)) for idx in indexes.tolist()]
+                            if all(v is not None for v in mapped):
+                                constraint_mask = np.asarray(mapped, dtype=bool)
+                        if "is_objective" in self.complete_ds.column_names:
+                            if self._index_to_is_objective is None:
+                                full_indexes = np.asarray(self.complete_ds["index"], dtype=np.int64)
+                                full_values = np.asarray(self.complete_ds["is_objective"], dtype=bool)
+                                self._index_to_is_objective = {
+                                    int(i): bool(v)
+                                    for i, v in zip(full_indexes.tolist(), full_values.tolist())
+                                }
+                            mapped = [self._index_to_is_objective.get(int(idx)) for idx in indexes.tolist()]
+                            if all(v is not None for v in mapped):
+                                objective_mask = np.asarray(mapped, dtype=bool)
+                    except Exception:
+                        constraint_mask = np.ones_like(indexes, dtype=bool)
+                        objective_mask = np.ones_like(indexes, dtype=bool)
+
+                constraint_indexes = indexes[constraint_mask]
+                objective_indexes = indexes[objective_mask]
                 eps_win = float(
                     getattr(
                         exp_cfg,
@@ -1489,16 +2058,38 @@ class DPO_KL(Experiment):
                 if indexes.shape[0] != constraint_values.shape[0]:
                     # Fallback for unexpected prediction/label packing mismatch.
                     indexes = np.arange(constraint_values.shape[0], dtype=np.int64)
+                    constraint_mask = np.ones_like(indexes, dtype=bool)
+                    objective_mask = np.ones_like(indexes, dtype=bool)
+                    constraint_indexes = indexes
+                    objective_indexes = indexes
+
+                constraint_values = constraint_values[constraint_mask]
+                slack_win_values = slack_win_values[constraint_mask]
+                slack_loose_values = slack_loose_values[constraint_mask]
+                gap_constraint = gap[constraint_mask]
+                gap_positive_count = int(np.sum(gap_constraint > 0.0)) if gap_constraint.size > 0 else 0
+                gap_positive_rate = float(np.mean(gap_constraint > 0.0)) if gap_constraint.size > 0 else 0.0
+                objective_values = arr[:, 2]
+                objective_values = objective_values[objective_mask]
 
                 # Store full-eval tensors for shared eval callbacks (eval/train prefixes).
                 self._last_constraint_slacks = torch.tensor(constraint_values, dtype=torch.float).detach().cpu()
-                self._last_constraint_indexes = torch.tensor(indexes, dtype=torch.long).detach().cpu()
+                self._last_constraint_indexes = torch.tensor(constraint_indexes, dtype=torch.long).detach().cpu()
                 self._last_constraint_slacks_win = torch.tensor(slack_win_values, dtype=torch.float).detach().cpu()
                 self._last_constraint_slacks_loose = torch.tensor(slack_loose_values, dtype=torch.float).detach().cpu()
-                self._last_objective_ratios = torch.tensor(gap, dtype=torch.float).detach().cpu()
-                self._last_objective_indexes = torch.tensor(indexes, dtype=torch.long).detach().cpu()
+                self._last_objective_ratios = torch.tensor(objective_values, dtype=torch.float).detach().cpu()
+                self._last_objective_indexes = torch.tensor(objective_indexes, dtype=torch.long).detach().cpu()
 
                 def _slack_stats(values_np: np.ndarray) -> Dict[str, float]:
+                    if values_np.size == 0:
+                        return {
+                            "mean": 0.0,
+                            "min": 0.0,
+                            "max": 0.0,
+                            "q90": 0.0,
+                            "q99": 0.0,
+                            "cvar": 0.0,
+                        }
                     mean_v = float(np.mean(values_np))
                     min_v = float(np.min(values_np))
                     max_v = float(np.max(values_np))
@@ -1520,9 +2111,11 @@ class DPO_KL(Experiment):
                 loose_stats = _slack_stats(slack_loose_values)
 
                 out = {
-                    "logp_gap": float(np.mean(gap)),
+                    "logp_gap": float(np.mean(gap_constraint)) if gap_constraint.size > 0 else 0.0,
                     "gap_positive_count": gap_positive_count,
                     "gap_positive_rate": gap_positive_rate,
+                    "objective_count": int(objective_mask.sum()),
+                    "constraint_count": int(constraint_mask.sum()),
                     "constraint_mean": constraint_stats["mean"],
                     "constraint_min": constraint_stats["min"],
                     "constraint_max": constraint_stats["max"],
@@ -1557,6 +2150,15 @@ class DPO_KL(Experiment):
                         and "index" in self.train_dataset.column_names
                     ):
                         train_indexes = list(self.train_dataset["index"])
+                        if "is_constraint" in self.train_dataset.column_names:
+                            train_constraints = [
+                                bool(v) for v in list(self.train_dataset["is_constraint"])
+                            ]
+                            train_indexes = [
+                                int(idx)
+                                for idx, is_c in zip(train_indexes, train_constraints)
+                                if bool(is_c)
+                            ]
                     else:
                         train_indexes = (
                             list(range(len(self.train_dataset)))
@@ -1677,20 +2279,27 @@ class DPO_KL(Experiment):
 
                         if wandb.run is not None:
                             epoch = self.state.epoch
-                            if preference_strength_values is not None:
+                            constraint_strength_values = None
+                            if (
+                                preference_strength_values is not None
+                                and preference_strength_values.shape[0] == constraint_mask.shape[0]
+                            ):
+                                constraint_strength_values = preference_strength_values[constraint_mask]
+
+                            if constraint_strength_values is not None:
                                 table = wandb.Table(columns=["constraint_slack", "preference_strength"])
                                 table_win = wandb.Table(columns=["slack_win", "preference_strength"])
                                 table_loose = wandb.Table(columns=["slack_loose", "preference_strength"])
                                 for s, strength in zip(
-                                    constraint_values.tolist(), preference_strength_values.tolist()
+                                    constraint_values.tolist(), constraint_strength_values.tolist()
                                 ):
                                     table.add_data(s, int(strength))
                                 for s, strength in zip(
-                                    slack_win_values.tolist(), preference_strength_values.tolist()
+                                    slack_win_values.tolist(), constraint_strength_values.tolist()
                                 ):
                                     table_win.add_data(s, int(strength))
                                 for s, strength in zip(
-                                    slack_loose_values.tolist(), preference_strength_values.tolist()
+                                    slack_loose_values.tolist(), constraint_strength_values.tolist()
                                 ):
                                     table_loose.add_data(s, int(strength))
                             else:
@@ -1881,22 +2490,33 @@ class DPO_KL(Experiment):
                 if loss_type == "simpo":
                     # third column is the SimPO score used inside logsigmoid
                     score = arr[:, 2]
+                    if constraint_mask.any():
+                        score = score[constraint_mask]
                     # logsigmoid(score) = -softplus(-score) = -logaddexp(0, -score)
-                    out["objective_simpo_logsigmoid"] = float(np.mean(-np.logaddexp(0.0, -score)))
+                    out["objective_simpo_logsigmoid"] = (
+                        float(np.mean(-np.logaddexp(0.0, -score))) if score.size > 0 else 0.0
+                    )
                     # softplus(-score) = logaddexp(0, -score)
-                    out["objective_simpo_loss"] = float(np.mean(np.logaddexp(0.0, -score)))
-                    out["simpo_margin_sat_rate"] = float(np.mean(score >= 0.0))
+                    out["objective_simpo_loss"] = (
+                        float(np.mean(np.logaddexp(0.0, -score))) if score.size > 0 else 0.0
+                    )
+                    out["simpo_margin_sat_rate"] = float(np.mean(score >= 0.0)) if score.size > 0 else 0.0
                 elif loss_type == "dpo":
                     # third column is the DPO score used inside logsigmoid
                     score = arr[:, 2]
+                    if constraint_mask.any():
+                        score = score[constraint_mask]
                     # logsigmoid(score) = -softplus(-score) = -logaddexp(0, -score)
-                    out["objective_dpo_logsigmoid"] = float(np.mean(-np.logaddexp(0.0, -score)))
+                    out["objective_dpo_logsigmoid"] = (
+                        float(np.mean(-np.logaddexp(0.0, -score))) if score.size > 0 else 0.0
+                    )
                     # softplus(-score) = logaddexp(0, -score)
-                    out["objective_dpo_loss"] = float(np.mean(np.logaddexp(0.0, -score)))
-                    out["dpo_pref_sat_rate"] = float(np.mean(score >= 0.0))
+                    out["objective_dpo_loss"] = (
+                        float(np.mean(np.logaddexp(0.0, -score))) if score.size > 0 else 0.0
+                    )
+                    out["dpo_pref_sat_rate"] = float(np.mean(score >= 0.0)) if score.size > 0 else 0.0
                 else:
-                    kl_mean = arr[:, 2]
-                    out["objective_kl"] = float(np.mean(kl_mean))
+                    out["objective_kl"] = float(np.mean(objective_values)) if objective_values.size > 0 else 0.0
 
                 return out
 
