@@ -655,7 +655,7 @@ class DPO_KL(Experiment):
         sanity_check = bool(getattr(cfg.train, "sanity_check", False))
         do_shuffle = bool(getattr(cfg.train, "shuffle", True))
 
-        dataset_name = str(getattr(cfg.train, "dataset", "orca")).lower()
+        dataset_name = str(getattr(cfg.train, "dataset", "orca")).strip().lower()
         print(f"[dpo_kl] Dataset name: {dataset_name}")
         helpsteer_pref_aliases = {
             "helpsteer2",
@@ -693,13 +693,23 @@ class DPO_KL(Experiment):
         is_when2call_refusal = dataset_name in when2call_refusal_aliases
         is_when2call_toolcall = dataset_name in when2call_toolcall_aliases
         is_mixed_apigen_when2call = dataset_name in mixed_apigen_when2call_aliases
-        use_xlam_prompt_format = bool(getattr(cfg.train, "use_xlam_prompt_format", False)) or self._is_xlam_model(cfg)
+        is_xlam_model = self._is_xlam_model(cfg)
+        use_xlam_prompt_format = bool(getattr(cfg.train, "use_xlam_prompt_format", False)) or is_xlam_model
         is_when2call_variant = (
             is_when2call_pref
             or is_when2call_request
             or is_when2call_refusal
             or is_when2call_toolcall
         )
+        force_original_when2call_xlam = (
+            dataset_name == "when2call"
+            and is_xlam_model
+        )
+        if force_original_when2call_xlam:
+            print(
+                "[dpo_kl] Using original nvidia/When2Call train_pref split with xLAM formatting "
+                "(no APIGen mixed objective data)."
+            )
 
         if is_mixed_apigen_when2call:
             tok_source = getattr(self, "_resolved_model_source", cfg.exp.model_name)
@@ -1003,6 +1013,11 @@ class DPO_KL(Experiment):
                 dataset_repo = "ihounie/when2call_imbalanced_refusal"
             elif is_when2call_toolcall:
                 dataset_repo = "ihounie/when2call_imbalanced_toolcall"
+            elif force_original_when2call_xlam:
+                # Explicit safeguard for xLAM runs with `dataset=when2call`:
+                # keep the pure NVIDIA preference split, never APIGen-mixed data.
+                dataset_repo = "nvidia/When2Call"
+                data_dir = "train_pref"
 
             try:
                 ds = load_dataset(
