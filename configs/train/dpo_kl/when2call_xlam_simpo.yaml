@@ -34,7 +34,7 @@ train:
   constraint_data_proportion: 1.0
   max_prompt_length: 1024
   max_length: 2048
-  filter_shortest_train: 0.2
+  filter_shortest_train: 1.0
 
   # Train-end generation: sample validation prompts
   max_gen: 0
