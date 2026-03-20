@@ -72,8 +72,8 @@ exp:
   # Loss/optimizer hyperparams
   loss_type: aug_dual_both
   loss_alpha: 1.0
-  loss_alpha_win: 1.0
-  loss_alpha_loose: 1.0
-  dual_step_size: 0.5
+  loss_alpha_win: 10.0
+  loss_alpha_loose: 10.0
+  dual_step_size: 1.0
   tol_win: -3.0
   tol_loose: -10.0
