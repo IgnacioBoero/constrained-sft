@@ -72,3 +72,6 @@ exp:
   # Loss/optimizer hyperparams
   loss_type: penalty_both
   loss_alpha: 1.0
+  dual_step_size: 0.0
+  tol_win: 0.0
+  tol_loose: -0.0
