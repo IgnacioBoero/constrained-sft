@@ -9,7 +9,7 @@ hydra:
       exp.loss_tol: 1
       train.dropout: 0.05
       exp.model_name: answerdotai/ModernBERT-base
-      exp.resilient_coef: 10.0,100.0,50.0,200.0,25.0
+      exp.resilient_coef: 2.5,5.0
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
