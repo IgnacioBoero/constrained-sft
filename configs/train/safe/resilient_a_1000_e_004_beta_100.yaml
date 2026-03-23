@@ -10,7 +10,7 @@ hydra:
       exp.tol: -0.04
       exp.tol2: -2.0
       exp.dual_step_size: 1.0
-      exp.resilient_coef: 1.0
+      exp.resilient_coef: 100.0
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -70,5 +70,5 @@ exp:
   tol: -0.04
   tol2: -2.0
   loss_alpha: 10.0  
-  dual_step_size: 0.1
-  resilient_coef: 1.0
+  dual_step_size: 1.0
+  resilient_coef: 100.0
