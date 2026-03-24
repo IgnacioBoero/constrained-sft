@@ -1,0 +1,93 @@
+# @package _global_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: resilient_both
+      exp.resilient_coef: 1.5
+
+
+train:
+  seed: 42
+  split_seed: 42
+  output_dir: "./outputs/dpo_kl/${train.dataset}/${exp.loss_type}/tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  do_train: true
+  do_initial_eval: false
+  use_wandb: true
+  save_model: true
+  push_adapters_to_wandb: true
+  wandb_project: "when2call"
+  wandb_entity: "alelab"
+  run_name: "dpo_kl-${train.dataset}-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  eval_at_end: true
+  eval_on_train: true
+
+  # Dataset / preprocessing
+  cache_dir: "./cache"
+  dataset: when2call
+  when2call_strict_prompt: true
+  val_fraction: 0.05
+  shuffle: true
+  sanity_check: false
+  data_proportion: 1.0
+  max_prompt_length: 1024
+  max_length: 2048
+  filter_shortest_train: 1.0
+
+  # Train-end generation: sample validation prompts
+  max_gen: 0
+  post_train_when2call_lm_eval:
+    enabled: false
+    backend: "vllm"
+    task_name: "when2call-llama3_2"
+    batch_size: "1"
+    use_cache: true
+    local_output_dir: "outputs/when2call_lm_eval_vllm"
+    tensor_parallel_size: -1
+    dtype: "bfloat16"
+    merge_dtype: "bfloat16"
+    gpu_memory_utilization: 0.8
+    max_length: 4096
+    trust_remote_code: false
+
+  lora:
+    r: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+
+  hf_args:
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 32
+    eval_accumulation_steps: 4
+    num_train_epochs: 10
+    learning_rate: 5e-5
+    lr_scheduler_type: "cosine"
+    warmup_ratio: 0.0
+    weight_decay: 0.0
+    eval_strategy: "no"
+    save_strategy: "no"
+    gradient_checkpointing: false
+    eval_do_concat_batches: false
+    bf16: true
+    fp16: false
+
+exp:
+  name: "dpo_kl"
+  model_name: "meta-llama/Llama-3.2-1B-Instruct"
+  use_pretrained_slacks: false
+
+  # Constraint settings
+  tol: 2.0
+
+  # Loss/optimizer hyperparams
+  loss_type: resilient_both
+  loss_alpha: 10.0
+  loss_alpha_win: 10.0
+  loss_alpha_loose: 10.0
+  dual_step_size: 1.0
+  tol_win: -2.0
+  tol_loose: -20.0
+  resilient_coef: 1.0
