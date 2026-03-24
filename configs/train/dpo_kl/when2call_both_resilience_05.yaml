@@ -6,7 +6,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: resilient_both
-      exp.resilient_coef: 10.0
+      exp.resilient_coef: 0.5
 
 
 train:
@@ -90,4 +90,4 @@ exp:
   dual_step_size: 1.0
   tol_win: -2.0
   tol_loose: -20.0
-  resilient_coef: 10.0
+  resilient_coef: 1.0
