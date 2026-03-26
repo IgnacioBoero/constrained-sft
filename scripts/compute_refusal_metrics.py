@@ -27,7 +27,7 @@ import wandb
 
 ENTITY_DEFAULT = "alelab"
 PROJECT_DEFAULT = "SAFE-long1k"
-TAG_DEFAULT = "sample"
+TAG_DEFAULT = "resilient"
 TABLE_PREFIX = "safe_generate_train_end_outputs_epoch_"
 
 

@@ -2,12 +2,12 @@
 
 wandb:
   entity: "alelab"
-  project: "dpo_kl"
-  run_id: "694jyduz" # "ppocpwoy" # null #"83q43pt7" #"bqp0t0qs"
+  project: "SAFE-long1k"
+  run_id: null # "e94c1vbx" #"cskgxlr5" # "694jyduz" # "ppocpwoy" # null #"83q43pt7" #"bqp0t0qs"
 
 model:
   # Optional override. If null, inferred from run config (`exp.model_name`).
-  base_model: "meta-llama/Llama-3.1-8B"
+  base_model: null #"princeton-nlp/Mistral-7B-Base-SFT-SimPO" # "meta-llama/Llama-3.1-8B"
 
 eval:
   dataset_path: "src/datasets/safety/evaluation/alpaca_eval.json"
@@ -23,7 +23,7 @@ vllm:
   tensor_parallel_size: -1
   dtype: "bfloat16"
   merge_dtype: "bfloat16"
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.6
   max_model_len: null
   trust_remote_code: false
   enforce_eager: false

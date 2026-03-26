@@ -246,11 +246,37 @@ def _auto_tensor_parallel_size(requested: int) -> int:
     return n
 
 
+def _is_mistral_family_model(model_name: str) -> bool:
+    """Best-effort check for Mistral-family tokenizer quirks."""
+    return "mistral" in (model_name or "").lower()
+
+
+def _load_tokenizer(
+    model_ref: str,
+    *,
+    mistral_hint: Optional[str] = None,
+) -> AutoTokenizer:
+    """
+    Load tokenizer and enable Mistral regex fix when relevant.
+
+    Some Mistral tokenizers require `fix_mistral_regex=True` to avoid
+    incorrect tokenization in newer transformers versions.
+    """
+    kwargs: Dict[str, Any] = {"use_fast": True}
+    if _is_mistral_family_model(mistral_hint or model_ref):
+        kwargs["fix_mistral_regex"] = True
+
+    try:
+        return AutoTokenizer.from_pretrained(model_ref, **kwargs)
+    except TypeError:
+        # Backward compatibility for transformers versions that do not
+        # recognize this argument.
+        kwargs.pop("fix_mistral_regex", None)
+        return AutoTokenizer.from_pretrained(model_ref, **kwargs)
+
+
 def _get_default_chat_template() -> str:
-    fallback_tok = AutoTokenizer.from_pretrained(
-        DEFAULT_CHAT_TEMPLATE_MODEL,
-        use_fast=True,
-    )
+    fallback_tok = _load_tokenizer(DEFAULT_CHAT_TEMPLATE_MODEL)
     template = getattr(fallback_tok, "chat_template", None)
     if not template:
         raise ValueError(
@@ -280,7 +306,7 @@ def _merge_lora_to_local_model(
     skip_chat_template: bool = False,
 ) -> AutoTokenizer:
     merged_dir.mkdir(parents=True, exist_ok=True)
-    tok = AutoTokenizer.from_pretrained(base_model, use_fast=True)
+    tok = _load_tokenizer(base_model, mistral_hint=base_model)
     if not skip_chat_template:
         tok = _ensure_chat_template(tok)
     if tok.pad_token is None:
@@ -305,7 +331,7 @@ def _merge_lora_to_local_model(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    merged_tok = AutoTokenizer.from_pretrained(str(merged_dir), use_fast=True)
+    merged_tok = _load_tokenizer(str(merged_dir), mistral_hint=base_model)
     if not skip_chat_template:
         merged_tok = _ensure_chat_template(merged_tok)
     return merged_tok
@@ -372,7 +398,7 @@ def main(cfg: DictConfig) -> None:
             model_ref = str(merged_dir)
             generator_name = "wandb_lora_merged_vllm"
         else:
-            tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
+            tokenizer = _load_tokenizer(base_model, mistral_hint=base_model)
             if not use_safety_format:
                 tokenizer = _ensure_chat_template(tokenizer)
             if tokenizer.pad_token is None:

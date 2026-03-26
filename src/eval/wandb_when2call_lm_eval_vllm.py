@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import tempfile
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -150,12 +151,139 @@ def _download_text_with_fallback(urls: list[str]) -> str:
     raise RuntimeError(f"Failed to download from all candidate URLs: {urls}") from last_err
 
 
+def _is_xlam_model_name(model_name: str) -> bool:
+    lowered = str(model_name).lower()
+    return ("salesforce/xlam" in lowered) or ("salesforce/llama-xlam" in lowered)
+
+
+def _resolve_when2call_task_name(requested_task_name: str, base_model: str) -> str:
+    requested = str(requested_task_name).strip()
+    requested_lower = requested.lower()
+    if requested_lower in {"auto", "when2call-auto"}:
+        return "when2call-xlam" if _is_xlam_model_name(base_model) else "when2call-llama3_2"
+    if _is_xlam_model_name(base_model) and requested_lower == "when2call-llama3_2":
+        print(
+            "[when2call-lm-eval] Detected xLAM base model; "
+            "switching task to when2call-xlam for xLAM-compatible formatting."
+        )
+        return "when2call-xlam"
+    return requested
+
+
+def _xlam_when2call_utils_snippet() -> str:
+    return textwrap.dedent(
+        """
+        def process_docs_xlam2(dataset: Dataset) -> Dataset:
+            system_message = "You are a helpful assistant that can use tools. You are developed by Salesforce xLAM team."
+            tool_instruction = (
+                "You have access to a set of tools. When using tools, make calls in a single JSON array: \\n\\n"
+                '[{"name": "tool_call_name", "arguments": {"arg1": "value1", "arg2": "value2"}}, ... (additional parallel tool calls as needed)]\\n\\n'
+                "If no tool is suitable, state that explicitly. If the user's input lacks required parameters, ask for clarification. "
+                "Do not interpret or respond until tool results are returned. Once they are available, process them or make additional calls if needed. "
+                "For tasks that don't require tools, such as casual conversation or general advice, respond directly in plain text. The available tools are:"
+            )
+
+            def _format_tool_call(tool_call_answer: str) -> str:
+                try:
+                    parsed = json.loads(tool_call_answer)
+                except Exception:
+                    return tool_call_answer
+
+                if isinstance(parsed, dict) and isinstance(parsed.get("tool_calls"), list):
+                    calls = parsed["tool_calls"]
+                elif isinstance(parsed, list):
+                    calls = parsed
+                elif isinstance(parsed, dict):
+                    if isinstance(parsed.get("function"), dict):
+                        parsed = parsed["function"]
+                    name = str(parsed.get("name") or "").strip()
+                    arguments = parsed.get("arguments", parsed.get("parameters", {}))
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except Exception:
+                            arguments = {}
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    calls = [{"name": name, "arguments": arguments}] if name else []
+                else:
+                    calls = []
+                return json.dumps(calls, ensure_ascii=False)
+
+            def _build_prompt(item: dict) -> str:
+                parsed_tools = []
+                for tool in item.get("tools", []):
+                    if isinstance(tool, str):
+                        try:
+                            parsed_tools.append(json.loads(tool))
+                        except Exception:
+                            continue
+                    elif isinstance(tool, dict):
+                        parsed_tools.append(tool)
+
+                prompt = "<|im_start|>system\\n"
+                prompt += system_message + "\\n"
+                prompt += tool_instruction + "\\n\\n"
+                for tool in parsed_tools:
+                    prompt += json.dumps(tool, indent=4, ensure_ascii=False) + "\\n\\n"
+                prompt += "<|im_end|>"
+                prompt += "<|im_start|>user\\n"
+                prompt += str(item.get("question") or "")
+                prompt += "<|im_end|>"
+                prompt += "<|im_start|>assistant\\n"
+                return prompt
+
+            def _make_mc_list(item: dict) -> dict:
+                choices, target_index = get_choices_and_index(item, format_tool_call=_format_tool_call)
+                item["choices"] = choices
+                item["target_index"] = target_index
+                item["prompt"] = _build_prompt(item)
+                return item
+
+            return dataset.map(_make_mc_list)
+        """
+    ).strip() + "\n"
+
+
+def _xlam_when2call_yaml(task_name: str) -> str:
+    return textwrap.dedent(
+        f"""
+        task: {task_name}
+        dataset_path: json
+        dataset_name: null
+        dataset_kwargs:
+          data_files: lm_eval/tasks/when2call/when2call_test_mcq.jsonl
+        training_split: null
+        validation_split: null
+        test_split: train
+        fewshot_split: null
+        process_docs: !function utils.process_docs_xlam2
+        doc_to_text: prompt
+        doc_to_target: target_index
+        doc_to_choice: choices
+        target_delimiter: ""
+        output_type: multiple_choice
+        metric_list:
+          - metric: macro_f1
+            aggregation: macro_f1
+            higher_is_better: true
+          - metric: acc
+            aggregation: mean
+            higher_is_better: true
+          - metric: acc_norm
+            aggregation: mean
+            higher_is_better: true
+        """
+    ).strip() + "\n"
+
+
 def _prepare_official_when2call_task_layout(root: Path) -> Path:
     """
     Build:
-      <root>/lm_eval/tasks/when2call/{when2call-llama3_2.yaml,utils.py,when2call_test_mcq.jsonl}
-    so official YAML `data_files: lm_eval/tasks/when2call/when2call_test_mcq.jsonl`
-    resolves unchanged.
+      <root>/lm_eval/tasks/when2call/
+        - official when2call-llama3_2.yaml + utils.py + test jsonl
+        - local when2call-xlam.yaml task variant with xLAM formatting
+    so YAML `data_files: lm_eval/tasks/when2call/when2call_test_mcq.jsonl` resolves unchanged.
     """
     task_dir = root / "lm_eval" / "tasks" / "when2call"
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -176,6 +304,21 @@ def _prepare_official_when2call_task_layout(root: Path) -> Path:
     }
     for filename, urls in files.items():
         (task_dir / filename).write_text(_download_text_with_fallback(urls), encoding="utf-8")
+
+    # Extend official utils with an xLAM2-style process_docs function.
+    utils_path = task_dir / "utils.py"
+    utils_text = utils_path.read_text(encoding="utf-8")
+    if "def process_docs_xlam2(" not in utils_text:
+        utils_path.write_text(
+            utils_text.rstrip() + "\n\n\n" + _xlam_when2call_utils_snippet(),
+            encoding="utf-8",
+        )
+
+    # Add xLAM task YAML variant.
+    (task_dir / "when2call-xlam.yaml").write_text(
+        _xlam_when2call_yaml("when2call-xlam"),
+        encoding="utf-8",
+    )
 
     return task_dir
 
@@ -206,6 +349,7 @@ def _build_hf_model_args(cfg: DictConfig, model_ref: str) -> str:
 def _run_lm_eval_command(
     cfg: DictConfig,
     *,
+    task_name: str,
     working_dir: Path,
     include_path: Path,
     output_path: Path,
@@ -228,7 +372,7 @@ def _run_lm_eval_command(
             "--model_args",
             backend_model_args,
             "--tasks",
-            str(cfg.lm_eval.task_name),
+            str(task_name),
             "--batch_size",
             str(batch_size_value),
             "--num_fewshot",
@@ -463,6 +607,11 @@ def main(cfg: DictConfig) -> None:
     api = wandb.Api()
     source_run = api.run(source_run_path)
     base_model = _pick_base_model(run_obj=source_run, override=base_model_override)
+    requested_task_name = str(cfg.lm_eval.task_name)
+    resolved_task_name = _resolve_when2call_task_name(
+        requested_task_name=requested_task_name,
+        base_model=base_model,
+    )
     artifact = _pick_lora_artifact_for_run(source_run)
 
     # Attach to the exact same run so metrics/artifacts are added to training run.
@@ -507,6 +656,7 @@ def main(cfg: DictConfig) -> None:
         model_args = _build_model_args(cfg, model_ref=str(merged_dir), tp_size=tp_size)
         cmd_result = _run_lm_eval_command(
             cfg,
+            task_name=resolved_task_name,
             working_dir=tmp_root,
             include_path=include_path,
             output_path=run_out_dir,
@@ -521,7 +671,7 @@ def main(cfg: DictConfig) -> None:
 
         results_path = _find_primary_results_json(run_out_dir)
         results_obj = json.loads(results_path.read_text(encoding="utf-8"))
-        metrics = _extract_task_metrics(results_obj, task_name=str(cfg.lm_eval.task_name))
+        metrics = _extract_task_metrics(results_obj, task_name=resolved_task_name)
         additional_metrics = compute_additional_metrics(run_out_dir)
         additional_metrics_json_path = run_out_dir / "when2call_additional_metrics.json"
         additional_metrics_json_path.write_text(
@@ -533,7 +683,8 @@ def main(cfg: DictConfig) -> None:
             "when2call_lm_eval_vllm/mode": "lora_merged",
             "when2call_lm_eval_vllm/base_model": base_model,
             "when2call_lm_eval_vllm/source_run_path": source_run_path,
-            "when2call_lm_eval_vllm/task_name": str(cfg.lm_eval.task_name),
+            "when2call_lm_eval_vllm/task_name": resolved_task_name,
+            "when2call_lm_eval_vllm/task_name_requested": requested_task_name,
             "when2call_lm_eval_vllm/tensor_parallel_size": tp_size,
             "when2call_lm_eval_vllm/lm_eval_backend": str(cmd_result.get("backend", "vllm")),
         }
@@ -549,11 +700,16 @@ def main(cfg: DictConfig) -> None:
                 "run_id": run_id,
                 "source_run_path": source_run_path,
                 "base_model": base_model,
-                "task_name": str(cfg.lm_eval.task_name),
+                "task_name": resolved_task_name,
+                "task_name_requested": requested_task_name,
                 "tensor_parallel_size": tp_size,
                 "artifact_name": getattr(artifact, "name", ""),
                 "generated_at_utc": _iso_now(),
-                "official_yaml": str(task_dir / "when2call-llama3_2.yaml"),
+                "official_yaml": str(
+                    (task_dir / f"{resolved_task_name}.yaml")
+                    if (task_dir / f"{resolved_task_name}.yaml").exists()
+                    else (task_dir / "when2call-llama3_2.yaml")
+                ),
             },
         )
         art.add_dir(str(run_out_dir))
