@@ -6,10 +6,11 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: resilient
-      exp.loss_tol: 1
-      train.dropout: 0.05
       exp.model_name: answerdotai/ModernBERT-base
-      exp.resilient_coef: 0.1,0.01
+      exp.resilient_coef: 0.5,5,10
+      exp.dual_step_size: 0.1
+      exp.loss_alpha: 1.0
+      exp.loss_tol: 1
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
