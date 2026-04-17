@@ -7,14 +7,10 @@ hydra:
     params:
       exp.loss_type: resilient
       exp.model_name: answerdotai/ModernBERT-base
-<<<<<<< HEAD
       exp.resilient_coef: 0.5,5,10
       exp.dual_step_size: 0.1
       exp.loss_alpha: 1.0
       exp.loss_tol: 1
-=======
-      exp.resilient_coef: 10.0,100.0,50.0,200.0,25.0
->>>>>>> 0977c504c5ebb13bb2a7ea4c95916a79944376ce
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
