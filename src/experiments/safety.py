@@ -151,6 +151,26 @@ class SAFETY(Experiment):
             return {"safe_output": ""}
 
         complete_dl = complete_dl.map(_add_safe_output)
+
+        # Add `chosen_output` / `rejected_output` columns for preference-based losses (e.g. DAA).
+        # - Preferred (chosen) is always the dataset `output` column.
+        # - Dispreferred (rejected) is:
+        #     * `beavertails_output` when safety_label == True
+        #     * SAFE_REFUSAL_OUTPUT when safety_label == False
+        def _add_preference_outputs(ex):
+            chosen = ex.get("output", "") or ""
+            is_safe = _to_bool(ex.get("safety_label", False)) is True
+            if is_safe:
+                rejected = ex.get("beavertails_output", "") or ""
+            else:
+                rejected = SAFE_REFUSAL_OUTPUT
+            if not isinstance(chosen, str):
+                chosen = str(chosen)
+            if not isinstance(rejected, str):
+                rejected = str(rejected)
+            return {"chosen_output": chosen, "rejected_output": rejected}
+
+        complete_dl = complete_dl.map(_add_preference_outputs)
         
         # Recover splits from the "split" tag
         tr = complete_dl.filter(lambda x: x["split"] == "train")
@@ -173,6 +193,52 @@ class SAFETY(Experiment):
 
         pad_id = tok.pad_token_id
         eos_id = tok.eos_token_id
+
+        loss_type = str(getattr(cfg.exp, "loss_type", "")).lower()
+        is_daa = loss_type == "daa"
+
+        def _tokenize_prompt_answer(prompt: str, answer: str):
+            """Tokenize prompt+answer with EOS and right-pad to max_length.
+
+            Returns (input_ids, response_mask) with shape (max_length,).
+            """
+            prompt_ids = tok(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                padding=False,
+                max_length=max_length - 1,
+            )["input_ids"][0]
+            len_prompt_ids = len(prompt_ids)
+
+            full_text = prompt + (answer if isinstance(answer, str) else "")
+            input_ids = tok(
+                full_text,
+                return_tensors="pt",
+                truncation=True,
+                padding=False,
+                max_length=max_length - 1,
+            )["input_ids"][0]
+
+            if input_ids.numel() == 0 or input_ids[-1].item() != eos_id:
+                input_ids = torch.cat(
+                    [input_ids, torch.tensor([eos_id], dtype=input_ids.dtype)]
+                )
+
+            seq_len = input_ids.shape[0]
+            if seq_len < max_length:
+                pad_len = max_length - seq_len
+                input_ids = torch.cat(
+                    [input_ids, torch.full((pad_len,), pad_id, dtype=input_ids.dtype)]
+                )
+            else:
+                input_ids = input_ids[:max_length]
+                seq_len = max_length
+
+            response_mask = torch.zeros(max_length, dtype=torch.bool)
+            start = min(len_prompt_ids, seq_len)
+            response_mask[start:seq_len] = True
+            return input_ids, response_mask
 
         def fn(sample):
             input_text = (
@@ -240,8 +306,8 @@ class SAFETY(Experiment):
             # 6) token-level labels for CausalLM loss: -100 outside response tokens
             #labels = input_ids.clone()
             #labels = labels.masked_fill(~response_mask, -100)
-            
-            return {
+
+            out = {
                 "input_ids": input_ids,
                 "safe": sample["safety_label"],
                 "response_mask": response_mask,
@@ -251,6 +317,20 @@ class SAFETY(Experiment):
                 "safe_output": safe_output,
                 #"labels": labels,
             }
+
+            # For DAA (DPO-style preference loss with KL penalty) also emit tokenized
+            # chosen/rejected sequences sharing the same prompt.
+            if is_daa:
+                chosen_answer = sample.get("chosen_output", "") or ""
+                rejected_answer = sample.get("rejected_output", "") or ""
+                chosen_ids, chosen_mask = _tokenize_prompt_answer(prompt, chosen_answer)
+                rejected_ids, rejected_mask = _tokenize_prompt_answer(prompt, rejected_answer)
+                out["chosen_input_ids"] = chosen_ids
+                out["chosen_response_mask"] = chosen_mask
+                out["rejected_input_ids"] = rejected_ids
+                out["rejected_response_mask"] = rejected_mask
+
+            return out
         return fn
     def get_collator(self, tok):
         class SafetyCollator():
@@ -308,6 +388,41 @@ class SAFETY(Experiment):
                     #"labels": labels,                    # (B, L) with -100 outside response
                 }
 
+                # For DAA / preference-based losses: pass through chosen/rejected tensors
+                # alongside their attention masks, if the preprocessing produced them.
+                if len(samples) > 0 and "chosen_input_ids" in samples[0]:
+                    def _stack_or_pad(key, pad_value, dtype):
+                        lst = [torch.as_tensor(s[key], dtype=dtype) for s in samples]
+                        same = all(x.shape == lst[0].shape for x in lst)
+                        if same:
+                            return torch.stack(lst, dim=0)
+                        return right_padding(lst, padding_value=pad_value)
+
+                    chosen_ids = _stack_or_pad("chosen_input_ids", self.pad_token_id, torch.long)
+                    chosen_rm = _stack_or_pad("chosen_response_mask", 0, torch.long).bool()
+                    rejected_ids = _stack_or_pad("rejected_input_ids", self.pad_token_id, torch.long)
+                    rejected_rm = _stack_or_pad("rejected_response_mask", 0, torch.long).bool()
+
+                    def _attn_from_mask(ids, rm):
+                        L = ids.shape[1]
+                        rev = rm.flip(-1).to(torch.long)
+                        first_true_from_right = rev.argmax(dim=-1)
+                        last_true = (L - 1) - first_true_from_right
+                        # If no True at all (empty answer + prompt-only), fall back to full length.
+                        has_any = rm.any(dim=-1)
+                        sl = torch.where(has_any, (last_true + 1), torch.full_like(last_true, L))
+                        sl = sl.clamp(min=1, max=L)
+                        return (
+                            torch.arange(L, device=ids.device)[None, :] < sl[:, None]
+                        ).bool()
+
+                    batch["chosen_input_ids"] = chosen_ids
+                    batch["chosen_response_mask"] = chosen_rm
+                    batch["chosen_attention_mask"] = _attn_from_mask(chosen_ids, chosen_rm)
+                    batch["rejected_input_ids"] = rejected_ids
+                    batch["rejected_response_mask"] = rejected_rm
+                    batch["rejected_attention_mask"] = _attn_from_mask(rejected_ids, rejected_rm)
+
                 # BASELINE IS COMPUTED AFTER PRECOMPUTE STEP
                 # if "baseline_logprob" in samples[0]:
                 #     baseline_logprob = torch.tensor(
@@ -359,6 +474,13 @@ class SAFETY(Experiment):
                 # Only apply if all expected columns exist.
                 if not all(hasattr(ds, "column_names") and c in ds.column_names for c in keep_cols):
                     return
+                # For DAA we also need the chosen/rejected tensors; include them when present.
+                daa_cols = [
+                    "chosen_input_ids", "chosen_response_mask",
+                    "rejected_input_ids", "rejected_response_mask",
+                ]
+                if all(c in ds.column_names for c in daa_cols):
+                    keep_cols = keep_cols + daa_cols
 
                 try:
                     ds.set_format(type="torch", columns=keep_cols, output_all_columns=False)
@@ -468,6 +590,31 @@ class SAFETY(Experiment):
             #     self.eval_dataset  = self.eval_dataset.map(add_baseline)
             #     model.train()
 
+            def _daa_seq_logp(self, model, ids, attn, mask):
+                """Sum of token log-probabilities of response tokens under `model`.
+
+                Returns (seq_logp: (B,), outputs) where `outputs` is the raw model
+                forward so callers can reuse `outputs.logits` if needed.
+                """
+                out = model(input_ids=ids, attention_mask=attn)
+                logits = out.logits[:, :-1]
+                logp = F.log_softmax(logits, dim=-1)
+                tok_lp = torch.gather(
+                    logp, dim=-1, index=ids[:, 1:].unsqueeze(-1)
+                ).squeeze(-1)
+                tok_lp = tok_lp * mask[:, 1:]
+                return tok_lp.sum(dim=-1), out
+
+            def _daa_disable_adapter_ctx(self, model):
+                if hasattr(model, "disable_adapter"):
+                    return model.disable_adapter()
+                if hasattr(model, "module") and hasattr(model.module, "disable_adapter"):
+                    return model.module.disable_adapter()
+                raise RuntimeError(
+                    "DAA loss requires PEFT LoRA adapters. "
+                    "Expected model to expose `.disable_adapter()` (PeftModel)."
+                )
+
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 """Loss function for the bias classification algorithm using Multiple Choice.
 
@@ -480,7 +627,51 @@ class SAFETY(Experiment):
                     dict[str, torch.Tensor]: loss, objective, constraint_value
                 """
                 cfg = self.custom_cfg.exp
-                
+
+                # -----------------------------
+                # DAA: DPO with KL penalization = alpha and margin = epsilon (=cfg.tol).
+                #   loss = -log sigma( alpha * (log pi/pi_ref)(y_w)
+                #                      - alpha * (log pi/pi_ref)(y_l)
+                #                      - epsilon )
+                # pi     = current model (LoRA adapters enabled)
+                # pi_ref = base model    (LoRA adapters disabled)
+                # -----------------------------
+                if str(getattr(cfg, "loss_type", "")).lower() == "daa":
+                    alpha = float(getattr(cfg, "loss_alpha", 1.0))
+                    eps = float(getattr(cfg, "tol", 0.0))
+
+                    chosen_ids = inputs["chosen_input_ids"]
+                    chosen_mask = inputs["chosen_response_mask"]
+                    chosen_attn = inputs["chosen_attention_mask"]
+                    rejected_ids = inputs["rejected_input_ids"]
+                    rejected_mask = inputs["rejected_response_mask"]
+                    rejected_attn = inputs["rejected_attention_mask"]
+
+                    pol_chosen_lp, chosen_out = self._daa_seq_logp(
+                        model, chosen_ids, chosen_attn, chosen_mask
+                    )
+                    pol_rejected_lp, _ = self._daa_seq_logp(
+                        model, rejected_ids, rejected_attn, rejected_mask
+                    )
+
+                    with torch.no_grad():
+                        with self._daa_disable_adapter_ctx(model):
+                            ref_chosen_lp, _ = self._daa_seq_logp(
+                                model, chosen_ids, chosen_attn, chosen_mask
+                            )
+                            ref_rejected_lp, _ = self._daa_seq_logp(
+                                model, rejected_ids, rejected_attn, rejected_mask
+                            )
+
+                    chosen_ratio = pol_chosen_lp - ref_chosen_lp
+                    rejected_ratio = pol_rejected_lp - ref_rejected_lp
+                    margin_logits = alpha * chosen_ratio - alpha * rejected_ratio - eps
+                    loss = -F.logsigmoid(margin_logits).mean()
+
+                    if return_outputs:
+                        return loss, chosen_out
+                    return loss
+
                 input_ids = inputs['input_ids']  # size = (B, 2, L)
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
                 response_mask = inputs['response_mask']  # size = (B, 2, L)
