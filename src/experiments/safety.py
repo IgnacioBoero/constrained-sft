@@ -75,14 +75,17 @@ class SAFETY(Experiment):
                 return x.strip().lower() in {"true", "1", "yes", "y"}
             return bool(x)
 
-        # Optional: keep only unsafe rows (safety_label == False) in train/eval splits.
+        # Optional: keep only unsafe rows (safety_label == True) in train/eval splits.
+        # Dataset convention (ihounie/SAFE-ALPACA-BTails-llama2):
+        #   * safety_label == True  -> UNSAFE prompt; `output` is the refusal target.
+        #   * safety_label == False -> SAFE prompt;   `output` is the benign Alpaca answer.
         only_unsafe_train = getattr(cfg.train, "only_unsafe_train", False)
         if only_unsafe_train:
-            tr_raw = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
+            tr_raw = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is True)
 
         only_unsafe_eval = getattr(cfg.train, "only_unsafe_eval", False)
         if only_unsafe_eval:
-            ev_raw = ev_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
+            ev_raw = ev_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is True)
 
         # Optional (EVAL ONLY): evaluate on only a fraction of the eval split.
         # This is applied after data_proportion and only_unsafe_eval filtering.
@@ -98,6 +101,7 @@ class SAFETY(Experiment):
         # Optional (TRAIN ONLY): keep the 1k longest unsafe responses.
         # If only_unsafe_train=False, we keep all safe rows + top-1k unsafe rows.
         # "response length" is measured as character length of the raw `output` field.
+        # Under the dataset convention above, `safety_label == True` selects UNSAFE prompts.
         filter_longest = getattr(cfg.train, "filter_longest", False)
         if filter_longest:
             def _add_response_len(ex):
@@ -110,7 +114,7 @@ class SAFETY(Experiment):
 
             tr_raw = tr_raw.map(_add_response_len)
 
-            unsafe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
+            unsafe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is True)
             unsafe_ds = unsafe_ds.sort("response_len", reverse=True)
             unsafe_keep_n = min(1000, len(unsafe_ds))
             unsafe_ds = unsafe_ds.select(range(unsafe_keep_n))
@@ -118,7 +122,7 @@ class SAFETY(Experiment):
             if only_unsafe_train:
                 tr_raw = unsafe_ds
             else:
-                safe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is True)
+                safe_ds = tr_raw.filter(lambda x: _to_bool(x.get("safety_label", False)) is False)
                 tr_raw = concatenate_datasets([safe_ds, unsafe_ds])
 
             # Report average response length (chars) of the final filtered training set.
@@ -142,27 +146,35 @@ class SAFETY(Experiment):
         complete_dl = complete_dl.add_column("index", list(range(len(complete_dl))))
 
         # Add a `safe_output` column so train/eval have identical schemas.
-        # Per request: set a refusal `safe_output` ONLY for train samples with safety_label=False.
+        # This column holds the refusal target used to score the "don't over-refuse on
+        # safe prompts" constraint (slack_no_refusal). Refusals are only needed on safe
+        # prompts (safety_label == False), so we populate the column only there.
+        # NOTE: the constraint loss actually tokenizes `self.safe_output_text` at runtime
+        # rather than reading this column, so the column is primarily informational.
         def _add_safe_output(ex):
             is_train = ex.get("split") == "train"
-            is_unsafe = _to_bool(ex.get("safety_label", False)) is False
-            if is_train and is_unsafe:
+            is_safe_prompt = _to_bool(ex.get("safety_label", False)) is False
+            if is_train and is_safe_prompt:
                 return {"safe_output": SAFE_REFUSAL_OUTPUT}
             return {"safe_output": ""}
 
         complete_dl = complete_dl.map(_add_safe_output)
 
         # Add `chosen_output` / `rejected_output` columns for preference-based losses (e.g. DAA).
-        # - Preferred (chosen) is always the dataset `output` column.
-        # - Dispreferred (rejected) is:
-        #     * `beavertails_output` when safety_label == True
-        #     * SAFE_REFUSAL_OUTPUT when safety_label == False
+        # Dataset convention (ihounie/SAFE-ALPACA-BTails-llama2):
+        #   * safety_label == True  -> UNSAFE prompt; dataset `output` is a refusal, and
+        #                              `beavertails_output` is the harmful response.
+        #   * safety_label == False -> SAFE prompt;   dataset `output` is the good answer.
+        # For unsafe prompts we *hardcode* the preferred response to the canonical refusal
+        # (`SAFE_REFUSAL_OUTPUT`) used by the other methods, so the refusal text is identical
+        # across methods (the dataset's stored refusal differs only in trailing punctuation).
         def _add_preference_outputs(ex):
-            chosen = ex.get("output", "") or ""
-            is_safe = _to_bool(ex.get("safety_label", False)) is True
-            if is_safe:
+            is_unsafe_prompt = _to_bool(ex.get("safety_label", False)) is True
+            if is_unsafe_prompt:
+                chosen = SAFE_REFUSAL_OUTPUT
                 rejected = ex.get("beavertails_output", "") or ""
             else:
+                chosen = ex.get("output", "") or ""
                 rejected = SAFE_REFUSAL_OUTPUT
             if not isinstance(chosen, str):
                 chosen = str(chosen)
@@ -309,6 +321,9 @@ class SAFETY(Experiment):
 
             out = {
                 "input_ids": input_ids,
+                # NOTE: legacy key. Value == safety_label, which under the dataset's
+                # convention is True for UNSAFE prompts (refusal constraint active) and
+                # False for SAFE prompts (don't-over-refuse constraint active).
                 "safe": sample["safety_label"],
                 "response_mask": response_mask,
                 "index": index,
@@ -453,7 +468,8 @@ class SAFETY(Experiment):
                 self.label_names = ["index"]
                 # Generate qualitative answers only once at the end of training.
                 self._generated_eval_answers = False
-                # Refusal used as `safe_output` for unsafe samples (safety_label=False).
+                # Refusal string scored on SAFE prompts (safety_label=False) to enforce
+                # the "don't over-refuse" constraint (slack_no_refusal).
                 self.safe_output_text = SAFE_REFUSAL_OUTPUT
                 self._safe_output_token_ids_cpu = None  # cached 1D LongTensor on CPU
                 self._maybe_optimize_train_dataset()
@@ -494,8 +510,10 @@ class SAFETY(Experiment):
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros(len(self.train_dataset) + len(self.eval_dataset), dtype=torch.float, requires_grad=False).to(self.model.device)
-                self.avg_dual_safe = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
-                self.avg_dual_unsafe = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                # Dual for the refusal constraint on UNSAFE prompts: logp(output) >= tol.
+                self.avg_dual_refusal = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                # Dual for the don't-over-refuse constraint on SAFE prompts: logp(refusal) <= tol2.
+                self.avg_dual_no_refusal = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
 
             def train(self, *args, **kwargs):
                 """
@@ -630,9 +648,13 @@ class SAFETY(Experiment):
 
                 # -----------------------------
                 # DAA: DPO with KL penalization = alpha and margin = epsilon (=cfg.tol).
-                #   loss = -log sigma( alpha * (log pi/pi_ref)(y_w)
-                #                      - alpha * (log pi/pi_ref)(y_l)
-                #                      - epsilon )
+                # The margin is applied ONLY on unsafe prompts (safety_label == True),
+                # so safe prompts use standard DPO (no margin):
+                #   unsafe: loss_i = -log sigma( alpha * (log pi/pi_ref)(y_w)
+                #                                - alpha * (log pi/pi_ref)(y_l)
+                #                                - epsilon )
+                #   safe:   loss_i = -log sigma( alpha * (log pi/pi_ref)(y_w)
+                #                                - alpha * (log pi/pi_ref)(y_l) )
                 # pi     = current model (LoRA adapters enabled)
                 # pi_ref = base model    (LoRA adapters disabled)
                 # -----------------------------
@@ -665,7 +687,10 @@ class SAFETY(Experiment):
 
                     chosen_ratio = pol_chosen_lp - ref_chosen_lp
                     rejected_ratio = pol_rejected_lp - ref_rejected_lp
-                    margin_logits = alpha * chosen_ratio - alpha * rejected_ratio - eps
+                    # Apply `eps` only on unsafe prompts; safe prompts get plain DPO.
+                    is_unsafe_prompt = inputs["safe"].to(chosen_ratio.device)
+                    eps_per_sample = eps * is_unsafe_prompt.to(chosen_ratio.dtype)
+                    margin_logits = alpha * chosen_ratio - alpha * rejected_ratio - eps_per_sample
                     loss = -F.logsigmoid(margin_logits).mean()
 
                     if return_outputs:
@@ -677,10 +702,12 @@ class SAFETY(Experiment):
                 response_mask = inputs['response_mask']  # size = (B, 2, L)
                 
                 # precomputed_answer_log_probs = inputs['baseline_logprob']  # size = (B,)
-                is_constraint = inputs['safe']  # size = (B,)                
-                is_not_constraint = ~is_constraint
+                # `inputs['safe']` == safety_label; True => UNSAFE prompt (refusal constraint active),
+                # False => SAFE prompt (don't-over-refuse constraint active).
+                is_unsafe_prompt = inputs['safe']  # size = (B,)
+                is_safe_prompt = ~is_unsafe_prompt
                 index = inputs['index']  # size = (B,)
-                index_constraints = index[is_constraint]
+                index_constraints = index[is_unsafe_prompt]
                 dual_var = self.dual_vars[index_constraints].clone()  # Get dual variable for the current batch
                 outputs = model(
                     input_ids=input_ids,
@@ -697,15 +724,15 @@ class SAFETY(Experiment):
                 answer_log_probs = answer_log_probs / num_tokens
 
                 # -----------------------------
-                # Extra constraint for unsafe samples (safety_label == False):
-                #   (1) use `safe_output` = refusal string
+                # Extra "don't over-refuse" constraint for SAFE prompts (safety_label == False):
+                #   (1) use `safe_output_text` = refusal string
                 #   (2) compute avg token logprob of that refusal
-                #   (3) define slack2 = logp_safe_output - tol2
+                #   (3) define slack_no_refusal = logp(refusal) - tol2   (want <= 0)
                 # -----------------------------
-                is_constraint = inputs['safe']  # size = (B,)
-                is_not_constraint = ~is_constraint
+                is_unsafe_prompt = inputs['safe']  # size = (B,)
+                is_safe_prompt = ~is_unsafe_prompt
                 tol2 = getattr(cfg, "tol2", None)
-                slack2 = None
+                slack_no_refusal = None
 
                 if cfg.loss_type != "erm" and tol2 is not None:
                     proc = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
@@ -737,7 +764,8 @@ class SAFETY(Experiment):
                     batch_idx = list(range(input_ids.shape[0]))
 
                     # Build a batch of (prompt + response + EOS) sequences for all samples.
-                    # For safety_label=True, we use an empty response (i.e., prompt + EOS).
+                    # For UNSAFE prompts (safety_label=True), we use an empty response
+                    # (prompt + EOS); only SAFE prompts actually need the refusal scored.
                     safe_ids_list: list[torch.Tensor] = []
                     safe_resp_mask_list: list[torch.Tensor] = []
                     kept_idx: list[int] = []
@@ -745,7 +773,7 @@ class SAFETY(Experiment):
                         prompt_end = int(prompt_ends[bi].item())
                         prompt_ids = input_ids[bi, :prompt_end]
 
-                        if is_not_constraint[bi]:
+                        if is_safe_prompt[bi]:
                             resp_ids = safe_out_ids
                         else:
                             resp_ids = prompt_ids.new_empty((0,), dtype=prompt_ids.dtype)
@@ -793,15 +821,15 @@ class SAFETY(Experiment):
                         safe_denom = safe_resp_mask[:, 1:].sum(dim=-1).clamp_min(1)
                         safe_avg = safe_sum / safe_denom  # avg token logprob of refusal
 
-                        # Per request: slack2 = logp - tol2 (only for unsafe samples)
-                        slack2 = torch.zeros_like(answer_log_probs)
-                        slack2[torch.tensor(kept_idx, device=input_ids.device, dtype=torch.long)] = safe_avg - float(tol2)
-                        slack2 = slack2 * is_not_constraint.float()
+                        # slack_no_refusal = logp(refusal) - tol2 (active only on SAFE prompts).
+                        slack_no_refusal = torch.zeros_like(answer_log_probs)
+                        slack_no_refusal[torch.tensor(kept_idx, device=input_ids.device, dtype=torch.long)] = safe_avg - float(tol2)
+                        slack_no_refusal = slack_no_refusal * is_safe_prompt.float()
                     else:
-                        slack2 = torch.zeros_like(answer_log_probs)
+                        slack_no_refusal = torch.zeros_like(answer_log_probs)
                 else:
-                    # No unsafe-refusal constraint active (tol2 not set or no unsafe samples in batch).
-                    slack2 = torch.zeros_like(answer_log_probs)
+                    # Don't-over-refuse constraint inactive (tol2 not set, or no safe samples in batch).
+                    slack_no_refusal = torch.zeros_like(answer_log_probs)
                 # Additional forward pass with adapters disabled (or base model) for KL objective.
                 device = input_ids.device
                 with torch.no_grad():
@@ -833,24 +861,25 @@ class SAFETY(Experiment):
                 # main objective: avg KL divergence vs. base model
                 loss = kl_sum
                 if cfg.loss_type != "erm":
-                    # Safe-sample constraint (existing): answer_log_probs >= tol  <=>  tol - logp <= 0
-                    slack_safe = (cfg.tol - answer_log_probs) * is_constraint.float()
-                    # Unsafe-sample constraint (new): logp - tol2 <= 0
-                    # We already computed `slack2= logp - tol2` (masked to unsafe samples).
-                    slack = slack_safe + slack2
+                    # Refusal constraint on UNSAFE prompts: logp(output) >= tol  <=>  tol - logp <= 0
+                    # (`output` is the dataset's refusal target on unsafe rows.)
+                    slack_refusal = (cfg.tol - answer_log_probs) * is_unsafe_prompt.float()
+                    # Don't-over-refuse constraint on SAFE prompts: logp(refusal) - tol2 <= 0
+                    # (`slack_no_refusal` was already computed above, masked to safe samples.)
+                    slack = slack_refusal + slack_no_refusal
 
                 if cfg.loss_type == "avg":
-                        dual_safe = self.avg_dual_safe.clone()
-                        dual_safe = torch.clamp(dual_safe + cfg.dual_step_size * slack_safe.mean(), min=0.0)
-                        self.avg_dual_safe = dual_safe.detach()
+                        dual_refusal = self.avg_dual_refusal.clone()
+                        dual_refusal = torch.clamp(dual_refusal + cfg.dual_step_size * slack_refusal.mean(), min=0.0)
+                        self.avg_dual_refusal = dual_refusal.detach()
 
-                        dual_unsafe = self.avg_dual_unsafe.clone()
-                        dual_unsafe = torch.clamp(dual_unsafe + cfg.dual_step_size * slack2.mean(), min=0.0)
-                        self.avg_dual_unsafe = dual_unsafe.detach()
+                        dual_no_refusal = self.avg_dual_no_refusal.clone()
+                        dual_no_refusal = torch.clamp(dual_no_refusal + cfg.dual_step_size * slack_no_refusal.mean(), min=0.0)
+                        self.avg_dual_no_refusal = dual_no_refusal.detach()
 
                         loss += (
-                            dual_safe.detach() * slack_safe
-                            + dual_unsafe.detach() * slack2
+                            dual_refusal.detach() * slack_refusal
+                            + dual_no_refusal.detach() * slack_no_refusal
                         )
                         # log the avg dual
 
@@ -1406,16 +1435,17 @@ class SAFETY(Experiment):
                 answer_log_probs = torch.tensor(logits); indexes = torch.tensor(indexes); 
                 cfg = self.custom_cfg.exp
 
-                # Get is_constraint, response_mask, input_ids from complete dataset and index
+                # Get safety labels, response_mask, input_ids from complete dataset and index.
+                # `collated['safe']` == safety_label; True => UNSAFE prompt, False => SAFE prompt.
                 samples = [self.complete_ds[int(idx)] for idx in indexes.tolist()]
                 collated = self.data_collator(samples)
                 input_ids = collated["input_ids"]
                 response_mask = collated['response_mask'].to(answer_log_probs.device)
-                is_constraint = collated['safe'].to(answer_log_probs.device)  # size
+                is_unsafe_prompt = collated['safe'].to(answer_log_probs.device)  # size
                 # precomputed_answer_log_probs = collated['baseline_logprob'].to(answer_log_probs.device)
 
-                is_not_constraint = ~is_constraint
-                
+                is_safe_prompt = ~is_unsafe_prompt
+
                 answer_log_probs = answer_log_probs * response_mask[:, 1:]
                 answer_log_probs = answer_log_probs.sum(dim=-1)  # size = (B,)
                 denom = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
@@ -1423,25 +1453,25 @@ class SAFETY(Experiment):
                 
                 # answer_log_ratios = answer_log_probs - precomputed_answer_log_probs
                 
-                
-                answer_log_ratios_objective = answer_log_probs[is_not_constraint]
+                # Objective tracked on SAFE prompts (keep producing the benign answer).
+                answer_log_ratios_objective = answer_log_probs[is_safe_prompt]
                 tol2 = getattr(cfg, "tol2", None)
                 if tol2 is None:
                     # -----------------------------
                     # Existing behavior (when tol2 is NOT provided):
-                    # only compute/log constraint slacks for safety_label=True samples.
+                    # only compute/log constraint slacks for UNSAFE prompts (safety_label=True).
                     # -----------------------------
-                    self._last_constraint_indexes = indexes[is_constraint].detach().cpu()
-                    self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
+                    self._last_constraint_indexes = indexes[is_unsafe_prompt].detach().cpu()
+                    self._last_objective_indexes = indexes[is_safe_prompt].detach().cpu()
 
-                    answer_log_ratios_constraint = -1 * answer_log_probs[is_constraint]
-                    if is_constraint.sum() == 0:
+                    answer_log_ratios_constraint = -1 * answer_log_probs[is_unsafe_prompt]
+                    if is_unsafe_prompt.sum() == 0:
                         answer_log_ratios_constraint = torch.tensor([0.0], device=answer_log_probs.device)
                         self._last_constraint_indexes = torch.tensor([0], dtype=torch.long)
                         self._last_constraint_safety_labels = torch.tensor([True], dtype=torch.bool)
                     else:
                         # all True, but keep shape aligned with slacks/indexes
-                        self._last_constraint_safety_labels = is_constraint[is_constraint].detach().cpu()
+                        self._last_constraint_safety_labels = is_unsafe_prompt[is_unsafe_prompt].detach().cpu()
 
                     slacks = answer_log_ratios_constraint
                     self._last_constraint_slacks = slacks.detach().cpu()
@@ -1475,14 +1505,14 @@ class SAFETY(Experiment):
 
                 # -----------------------------
                 # tol2 is provided => compute BOTH constraints in eval:
-                #  - safe samples (safety_label=True): slack_safe = tol - logp(output)
-                #  - unsafe samples (safety_label=False): slack2 = logp(safe_output) - tol2
+                #  - UNSAFE prompts (safety_label=True): slack_refusal = tol - logp(output)
+                #  - SAFE prompts   (safety_label=False): slack_no_refusal = logp(refusal) - tol2
                 # -----------------------------
-                slack_safe = (cfg.tol - answer_log_probs) * is_constraint.float()
+                slack_refusal = (cfg.tol - answer_log_probs) * is_unsafe_prompt.float()
 
                 safe_output_logp = torch.zeros_like(answer_log_probs)
-                slack2 = torch.zeros_like(answer_log_probs)
-                if bool(is_not_constraint.any()):
+                slack_no_refusal = torch.zeros_like(answer_log_probs)
+                if bool(is_safe_prompt.any()):
                     proc = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
                     if proc is None:
                         raise RuntimeError("Could not find tokenizer/processing_class on Trainer to score safe_output.")
@@ -1507,8 +1537,9 @@ class SAFETY(Experiment):
                     safe_out_ids_cpu = self._safe_output_token_ids_cpu  # (T,)
 
                     prompt_ends = response_mask.long().argmax(dim=-1)  # (N,)
-                    unsafe_batch_idx = (
-                        torch.nonzero(is_not_constraint, as_tuple=False).squeeze(-1).detach().cpu().tolist()
+                    # Indices of SAFE prompts (where we score the refusal to check for over-refusal).
+                    safe_batch_idx = (
+                        torch.nonzero(is_safe_prompt, as_tuple=False).squeeze(-1).detach().cpu().tolist()
                     )
 
                     model = extract_model_from_parallel(self.model)
@@ -1548,7 +1579,7 @@ class SAFETY(Experiment):
                             batch_pos.clear()
 
                         max_len = int(input_ids.shape[1])
-                        for bi in unsafe_batch_idx:
+                        for bi in safe_batch_idx:
                             prompt_end = int(prompt_ends[bi].item())
                             prompt_ids = input_ids[bi, :prompt_end].to(torch.long).cpu()
 
@@ -1585,16 +1616,16 @@ class SAFETY(Experiment):
                         if was_training:
                             model.train()
 
-                    slack2 = (safe_output_logp - float(tol2)) * is_not_constraint.float()
+                    slack_no_refusal = (safe_output_logp - float(tol2)) * is_safe_prompt.float()
 
-                slacks = slack_safe + slack2
+                slacks = slack_refusal + slack_no_refusal
 
                 # Keep for wandb callback logging
                 self._last_constraint_slacks = slacks.detach().cpu()
                 self._last_constraint_indexes = indexes.detach().cpu()
-                self._last_constraint_safety_labels = is_constraint.detach().cpu()
+                self._last_constraint_safety_labels = is_unsafe_prompt.detach().cpu()
                 self._last_objective_ratios = answer_log_ratios_objective.detach().cpu()
-                self._last_objective_indexes = indexes[is_not_constraint].detach().cpu()
+                self._last_objective_indexes = indexes[is_safe_prompt].detach().cpu()
 
                 epoch = self.state.epoch
                 # Flatten slacks and output table to wandb
@@ -1603,7 +1634,7 @@ class SAFETY(Experiment):
                 import wandb
                 if wandb.run is not None:
                     table = wandb.Table(columns=["constraint_slack", "safety_label"])
-                    safety_labels = is_constraint.detach().cpu().flatten().tolist()
+                    safety_labels = is_unsafe_prompt.detach().cpu().flatten().tolist()
                     for slack, lbl in zip(constraint_slacks.detach().cpu().tolist(), safety_labels):
                         table.add_data(slack, bool(lbl))
                     wandb.log({f"constraint_slacks_epoch_{epoch}_{self._current_eval_prefix}": table})
@@ -1614,7 +1645,7 @@ class SAFETY(Experiment):
                 else:
                     objective = 0.0
 
-                # Combined constraint stats (safe+unsafe)
+                # Combined constraint stats (refusal-on-unsafe + no-refusal-on-safe)
                 if slacks.numel() > 0:
                     constraint_mean = slacks.mean().item()
                     constrain_min = slacks.min().item()
@@ -1629,9 +1660,15 @@ class SAFETY(Experiment):
                     constrain_max = 0.0
                     contriant_cvar = 0.0
 
-                # Per-group means for debugging
-                safe_mean = slack_safe[is_constraint].mean().item() if bool(is_constraint.any()) else 0.0
-                unsafe_mean = slack2[is_not_constraint].mean().item() if bool(is_not_constraint.any()) else 0.0
+                # Per-group means for debugging.
+                # `refusal_slack_mean`    : mean slack of the refusal constraint on UNSAFE prompts.
+                # `no_refusal_slack_mean` : mean slack of the don't-over-refuse constraint on SAFE prompts.
+                refusal_slack_mean = (
+                    slack_refusal[is_unsafe_prompt].mean().item() if bool(is_unsafe_prompt.any()) else 0.0
+                )
+                no_refusal_slack_mean = (
+                    slack_no_refusal[is_safe_prompt].mean().item() if bool(is_safe_prompt.any()) else 0.0
+                )
 
                 return {
                     "objective": objective,
@@ -1639,8 +1676,11 @@ class SAFETY(Experiment):
                     "constraint_min": constrain_min,
                     "constraint_max": constrain_max,
                     "constraint_cvar": contriant_cvar,
-                    "constraint_safe_mean": safe_mean,
-                    "constraint_unsafe_mean": unsafe_mean,
+                    # NOTE: legacy wandb keys kept for dashboard backward-compatibility.
+                    # `constraint_safe_mean`   = refusal-constraint slack mean (on UNSAFE prompts).
+                    # `constraint_unsafe_mean` = no-refusal-constraint slack mean (on SAFE prompts).
+                    "constraint_safe_mean": refusal_slack_mean,
+                    "constraint_unsafe_mean": no_refusal_slack_mean,
                 }
         return CustomTrainer
     
