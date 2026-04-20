@@ -7,7 +7,7 @@ hydra:
     params:
       exp.loss_type: erm
       exp.length_constraint: false
-      exp.dropout: 0.05, 0.1, 0.03
+      train.dropout: 0.05, 0.1, 0.03
 
 
 
