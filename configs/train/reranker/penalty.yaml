@@ -9,7 +9,6 @@ hydra:
       exp.loss_alpha: 0.1,0.01,0.05,0.5
       exp.loss_tol: 1
       exp.dual_step_size: 1.0
-      exp.model_name: answerdotai/ModernBERT-large
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -22,7 +21,7 @@ train:
   seed: 42
   output_dir: "outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   do_train: true
-  do_initial_eval: false
+  do_initial_eval: true
   use_wandb: true
   include_inputs_for_metrics: true
   wandb_project: "RERANKER-final-v2"
@@ -34,19 +33,16 @@ train:
   size: large
   hf_args:
     per_device_train_batch_size: 8          # ST recipe
-    per_device_eval_batch_size: 1
+    per_device_eval_batch_size: 8
     gradient_accumulation_steps: 8
     num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 2e-5
     warmup_ratio: 0.1
     weight_decay: 0.0
     lr_scheduler_type: "linear"
-    eval_strategy: "no"
-    save_strategy: "no"
-    # load_best_model_at_end: true
-    # metric_for_best_model: "objective"
-    # greater_is_better: true
-    # save_total_limit: 1
+    eval_strategy: "epoch"
+    save_strategy: "epoch"
+    save_total_limit: 1
     bf16: true
     fp16: false
 
