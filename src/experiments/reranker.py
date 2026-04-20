@@ -291,7 +291,8 @@ class RERANKER(Experiment):
             
                 loss = torch.zeros(B, dtype=logits.dtype, device=logits.device)
                 if cfg.length_constraint:
-                    loss += obj
+                    erm_penalty = getattr(cfg, "erm_penalty", 1.0)
+                    loss += erm_penalty * obj
 
 
                 s_pos = logits[:, 0]    # (B, 1)
