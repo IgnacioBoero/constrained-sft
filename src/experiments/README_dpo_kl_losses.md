@@ -11,7 +11,7 @@ The trainer builds paired samples `(chosen, rejected)` and computes per-token lo
 - `gap = logp_chosen - logp_rejected`.
 - `tol` / `tol_win` / `tol_loose`: constraint thresholds from config.
 
-For KL-based losses (all except `simpo` and `dpo`), a reference/base policy is computed by running the same model with adapters disabled, then:
+For KL-based losses (all except `simpo`, `slic_hf`, `dpo`, and `cal_dpo`), a reference/base policy is computed by running the same model with adapters disabled, then:
 
 - token KL: `sum_v p_theta(v) * (log p_theta(v) - log p_ref(v))`
 - sequence KL: average over response tokens
@@ -58,13 +58,38 @@ No KL term. Uses reference/base gap subtraction.
 
 Interpretation: standard DPO preference score against frozen reference behavior.
 
-### 3) `erm`
+### 3) `cal_dpo`
+
+No KL term. Uses the same reference-adjusted log-ratios as DPO:
+
+- `rel_logp_chosen = logp_chosen - base_logp_chosen`
+- `rel_logp_rejected = logp_rejected - base_logp_rejected`
+- `score = rel_logp_chosen - rel_logp_rejected`
+- `beta = loss_alpha`
+- `target = 1 / (2 * beta)`
+- `loss = mean(softplus(-score) + (rel_logp_chosen - target)^2 + (rel_logp_rejected + target)^2)`
+
+Interpretation: DPO with an unscaled preference term (`beta = 1` for the logistic score) plus quadratic calibration penalties that pull chosen and rejected log-ratios toward `+1/(2*loss_alpha)` and `-1/(2*loss_alpha)`.
+
+### 4) `slic_hf`
+
+No KL term and no base-model pass.
+
+- `delta = tol`
+- `lambda = loss_alpha`
+- `gap = logp_chosen - logp_rejected`
+- `score = gap - delta`
+- `loss = mean(relu(-score) - lambda * logp_chosen)`
+
+Interpretation: hinge margin on the pairwise preference (`gap >= delta`) plus a chosen-logprob reward term weighted by `loss_alpha`.
+
+### 5) `erm`
 
 Objective-only KL minimization, no constraint penalty.
 
 - `loss = mean(kl_mean)`
 
-### 4) `avg`
+### 6) `avg`
 
 Single average (global) dual variable for pairwise slack.
 
@@ -73,7 +98,7 @@ Single average (global) dual variable for pairwise slack.
 - Loss:  
   `loss = mean(kl_mean + mu * slack)`
 
-### 5) `aug_dual`
+### 7) `aug_dual`
 
 Single per-example augmented-Lagrangian dual variable (`dual_vars[index]`) for pairwise slack.
 
@@ -89,7 +114,7 @@ Single per-example augmented-Lagrangian dual variable (`dual_vars[index]`) for p
   - `loss += loss_alpha/4 * (relu(z)^2 - b^2)`
 - Final: batch mean.
 
-### 6) `resilient`
+### 8) `resilient`
 
 Variant of `aug_dual` with additional resilience coefficient.
 
@@ -107,13 +132,13 @@ Variant of `aug_dual` with additional resilience coefficient.
   - `loss += loss_alpha/4 * (coef * relu(z)^2 - b^2)`
 - Final: batch mean.
 
-### 7) `penalty`
+### 9) `penalty`
 
 Linear pairwise slack penalty.
 
 - `loss = mean(kl_mean + loss_alpha * slack)`
 
-### 8) `_both_avg` aliases
+### 10) `_both_avg` aliases
 
 Aliases: `_both_avg`, `both_avg`, `avg_both`
 
@@ -128,7 +153,7 @@ Two global duals, one for `slack_win` and one for `slack_loose`.
 - Loss:
   - `loss = mean(kl_mean + alpha_win*mu_win*slack_win + alpha_loose*mu_loose*slack_loose)`
 
-### 9) `_both_aug_dual` aliases
+### 11) `_both_aug_dual` aliases
 
 Aliases: `_both_aug_dual`, `both_aug_dual`, `aug_dual_both`
 
@@ -136,7 +161,7 @@ Two per-example augmented-dual terms, one for `slack_win`, one for `slack_loose`
 
 Each side uses the same augmented form as `aug_dual` (`a`, `b`, `z`, piecewise dual gradient), and the final loss adds both penalty terms to `kl_mean`, then averages.
 
-### 10) `_both_penalty` aliases
+### 12) `_both_penalty` aliases
 
 Aliases: `_both_penalty`, `both_penalty`, `penalty_both`
 
@@ -146,7 +171,7 @@ Linear penalties on both explicit constraints.
 - `alpha_win = loss_alpha_win` fallback `loss_alpha`
 - `alpha_loose = loss_alpha_loose` fallback `loss_alpha`
 
-### 11) `aug_dual_three` aliases
+### 13) `aug_dual_three` aliases
 
 Aliases: `aug_dual_three`, `_aug_dual_three`, `three_aug_dual`
 
@@ -167,9 +192,9 @@ Each uses the same augmented piecewise update as `aug_dual` but with independent
   - `_both_penalty` aliases
   - `aug_dual_three` aliases
 - No reference pass:
-  - `simpo`
-- Reference pass used for preference score only (not KL objective):
-  - `dpo`
+  - `simpo`, `slic_hf`
+- Reference pass used for preference score/log-ratio penalties only (not KL objective):
+  - `dpo`, `cal_dpo`
 
 ## Key Config Fields By Family
 
@@ -177,7 +202,7 @@ Each uses the same augmented piecewise update as `aug_dual` but with independent
   - `loss_type`
 - Margin-style:
   - `tol`
-- SimPO/DPO scale:
+- SimPO/Slic-HF/DPO/calibration scale:
   - `loss_alpha`
 - Dual updates:
   - `dual_step_size`
@@ -193,7 +218,9 @@ Each uses the same augmented piecewise update as `aug_dual` but with independent
 `compute_metrics` always logs `logp_gap` and slack statistics. It interprets the 3rd prediction column based on loss family:
 
 - `simpo`: third column is SimPO `score`; logs `objective_simpo_*` and `simpo_margin_sat_rate`.
+- `slic_hf`: third column is Slic-HF `score = gap - delta`; logs hinge term, regularizer term, total loss, and `slic_hf_margin_sat_rate`.
 - `dpo`: third column is DPO `score`; logs `objective_dpo_*` and `dpo_pref_sat_rate`.
+- `cal_dpo`: third column is unscaled DPO `score`; logs DPO term, quadratic penalty, total loss, and `cal_dpo_pref_sat_rate`.
 - all others: third column is `kl_mean`; logs `objective_kl`.
 
 For augmented-dual losses, it also logs dual-variable distribution stats (mean/min/max/q90/q99/CVaR), with per-constraint breakdown for the multi-constraint variants.
