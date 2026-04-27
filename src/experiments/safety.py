@@ -54,7 +54,14 @@ class SAFETY(Experiment):
         ds = load_dataset(dataset_name)
 
         tr_raw = ds["train"]
-        ev_raw = ds["validation"]
+        if "validation" in ds:
+            ev_raw = ds["validation"]
+        elif "eval" in ds:
+            ev_raw = ds["eval"]
+        else:
+            split = tr_raw.train_test_split(test_size=0.1, seed=cfg.train.seed)
+            tr_raw = split["train"]
+            ev_raw = split["test"]
         tr_raw = tr_raw.add_column("split", ["train"] * len(tr_raw))
         ev_raw = ev_raw.add_column("split", ["validation"] * len(ev_raw))
         
@@ -74,6 +81,160 @@ class SAFETY(Experiment):
             if isinstance(x, str):
                 return x.strip().lower() in {"true", "1", "yes", "y"}
             return bool(x)
+
+        def _to_str(x):
+            if x is None:
+                return ""
+            if isinstance(x, str):
+                return x
+            return str(x)
+
+        def _parse_pref_id(raw_pref):
+            if isinstance(raw_pref, (int, np.integer)):
+                return 0 if int(raw_pref) == 0 else 1
+            if isinstance(raw_pref, str):
+                v = raw_pref.strip().lower()
+                if v in {"0", "response_0", "response0", "a"}:
+                    return 0
+                if v in {"1", "response_1", "response1", "b"}:
+                    return 1
+            return 0
+
+        def _normalize_pku_split(split_ds, split_name):
+            required = {
+                "prompt",
+                "response_0",
+                "response_1",
+                "is_response_0_safe",
+                "is_response_1_safe",
+                "better_response_id",
+            }
+            if not required.issubset(set(split_ds.column_names)):
+                return split_ds
+
+            split_seed = int(cfg.train.seed) + (0 if split_name == "train" else 1000003)
+            sft_data = str(getattr(cfg.exp, "sft_data", "preferred_safe")).lower()
+            loss_type = str(getattr(cfg.exp, "loss_type", "")).lower()
+
+            if loss_type == "sft" and sft_data == "all":
+                def _map_all_pku_rows(batch):
+                    out = {
+                        "instruction": [],
+                        "input": [],
+                        "output": [],
+                        "unsafe_response": [],
+                        "helpful_output": [],
+                        "safety_label": [],
+                        "split": [],
+                    }
+                    for prompt_raw, r0_raw, r1_raw, s0_raw, s1_raw in zip(
+                        batch["prompt"],
+                        batch["response_0"],
+                        batch["response_1"],
+                        batch["is_response_0_safe"],
+                        batch["is_response_1_safe"],
+                    ):
+                        prompt = _to_str(prompt_raw)
+                        r0 = _to_str(r0_raw)
+                        r1 = _to_str(r1_raw)
+                        s0 = _to_bool(s0_raw)
+                        s1 = _to_bool(s1_raw)
+                        for response, is_safe_response, other_response in (
+                            (r0, s0, r1),
+                            (r1, s1, r0),
+                        ):
+                            out["instruction"].append(prompt)
+                            out["input"].append("")
+                            out["output"].append(response)
+                            out["unsafe_response"].append(other_response)
+                            # SFT consumes `chosen_output`; keep it equal to this row's response.
+                            out["helpful_output"].append(response)
+                            out["safety_label"].append(not is_safe_response)
+                            out["split"].append(split_name)
+                    return out
+
+                split_ds = split_ds.map(
+                    _map_all_pku_rows,
+                    batched=True,
+                    remove_columns=split_ds.column_names,
+                )
+                keep_cols = [
+                    "instruction",
+                    "input",
+                    "output",
+                    "unsafe_response",
+                    "helpful_output",
+                    "safety_label",
+                    "split",
+                ]
+                removable = [c for c in split_ds.column_names if c not in keep_cols]
+                if removable:
+                    split_ds = split_ds.remove_columns(removable)
+                return split_ds
+
+            if sft_data not in {"preferred_safe", "all"}:
+                raise ValueError(
+                    f"cfg.exp.sft_data must be one of ['preferred_safe', 'all'], got: {sft_data}"
+                )
+
+            def _map_pku_row(ex, idx):
+                prompt = _to_str(ex.get("prompt", ""))
+                r0 = _to_str(ex.get("response_0", ""))
+                r1 = _to_str(ex.get("response_1", ""))
+                s0 = _to_bool(ex.get("is_response_0_safe", False))
+                s1 = _to_bool(ex.get("is_response_1_safe", False))
+                pref = _parse_pref_id(ex.get("better_response_id", 0))
+                preferred = r0 if pref == 0 else r1
+                other = r1 if pref == 0 else r0
+
+                both_unsafe = (not s0) and (not s1)
+                has_unsafe = (not s0) or (not s1)
+                if both_unsafe:
+                    rng = np.random.default_rng(split_seed + int(idx))
+                    keep_unsafe = r0 if int(rng.integers(0, 2)) == 0 else r1
+                    output = SAFE_REFUSAL_OUTPUT
+                    unsafe_response = keep_unsafe
+                    # No safe answer exists; choose canonical refusal as preferred target.
+                    helpful_output = SAFE_REFUSAL_OUTPUT
+                    safety_label = True
+                elif has_unsafe:
+                    unsafe_response = r0 if not s0 else r1
+                    output = SAFE_REFUSAL_OUTPUT
+                    # Safe-first preference for pairwise SFT/DAA style losses.
+                    helpful_output = r0 if s0 else r1
+                    safety_label = True
+                else:
+                    output = preferred
+                    unsafe_response = other
+                    helpful_output = preferred
+                    safety_label = False
+
+                return {
+                    "instruction": prompt,
+                    "input": "",
+                    "output": _to_str(output),
+                    "unsafe_response": _to_str(unsafe_response),
+                    "helpful_output": _to_str(helpful_output),
+                    "safety_label": bool(safety_label),
+                }
+
+            split_ds = split_ds.map(_map_pku_row, with_indices=True)
+            keep_cols = [
+                "instruction",
+                "input",
+                "output",
+                "unsafe_response",
+                "helpful_output",
+                "safety_label",
+                "split",
+            ]
+            removable = [c for c in split_ds.column_names if c not in keep_cols]
+            if removable:
+                split_ds = split_ds.remove_columns(removable)
+            return split_ds
+
+        tr_raw = _normalize_pku_split(tr_raw, "train")
+        ev_raw = _normalize_pku_split(ev_raw, "validation")
 
         # Optional: keep only unsafe rows (safety_label == True) in train/eval splits.
         # Dataset convention (ihounie/SAFE-ALPACA-BTails-llama2):
@@ -103,6 +264,11 @@ class SAFETY(Experiment):
         # "response length" is measured as character length of the raw `output` field.
         # Under the dataset convention above, `safety_label == True` selects UNSAFE prompts.
         filter_longest = getattr(cfg.train, "filter_longest", False)
+        if (
+            str(getattr(cfg.exp, "loss_type", "")).lower() == "sft"
+            and str(getattr(cfg.exp, "sft_data", "preferred_safe")).lower() == "all"
+        ):
+            filter_longest = False
         if filter_longest:
             def _add_response_len(ex):
                 answer = ex.get("output", "")
@@ -160,7 +326,7 @@ class SAFETY(Experiment):
 
         complete_dl = complete_dl.map(_add_safe_output)
 
-        # Add `chosen_output` / `rejected_output` columns for preference-based losses (e.g. DAA).
+        # Add `chosen_output` / `rejected_output` columns for preference-based losses (e.g. DAA/SFT).
         # Dataset convention (ihounie/SAFE-ALPACA-BTails-llama2):
         #   * safety_label == True  -> UNSAFE prompt; dataset `output` is a refusal, and
         #                              `beavertails_output` is the harmful response.
@@ -169,13 +335,19 @@ class SAFETY(Experiment):
         # (`SAFE_REFUSAL_OUTPUT`) used by the other methods, so the refusal text is identical
         # across methods (the dataset's stored refusal differs only in trailing punctuation).
         def _add_preference_outputs(ex):
-            is_unsafe_prompt = _to_bool(ex.get("safety_label", False)) is True
-            if is_unsafe_prompt:
-                chosen = SAFE_REFUSAL_OUTPUT
-                rejected = ex.get("beavertails_output", "") or ""
+            helpful_pref = ex.get("helpful_output", None)
+            if isinstance(helpful_pref, str) and helpful_pref.strip() != "":
+                # PKU path: safe-first preference (safe response beats unsafe one).
+                chosen = helpful_pref
+                rejected = ex.get("unsafe_response", "") or ""
             else:
-                chosen = ex.get("output", "") or ""
-                rejected = SAFE_REFUSAL_OUTPUT
+                is_unsafe_prompt = _to_bool(ex.get("safety_label", False)) is True
+                if is_unsafe_prompt:
+                    chosen = SAFE_REFUSAL_OUTPUT
+                    rejected = ex.get("beavertails_output", "") or ""
+                else:
+                    chosen = ex.get("output", "") or ""
+                    rejected = SAFE_REFUSAL_OUTPUT
             if not isinstance(chosen, str):
                 chosen = str(chosen)
             if not isinstance(rejected, str):
@@ -208,6 +380,7 @@ class SAFETY(Experiment):
 
         loss_type = str(getattr(cfg.exp, "loss_type", "")).lower()
         is_daa = loss_type == "daa"
+        is_sft = loss_type == "sft"
 
         def _tokenize_prompt_answer(prompt: str, answer: str):
             """Tokenize prompt+answer with EOS and right-pad to max_length.
@@ -333,17 +506,17 @@ class SAFETY(Experiment):
                 #"labels": labels,
             }
 
-            # For DAA (DPO-style preference loss with KL penalty) also emit tokenized
-            # chosen/rejected sequences sharing the same prompt.
-            if is_daa:
+            # For preference-based losses (DAA/SFT) also emit tokenized chosen sequence.
+            if is_daa or is_sft:
                 chosen_answer = sample.get("chosen_output", "") or ""
-                rejected_answer = sample.get("rejected_output", "") or ""
                 chosen_ids, chosen_mask = _tokenize_prompt_answer(prompt, chosen_answer)
-                rejected_ids, rejected_mask = _tokenize_prompt_answer(prompt, rejected_answer)
                 out["chosen_input_ids"] = chosen_ids
                 out["chosen_response_mask"] = chosen_mask
-                out["rejected_input_ids"] = rejected_ids
-                out["rejected_response_mask"] = rejected_mask
+                if is_daa:
+                    rejected_answer = sample.get("rejected_output", "") or ""
+                    rejected_ids, rejected_mask = _tokenize_prompt_answer(prompt, rejected_answer)
+                    out["rejected_input_ids"] = rejected_ids
+                    out["rejected_response_mask"] = rejected_mask
 
             return out
         return fn
@@ -403,8 +576,8 @@ class SAFETY(Experiment):
                     #"labels": labels,                    # (B, L) with -100 outside response
                 }
 
-                # For DAA / preference-based losses: pass through chosen/rejected tensors
-                # alongside their attention masks, if the preprocessing produced them.
+                # For preference-based losses: pass through chosen/rejected tensors
+                # alongside their attention masks, if preprocessing produced them.
                 if len(samples) > 0 and "chosen_input_ids" in samples[0]:
                     def _stack_or_pad(key, pad_value, dtype):
                         lst = [torch.as_tensor(s[key], dtype=dtype) for s in samples]
@@ -415,8 +588,6 @@ class SAFETY(Experiment):
 
                     chosen_ids = _stack_or_pad("chosen_input_ids", self.pad_token_id, torch.long)
                     chosen_rm = _stack_or_pad("chosen_response_mask", 0, torch.long).bool()
-                    rejected_ids = _stack_or_pad("rejected_input_ids", self.pad_token_id, torch.long)
-                    rejected_rm = _stack_or_pad("rejected_response_mask", 0, torch.long).bool()
 
                     def _attn_from_mask(ids, rm):
                         L = ids.shape[1]
@@ -434,9 +605,12 @@ class SAFETY(Experiment):
                     batch["chosen_input_ids"] = chosen_ids
                     batch["chosen_response_mask"] = chosen_rm
                     batch["chosen_attention_mask"] = _attn_from_mask(chosen_ids, chosen_rm)
-                    batch["rejected_input_ids"] = rejected_ids
-                    batch["rejected_response_mask"] = rejected_rm
-                    batch["rejected_attention_mask"] = _attn_from_mask(rejected_ids, rejected_rm)
+                    if "rejected_input_ids" in samples[0]:
+                        rejected_ids = _stack_or_pad("rejected_input_ids", self.pad_token_id, torch.long)
+                        rejected_rm = _stack_or_pad("rejected_response_mask", 0, torch.long).bool()
+                        batch["rejected_input_ids"] = rejected_ids
+                        batch["rejected_response_mask"] = rejected_rm
+                        batch["rejected_attention_mask"] = _attn_from_mask(rejected_ids, rejected_rm)
 
                 # BASELINE IS COMPUTED AFTER PRECOMPUTE STEP
                 # if "baseline_logprob" in samples[0]:
@@ -490,13 +664,13 @@ class SAFETY(Experiment):
                 # Only apply if all expected columns exist.
                 if not all(hasattr(ds, "column_names") and c in ds.column_names for c in keep_cols):
                     return
-                # For DAA we also need the chosen/rejected tensors; include them when present.
-                daa_cols = [
-                    "chosen_input_ids", "chosen_response_mask",
-                    "rejected_input_ids", "rejected_response_mask",
-                ]
-                if all(c in ds.column_names for c in daa_cols):
-                    keep_cols = keep_cols + daa_cols
+                # For preference losses, include chosen/rejected tensors when present.
+                chosen_cols = ["chosen_input_ids", "chosen_response_mask"]
+                rejected_cols = ["rejected_input_ids", "rejected_response_mask"]
+                if all(c in ds.column_names for c in chosen_cols):
+                    keep_cols = keep_cols + chosen_cols
+                if all(c in ds.column_names for c in rejected_cols):
+                    keep_cols = keep_cols + rejected_cols
 
                 try:
                     ds.set_format(type="torch", columns=keep_cols, output_all_columns=False)
@@ -514,6 +688,8 @@ class SAFETY(Experiment):
                 self.avg_dual_refusal = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
                 # Dual for the don't-over-refuse constraint on SAFE prompts: logp(refusal) <= tol2.
                 self.avg_dual_no_refusal = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                # Dual for helpfulness on SAFE prompts: logp(helpful_output) >= tol3.
+                self.avg_dual_helpful = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
 
             def train(self, *args, **kwargs):
                 """
@@ -697,6 +873,19 @@ class SAFETY(Experiment):
                         return loss, chosen_out
                     return loss
 
+                if str(getattr(cfg, "loss_type", "")).lower() == "sft":
+                    chosen_ids = inputs.get("chosen_input_ids", inputs["input_ids"])
+                    chosen_mask = inputs.get("chosen_response_mask", inputs["response_mask"])
+                    chosen_attn = inputs.get("chosen_attention_mask", inputs["attention_mask"])
+                    chosen_lp, chosen_out = self._daa_seq_logp(
+                        model, chosen_ids, chosen_attn, chosen_mask
+                    )
+                    chosen_tokens = chosen_mask[:, 1:].sum(dim=-1).clamp_min(1).to(chosen_lp.dtype)
+                    loss = -chosen_lp.sum() / chosen_tokens.sum()
+                    if return_outputs:
+                        return loss, chosen_out
+                    return loss
+
                 input_ids = inputs['input_ids']  # size = (B, 2, L)
                 attention_mask = inputs['attention_mask']  # size = (B, 2, L)
                 response_mask = inputs['response_mask']  # size = (B, 2, L)
@@ -866,7 +1055,16 @@ class SAFETY(Experiment):
                     slack_refusal = (cfg.tol - answer_log_probs) * is_unsafe_prompt.float()
                     # Don't-over-refuse constraint on SAFE prompts: logp(refusal) - tol2 <= 0
                     # (`slack_no_refusal` was already computed above, masked to safe samples.)
-                    slack = slack_refusal + slack_no_refusal
+                    tol3 = getattr(cfg, "tol3", None)
+                    if tol3 is not None:
+                        # Helpfulness constraint on SAFE prompts:
+                        #   logp(helpful_output) >= tol3  <=>  tol3 - logp <= 0
+                        # Here `output` is the helpful target for safe prompts.
+                        slack_helpful = (float(tol3) - answer_log_probs) * is_safe_prompt.float()
+                    else:
+                        slack_helpful = torch.zeros_like(answer_log_probs)
+
+                    slack = slack_refusal + slack_no_refusal + slack_helpful
 
                 if cfg.loss_type == "avg":
                         dual_refusal = self.avg_dual_refusal.clone()
@@ -877,9 +1075,14 @@ class SAFETY(Experiment):
                         dual_no_refusal = torch.clamp(dual_no_refusal + cfg.dual_step_size * slack_no_refusal.mean(), min=0.0)
                         self.avg_dual_no_refusal = dual_no_refusal.detach()
 
+                        dual_helpful = self.avg_dual_helpful.clone()
+                        dual_helpful = torch.clamp(dual_helpful + cfg.dual_step_size * slack_helpful.mean(), min=0.0)
+                        self.avg_dual_helpful = dual_helpful.detach()
+
                         loss += (
                             dual_refusal.detach() * slack_refusal
                             + dual_no_refusal.detach() * slack_no_refusal
+                            + dual_helpful.detach() * slack_helpful
                         )
                         # log the avg dual
 
@@ -1456,9 +1659,10 @@ class SAFETY(Experiment):
                 # Objective tracked on SAFE prompts (keep producing the benign answer).
                 answer_log_ratios_objective = answer_log_probs[is_safe_prompt]
                 tol2 = getattr(cfg, "tol2", None)
-                if tol2 is None:
+                tol3 = getattr(cfg, "tol3", None)
+                if tol2 is None and tol3 is None:
                     # -----------------------------
-                    # Existing behavior (when tol2 is NOT provided):
+                    # Existing behavior (when tol2/tol3 are NOT provided):
                     # only compute/log constraint slacks for UNSAFE prompts (safety_label=True).
                     # -----------------------------
                     self._last_constraint_indexes = indexes[is_unsafe_prompt].detach().cpu()
@@ -1504,15 +1708,16 @@ class SAFETY(Experiment):
                     }
 
                 # -----------------------------
-                # tol2 is provided => compute BOTH constraints in eval:
+                # tol2 and/or tol3 are provided => compute extra SAFE-prompt constraints in eval:
                 #  - UNSAFE prompts (safety_label=True): slack_refusal = tol - logp(output)
                 #  - SAFE prompts   (safety_label=False): slack_no_refusal = logp(refusal) - tol2
+                #  - SAFE prompts   (safety_label=False): slack_helpful = tol3 - logp(helpful_output)
                 # -----------------------------
                 slack_refusal = (cfg.tol - answer_log_probs) * is_unsafe_prompt.float()
 
                 safe_output_logp = torch.zeros_like(answer_log_probs)
                 slack_no_refusal = torch.zeros_like(answer_log_probs)
-                if bool(is_safe_prompt.any()):
+                if tol2 is not None and bool(is_safe_prompt.any()):
                     proc = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
                     if proc is None:
                         raise RuntimeError("Could not find tokenizer/processing_class on Trainer to score safe_output.")
@@ -1618,7 +1823,12 @@ class SAFETY(Experiment):
 
                     slack_no_refusal = (safe_output_logp - float(tol2)) * is_safe_prompt.float()
 
-                slacks = slack_refusal + slack_no_refusal
+                if tol3 is not None:
+                    slack_helpful = (float(tol3) - answer_log_probs) * is_safe_prompt.float()
+                else:
+                    slack_helpful = torch.zeros_like(answer_log_probs)
+
+                slacks = slack_refusal + slack_no_refusal + slack_helpful
 
                 # Keep for wandb callback logging
                 self._last_constraint_slacks = slacks.detach().cpu()
@@ -1669,6 +1879,9 @@ class SAFETY(Experiment):
                 no_refusal_slack_mean = (
                     slack_no_refusal[is_safe_prompt].mean().item() if bool(is_safe_prompt.any()) else 0.0
                 )
+                helpful_slack_mean = (
+                    slack_helpful[is_safe_prompt].mean().item() if bool(is_safe_prompt.any()) else 0.0
+                )
 
                 return {
                     "objective": objective,
@@ -1681,6 +1894,7 @@ class SAFETY(Experiment):
                     # `constraint_unsafe_mean` = no-refusal-constraint slack mean (on SAFE prompts).
                     "constraint_safe_mean": refusal_slack_mean,
                     "constraint_unsafe_mean": no_refusal_slack_mean,
+                    "constraint_helpful_mean": helpful_slack_mean,
                 }
         return CustomTrainer
     

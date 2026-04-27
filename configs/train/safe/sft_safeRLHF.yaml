@@ -1,0 +1,74 @@
+# @package _global_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: sft
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun
+    subdir: ${hydra.job.num}
+
+train:
+  seed: 42
+  output_dir: "./outputs/safe/${exp.loss_type}/epochs:${train.hf_args.num_train_epochs}"
+  do_train: true
+  do_initial_eval: false
+  use_wandb: true
+  save_model: true
+  wandb_project: "SAFE-RLHF-point"
+  run_name: "run-${exp.loss_type}-epochs:${train.hf_args.num_train_epochs}"
+  eval_on_train: false
+  enable_profiler: false
+  include_inputs_for_metrics: true
+  dropout: 0.0
+  data_proportion: 1.0
+  # Optional: cap number of prompts for train-end generation/logprob eval. Disabled by default.
+  max_gen: 10
+  max_length: 512
+  eval_at_end: true
+  filter_longest: false
+  only_unsafe_train: false
+  only_unsafe_eval: false
+  push_adapters_to_wandb: true
+  lora:
+    r: 64
+    lora_alpha: 128
+    lora_dropout: 0.05
+  hf_args:
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 32
+    eval_accumulation_steps: 4
+    num_train_epochs: 3
+    learning_rate: 5e-4
+    lr_scheduler_type: "cosine"
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+    eval_strategy: "no"
+    save_strategy: "no"
+    gradient_checkpointing: false
+    eval_do_concat_batches: false
+    bf16: true
+    fp16: false
+
+exp:
+  name: "safety"
+  model_name: PKU-Alignment/alpaca-7b-reproduced
+  dataset: PKU-Alignment/PKU-SafeRLHF-30K
+  loss_type: sft
+  # SFT data mode:
+  #   preferred_safe -> safe response beats unsafe; both safe use helpfulness preference.
+  #   all            -> train on both PKU responses regardless of labels.
+  sft_data: preferred_safe
+  # Present for compatibility with shared safety metrics/config paths; ignored by SFT loss.
+  tol: -1.2
+  tol2: -2.0
+  tol3: -1.2
+  loss_alpha: 10.0
+  dual_step_size: 0.1
