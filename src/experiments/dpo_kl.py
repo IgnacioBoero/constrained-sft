@@ -1107,7 +1107,11 @@ class DPO_KL(Experiment):
                 logp_rejected = avg_logp[B:]
                 gap = None
                 slic_hf_aliases = {"slic_hf", "slic-hf", "slichf"}
-                if loss_type in {"simpo", "dpo"} or loss_type in slic_hf_aliases or needs_pairwise_slack:
+                if (
+                    loss_type in {"simpo", "dpo", "cpo", "CPO"}
+                    or loss_type in slic_hf_aliases
+                    or needs_pairwise_slack
+                ):
                     gap = logp_chosen - logp_rejected  # (B,)
 
                 # SimPO objective (no KL regularization / no base model pass):
@@ -1154,6 +1158,35 @@ class DPO_KL(Experiment):
                     if return_outputs:
                         packed = torch.stack(
                             [logp_chosen, logp_rejected, score, hinge, reg], dim=-1
+                        )
+                        return loss, {"logits": packed}
+                    return loss
+
+                if loss_type in {"cpo", "CPO"}:
+                    alpha_cpo = float(getattr(cfg, "loss_alpha", 1.0))
+                    beta_cpo = float(getattr(cfg, "loss_beta", 1.0))
+                    if gap is None:
+                        gap = logp_chosen - logp_rejected
+                    score = beta_cpo * gap
+                    preference_loss = F.softplus(-score)
+                    chosen_reg = -alpha_cpo * logp_chosen
+                    per_example_loss = preference_loss + chosen_reg
+                    loss = per_example_loss.mean()
+                    if model.training:
+                        self._accumulate_pbar_means(
+                            objective_mean=float(preference_loss.mean().detach().cpu().item()),
+                            loss_mean=float(loss.detach().cpu().item()),
+                        )
+                    if return_outputs:
+                        packed = torch.stack(
+                            [
+                                logp_chosen,
+                                logp_rejected,
+                                score,
+                                preference_loss,
+                                chosen_reg,
+                            ],
+                            dim=-1,
                         )
                         return loss, {"logits": packed}
                     return loss
@@ -2031,6 +2064,16 @@ class DPO_KL(Experiment):
                     out["objective_slic_hf_reg"] = float(np.mean(reg))
                     out["objective_slic_hf_loss"] = float(np.mean(hinge + reg))
                     out["slic_hf_margin_sat_rate"] = float(np.mean(score >= 0.0))
+                elif loss_type in {"cpo", "CPO"}:
+                    # third column is score = beta * (logp_chosen - logp_rejected).
+                    score = arr[:, 2]
+                    alpha_cpo = float(getattr(exp_cfg, "loss_alpha", 1.0))
+                    preference_loss = np.logaddexp(0.0, -score)
+                    chosen_reg = -alpha_cpo * logp_chosen
+                    out["objective_cpo_preference_loss"] = float(np.mean(preference_loss))
+                    out["objective_cpo_reg"] = float(np.mean(chosen_reg))
+                    out["objective_cpo_loss"] = float(np.mean(preference_loss + chosen_reg))
+                    out["cpo_pref_sat_rate"] = float(np.mean(score >= 0.0))
                 else:
                     kl_mean = arr[:, 2]
                     out["objective_kl"] = float(np.mean(kl_mean))
