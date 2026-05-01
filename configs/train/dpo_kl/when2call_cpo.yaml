@@ -8,7 +8,8 @@ hydra:
       exp.loss_type: cpo
       train.hf_args.num_train_epochs: 10
       exp.loss_alpha: 1.0
-      exp.loss_beta: 0.01, 0.05, 0.1
+      exp.loss_beta: 0.25
+      train.seed: 43,44
       
   # Ensure sequential launching (no parallel launcher)
   launcher:

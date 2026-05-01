@@ -36,6 +36,7 @@ class DPO_KL(Experiment):
       - erm: objective only
       - avg: average dual variable
       - aug_dual: augmented Lagrangian with per-example dual variables
+      - dual: same objective and slacks as aug_dual but classical (linear) Lagrangian λ·slack
       - resilient: augmented-dual variant with resilient coefficient
       - penalty: linear penalty
       - _both_avg: avg dual on (win, loose) slacks with separate duals
@@ -982,7 +983,7 @@ class DPO_KL(Experiment):
 
                 needs_single_avg_dual = loss_type == "avg"
                 needs_both_avg_duals = loss_type in both_avg_aliases
-                needs_single_aug_dual = loss_type in {"aug_dual", "resilient"}
+                needs_single_aug_dual = loss_type in {"aug_dual", "resilient", "dual"}
                 needs_both_aug_duals = (
                     loss_type in both_aug_aliases or loss_type in resilient_both_aliases
                 )
@@ -1060,6 +1061,7 @@ class DPO_KL(Experiment):
                 needs_pairwise_slack = loss_type in {
                     "avg",
                     "aug_dual",
+                    "dual",
                     "resilient",
                     "penalty",
                 } or (loss_type in three_aug_aliases)
@@ -1340,6 +1342,17 @@ class DPO_KL(Experiment):
                             )
                         self.avg_dual = dual_avg.detach()
                     loss = loss + self.avg_dual * slack
+
+                elif loss_type == "dual":
+                    dual_var = self.dual_vars[index].clone()
+                    with torch.no_grad():
+                        if model.training:
+                            dual_var = torch.clamp(
+                                dual_var + cfg.dual_step_size * slack,
+                                min=0.0,
+                            )
+                            self.dual_vars[index] = dual_var.detach()
+                    loss = loss + dual_var * slack
 
                 elif loss_type == "aug_dual":
                     dual_var = self.dual_vars[index].clone()
@@ -1688,7 +1701,7 @@ class DPO_KL(Experiment):
                 dual_stats_loose = None
                 dual_stats_gap = None
                 if (
-                    loss_type in {"aug_dual", "resilient"}
+                    loss_type in {"aug_dual", "dual", "resilient"}
                     or loss_type in both_aug_aliases
                     or loss_type in resilient_both_aliases
                     or loss_type in three_aug_aliases
@@ -1737,7 +1750,7 @@ class DPO_KL(Experiment):
                             "_dual_vals": dual_vals if train_indexes else None,
                         }
 
-                    if loss_type in {"aug_dual", "resilient"}:
+                    if loss_type in {"aug_dual", "dual", "resilient"}:
                         dual_stats = _dual_stats_for(self.dual_vars)
                         if dual_stats is not None:
                             out.update(
@@ -1858,7 +1871,9 @@ class DPO_KL(Experiment):
                     except Exception as exc:
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
-                if loss_type in {"aug_dual", "resilient"} and getattr(cfg.train, "use_wandb", False):
+                if loss_type in {"aug_dual", "dual", "resilient"} and getattr(
+                    cfg.train, "use_wandb", False
+                ):
                     try:
                         import wandb
 

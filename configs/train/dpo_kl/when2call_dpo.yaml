@@ -7,8 +7,8 @@ hydra:
     params:
       exp.loss_type: dpo
       train.hf_args.num_train_epochs: 10
-      exp.loss_alpha: 0.1,0.5,0.05
-      
+      exp.loss_alpha: 0.1
+      train.seed: 43,44
   # Ensure sequential launching (no parallel launcher)
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher

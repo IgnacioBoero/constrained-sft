@@ -7,8 +7,9 @@ hydra:
     params:
       exp.loss_type: simpo
       train.hf_args.num_train_epochs: 10
-      exp.loss_alpha: 2.0,2.5
-      exp.tol: 0.0,1.0
+      exp.loss_alpha: 2.0
+      exp.tol: 0.0
+      train.seed: 43,44
       
   # Ensure sequential launching (no parallel launcher)
   launcher:
