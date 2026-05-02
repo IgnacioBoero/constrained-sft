@@ -41,6 +41,7 @@ class DPO_KL(Experiment):
       - penalty: linear penalty
       - _both_avg: avg dual on (win, loose) slacks with separate duals
       - _both_aug_dual: augmented dual on (win, loose) slacks with separate per-sample duals
+      - _both_dual: classical (linear) Lagrangian on (win, loose) with separate per-sample duals
       - resilient_both: resilient augmented dual on (win, loose) slacks
       - _both_penalty: linear penalty with separate multipliers for (win, loose) slacks
       - aug_dual_three: augmented dual with three per-sample constraints
@@ -978,6 +979,7 @@ class DPO_KL(Experiment):
                 loss_type = str(self.custom_cfg.exp.loss_type)
                 both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
                 both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                both_dual_aliases = {"_both_dual", "both_dual", "dual_both"}
                 resilient_both_aliases = {"resilient_both"}
                 three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
 
@@ -985,7 +987,9 @@ class DPO_KL(Experiment):
                 needs_both_avg_duals = loss_type in both_avg_aliases
                 needs_single_aug_dual = loss_type in {"aug_dual", "resilient", "dual"}
                 needs_both_aug_duals = (
-                    loss_type in both_aug_aliases or loss_type in resilient_both_aliases
+                    loss_type in both_aug_aliases
+                    or loss_type in resilient_both_aliases
+                    or loss_type in both_dual_aliases
                 )
                 needs_three_aug_duals = loss_type in three_aug_aliases
                 needs_any_per_example_duals = (
@@ -1014,7 +1018,7 @@ class DPO_KL(Experiment):
                             n, dtype=torch.float, requires_grad=False, device=self.model.device
                         )
                     if needs_both_aug_duals:
-                        # State for two-constraint (_both*) augmented-dual losses.
+                        # Per-sample win/loose duals: aug_dual_both, resilient_both, dual_both.
                         self.dual_vars_win = torch.zeros(
                             n, dtype=torch.float, requires_grad=False, device=self.model.device
                         )
@@ -1055,6 +1059,7 @@ class DPO_KL(Experiment):
                 loss_type = str(cfg.loss_type)
                 both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
                 both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                both_dual_aliases = {"_both_dual", "both_dual", "dual_both"}
                 resilient_both_aliases = {"resilient_both"}
                 both_penalty_aliases = {"_both_penalty", "both_penalty", "penalty_both"}
                 three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
@@ -1068,6 +1073,7 @@ class DPO_KL(Experiment):
                 needs_two_constraint_slacks = (
                     loss_type in both_avg_aliases
                     or loss_type in both_aug_aliases
+                    or loss_type in both_dual_aliases
                     or loss_type in resilient_both_aliases
                     or loss_type in both_penalty_aliases
                     or loss_type in three_aug_aliases
@@ -1411,6 +1417,31 @@ class DPO_KL(Experiment):
                         + alpha_loose * self.avg_dual_loose.detach() * slack_loose
                     )
 
+                elif loss_type in both_dual_aliases:
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(
+                        getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0))
+                    )
+                    dual_var_win = self.dual_vars_win[index].clone()
+                    dual_var_loose = self.dual_vars_loose[index].clone()
+                    with torch.no_grad():
+                        if model.training:
+                            dual_var_win = torch.clamp(
+                                dual_var_win + cfg.dual_step_size * slack_win,
+                                min=0.0,
+                            )
+                            dual_var_loose = torch.clamp(
+                                dual_var_loose + cfg.dual_step_size * slack_loose,
+                                min=0.0,
+                            )
+                            self.dual_vars_win[index] = dual_var_win.detach()
+                            self.dual_vars_loose[index] = dual_var_loose.detach()
+                    loss = (
+                        loss
+                        + alpha_win * dual_var_win * slack_win
+                        + alpha_loose * dual_var_loose * slack_loose
+                    )
+
                 elif loss_type in both_aug_aliases:
                     alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
                     alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
@@ -1567,6 +1598,7 @@ class DPO_KL(Experiment):
                 loss_type = str(exp_cfg.loss_type)
                 both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
                 both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                both_dual_aliases = {"_both_dual", "both_dual", "dual_both"}
                 resilient_both_aliases = {"resilient_both"}
                 three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
                 arr = pred.predictions
@@ -1703,6 +1735,7 @@ class DPO_KL(Experiment):
                 if (
                     loss_type in {"aug_dual", "dual", "resilient"}
                     or loss_type in both_aug_aliases
+                    or loss_type in both_dual_aliases
                     or loss_type in resilient_both_aliases
                     or loss_type in three_aug_aliases
                 ):
@@ -1763,7 +1796,11 @@ class DPO_KL(Experiment):
                                     "dual_vars_cvar": dual_stats["dual_vars_cvar"],
                                 }
                             )
-                    elif loss_type in both_aug_aliases or loss_type in resilient_both_aliases:
+                    elif (
+                        loss_type in both_aug_aliases
+                        or loss_type in both_dual_aliases
+                        or loss_type in resilient_both_aliases
+                    ):
                         dual_stats_win = _dual_stats_for(self.dual_vars_win)
                         dual_stats_loose = _dual_stats_for(self.dual_vars_loose)
                         if dual_stats_win is not None:
@@ -1902,7 +1939,9 @@ class DPO_KL(Experiment):
                         print(f"[dpo_kl] wandb logging failed: {exc}")
 
                 if (
-                    loss_type in both_aug_aliases or loss_type in resilient_both_aliases
+                    loss_type in both_aug_aliases
+                    or loss_type in both_dual_aliases
+                    or loss_type in resilient_both_aliases
                 ) and getattr(cfg.train, "use_wandb", False):
                     try:
                         import wandb

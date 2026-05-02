@@ -161,6 +161,14 @@ Two per-example augmented-dual terms, one for `slack_win`, one for `slack_loose`
 
 Each side uses the same augmented form as `aug_dual` (`a`, `b`, `z`, piecewise dual gradient), and the final loss adds both penalty terms to `kl_mean`, then averages.
 
+### 11b) `_both_dual` aliases
+
+Aliases: `_both_dual`, `both_dual`, `dual_both`
+
+Two per-example **classical** (linear) Lagrangian terms, same dual update as single-constraint `dual`:  
+`λ <- clamp(λ + dual_step_size * slack, min=0)` per example and constraint, then  
+`loss += alpha_win * λ_win * slack_win + alpha_loose * λ_loose * slack_loose` (alphas from `loss_alpha_win` / `loss_alpha_loose`, falling back to `loss_alpha`). No quadratic penalty.
+
 ### 12) `_both_penalty` aliases
 
 Aliases: `_both_penalty`, `both_penalty`, `penalty_both`
@@ -189,6 +197,7 @@ Each uses the same augmented piecewise update as `aug_dual` but with independent
   - `erm`, `avg`, `aug_dual`, `resilient`, `penalty`
   - `_both_avg` aliases
   - `_both_aug_dual` aliases
+  - `_both_dual` aliases
   - `_both_penalty` aliases
   - `aug_dual_three` aliases
 - No reference pass:
