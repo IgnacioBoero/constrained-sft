@@ -1,8 +1,11 @@
 # @package _global_
 
 hydra:
-  launcher:
-    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      train.seed: 43,44
 
 train:
   seed: 42

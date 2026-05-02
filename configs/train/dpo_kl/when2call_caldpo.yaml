@@ -5,7 +5,18 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      train.seed: 43,44
+      exp.loss_type: cal_dpo
+      train.hf_args.num_train_epochs: 10
+      exp.loss_alpha: 0.1,0.5,0.05
+      
+  # Ensure sequential launching (no parallel launcher)
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  # Optional: get deterministic per-job folders 0,1,2,...
+  sweep:
+    dir: ./multirun
+    subdir: ${hydra.job.num}  # 0,1,2,... in the iteration order
 
 train:
   seed: 42
@@ -25,22 +36,30 @@ train:
   # Dataset / preprocessing
   cache_dir: "./cache"
   dataset: when2call
-  use_xlam_prompt_format: true
-  when2call_strict_prompt: false
+  when2call_strict_prompt: true
   val_fraction: 0.05
-  objective_val_fraction: 0.05
-  constraint_val_fraction: 0.05
   shuffle: true
   sanity_check: false
   data_proportion: 1.0
-  objective_data_proportion: 1.0
-  constraint_data_proportion: 1.0
   max_prompt_length: 1024
   max_length: 2048
   filter_shortest_train: 1.0
 
   # Train-end generation: sample validation prompts
   max_gen: 0
+  post_train_when2call_lm_eval:
+    enabled: false
+    backend: "vllm"
+    task_name: "when2call-llama3_2"
+    batch_size: "1"
+    use_cache: true
+    local_output_dir: "outputs/when2call_lm_eval_vllm"
+    tensor_parallel_size: -1
+    dtype: "bfloat16"
+    merge_dtype: "bfloat16"
+    gpu_memory_utilization: 0.9
+    max_length: 2048
+    trust_remote_code: false
 
   lora:
     r: 8
@@ -51,8 +70,8 @@ train:
     per_device_train_batch_size: 1
     per_device_eval_batch_size: 1
     gradient_accumulation_steps: 32
-    eval_accumulation_steps: 2
-    num_train_epochs: 10
+    eval_accumulation_steps: 4
+    num_train_epochs: 1
     learning_rate: 5e-5
     lr_scheduler_type: "cosine"
     warmup_ratio: 0.0
@@ -67,12 +86,13 @@ train:
 exp:
   name: "dpo_kl"
   model_name: "Salesforce/xLAM-2-1b-fc-r"
-  use_pretrained_slacks: false
 
   # Constraint settings
-  tol: 0.0
+  tol: 1.0
 
   # Loss/optimizer hyperparams
-  loss_type: simpo
-  loss_alpha: 2.5
-  dual_step_size: 1.0
+  loss_type: dpo
+  loss_alpha: 0.05
+  dual_step_size: 0.5
+  tol_win: 1.0
+  tol_loose: -1.0

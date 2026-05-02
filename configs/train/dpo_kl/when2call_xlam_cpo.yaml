@@ -5,12 +5,13 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
+      exp.loss_beta: 0.25
       train.seed: 43,44
 
 train:
   seed: 42
   split_seed: 42
-  output_dir: "./outputs/dpo_kl/${train.dataset}/${exp.loss_type}/tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  output_dir: "./outputs/dpo_kl/${train.dataset}/${exp.loss_type}/alpha:${exp.loss_alpha}-beta:${exp.loss_beta}"
   do_train: true
   do_initial_eval: false
   use_wandb: true
@@ -18,7 +19,7 @@ train:
   push_adapters_to_wandb: true
   wandb_project: "xlam_when2call"
   wandb_entity: "alelab"
-  run_name: "dpo_kl-${train.dataset}-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  run_name: "dpo_kl-${train.dataset}-${exp.loss_type}-alpha:${exp.loss_alpha}-beta:${exp.loss_beta}"
   eval_at_end: true
   eval_on_train: true
 
@@ -73,6 +74,9 @@ exp:
   tol: 0.0
 
   # Loss/optimizer hyperparams
-  loss_type: simpo
-  loss_alpha: 2.5
-  dual_step_size: 1.0
+  loss_type: cpo
+  loss_alpha: 1.0
+  loss_beta: 0.01
+  dual_step_size: 0.0
+  tol_win: 0.0
+  tol_loose: -0.0
