@@ -7,7 +7,7 @@ hydra:
     params:
       exp.loss_type: penalty_both
       train.hf_args.num_train_epochs: 10
-      exp.loss_alpha: 1.o
+      exp.loss_alpha: 1.0
       train.seed: 43,44
 
 train:
