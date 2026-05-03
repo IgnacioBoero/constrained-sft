@@ -1259,7 +1259,8 @@ class DPO_KL(Experiment):
                             loss_mean=float(loss.detach().cpu().item()),
                         )
                     if return_outputs:
-                        packed = torch.stack([rel_logp_chosen, rel_logp_rejected, score], dim=-1)
+                        # Match KL/constrained objectives: cols 0–1 are per-token avg logp (not ref-subtracted).
+                        packed = torch.stack([logp_chosen, logp_rejected, score], dim=-1)
                         return loss, {"logits": packed}
                     return loss
 
@@ -1281,11 +1282,14 @@ class DPO_KL(Experiment):
                             loss_mean=float(loss.detach().cpu().item()),
                         )
                     if return_outputs:
+                        # Raw avg logp in 0–1 for eval slacks; rel logp in 3–4 for metric penalty terms.
                         packed = torch.stack(
                             [
+                                logp_chosen,
+                                logp_rejected,
+                                score,
                                 rel_logp_chosen,
                                 rel_logp_rejected,
-                                score,
                                 dpo_loss,
                                 penalty,
                             ],
@@ -2100,8 +2104,15 @@ class DPO_KL(Experiment):
                     if beta_cal == 0.0:
                         raise ValueError("cal_dpo requires exp.loss_alpha to be non-zero.")
                     target = 1.0 / (2.0 * beta_cal)
-                    chosen_penalty = (logp_chosen - target) ** 2
-                    rejected_penalty = (logp_rejected + target) ** 2
+                    if arr.shape[1] >= 5:
+                        rel_logp_chosen_m = arr[:, 3]
+                        rel_logp_rejected_m = arr[:, 4]
+                    else:
+                        # Legacy: columns 0–1 were reference-subtracted logp.
+                        rel_logp_chosen_m = logp_chosen
+                        rel_logp_rejected_m = logp_rejected
+                    chosen_penalty = (rel_logp_chosen_m - target) ** 2
+                    rejected_penalty = (rel_logp_rejected_m + target) ** 2
                     penalty = chosen_penalty + rejected_penalty
                     out["objective_cal_dpo_logsigmoid"] = float(np.mean(-dpo_loss))
                     out["objective_cal_dpo_dpo_loss"] = float(np.mean(dpo_loss))
