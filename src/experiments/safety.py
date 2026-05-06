@@ -52,6 +52,8 @@ class SAFETY(Experiment):
         if getattr(cfg.train, "hf_args", None) is not None and getattr(cfg.train.hf_args, "gradient_checkpointing", False):
             if hasattr(model, "enable_input_require_grads"):
                 model.enable_input_require_grads()
+        # Full-sequence training forwards don't need KV return values; disabling saves memory.
+        model.config.use_cache = False
         return model, tok
 
     def load_datasets(self, cfg):
@@ -1228,6 +1230,7 @@ class SAFETY(Experiment):
                         output_ids = self.model.generate(
                             **tokenized,
                             max_new_tokens=512,
+                            use_cache=True,
                         )
                     generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
                     decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
@@ -1444,7 +1447,8 @@ class SAFETY(Experiment):
                                 output_ids = model.generate(
                                     **tokenized,
                                     max_new_tokens=512,
-                                    no_repeat_ngram_size=5
+                                    no_repeat_ngram_size=5,
+                                    use_cache=True,
                                 )
                             generated_ids = output_ids[0][tokenized["input_ids"].shape[1]:]
                             decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
@@ -1546,6 +1550,7 @@ class SAFETY(Experiment):
                                         input_ids=prompt_ids,
                                         attention_mask=attn,
                                         max_new_tokens=512,
+                                        use_cache=True,
                                     )
                                 generated_ids = output_ids[0][prompt_ids.shape[1]:]
                                 decoded = self.processing_class.decode(generated_ids, skip_special_tokens=True)
