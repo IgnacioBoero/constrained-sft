@@ -1020,7 +1020,6 @@ class SAFETY(Experiment):
                     # Don't-over-refuse constraint inactive (tol2 not set, or no safe samples in batch).
                     slack_no_refusal = torch.zeros_like(answer_log_probs)
                 # Additional forward pass with adapters disabled (or base model) for KL objective.
-                device = input_ids.device
                 with torch.no_grad():
                     if hasattr(model, "disable_adapter"):
                         with model.disable_adapter():
@@ -1041,9 +1040,13 @@ class SAFETY(Experiment):
                         )
                     base_logits = base_outputs.logits[:, :-1]
                     base_log_probs = F.log_softmax(base_logits, dim=-1)
-                # Tokenwise KL divergence between current model and base model.
-                probs = log_probs.exp()
-                kl_token = (probs * (log_probs - base_log_probs)).sum(dim=-1)
+                # KL(student || base) per token; fused to avoid a full-vocab `exp(log_probs)` tensor.
+                kl_token = F.kl_div(
+                    base_log_probs,
+                    log_probs,
+                    log_target=True,
+                    reduction="none",
+                ).sum(dim=-1)
                 kl_token = kl_token * response_mask[:, 1:]
                 kl_sum = kl_token.sum(dim=-1) / num_tokens
                 # if model is training, we need to reduce the number of tokens across all processes
