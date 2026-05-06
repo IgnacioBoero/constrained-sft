@@ -58,7 +58,7 @@ train:
     weight_decay: 0.01
     eval_strategy: "no"
     save_strategy: "no"
-    gradient_checkpointing: false
+    gradient_checkpointing: true
     eval_do_concat_batches: false
     bf16: true
     fp16: false
