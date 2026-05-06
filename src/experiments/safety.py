@@ -1044,7 +1044,9 @@ class SAFETY(Experiment):
                             "Expected model to expose `.disable_adapter()` (PeftModel)."
                         )
                     base_logits = base_outputs.logits[:, :-1]
+                    del base_outputs
                     base_log_probs = F.log_softmax(base_logits, dim=-1)
+                    del base_logits
                 # KL(student || base) per token; fused to avoid a full-vocab `exp(log_probs)` tensor.
                 kl_token = F.kl_div(
                     base_log_probs,
