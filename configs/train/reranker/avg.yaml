@@ -9,6 +9,7 @@ hydra:
       exp.dual_step_size: 0.1
       exp.loss_alpha: 1.0
       exp.loss_tol: 100
+      train.seed: 0,1
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
