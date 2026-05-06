@@ -27,7 +27,12 @@ class SAFETY(Experiment):
         tok = AutoTokenizer.from_pretrained(cfg.exp.model_name, use_fast=True)
         tok.model_max_length = cfg.train.max_length
         tok.pad_token = tok.eos_token  # Ensure pad token is defined
-        model = AutoModelForCausalLM.from_pretrained(cfg.exp.model_name, low_cpu_mem_usage=True, torch_dtype=torch.float16)
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.exp.model_name,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
+            attn_implementation="flash_attention_2",
+        )
         if getattr(cfg.train, 'lora', False):
             model = get_peft_model(
                         model,
