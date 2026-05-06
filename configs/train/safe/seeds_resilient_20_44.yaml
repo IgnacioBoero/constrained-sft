@@ -10,8 +10,8 @@ hydra:
       exp.tol: -0.08
       exp.tol2: -2.0
       exp.dual_step_size: 1.0
-      exp.resilient_coef: 10.0
-      train.seed: 43
+      exp.resilient_coef: 20.0
+      train.seed: 44
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
