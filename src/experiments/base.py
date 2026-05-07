@@ -15,15 +15,11 @@ class Experiment(ABC):
     @abstractmethod
     def get_trainer_class(self) -> Any: ...
     
-from .bias import BIAS
-from .reasoning import REASONING
 from .reranker import RERANKER
 from .safety import SAFETY
 from .dpo_kl import DPO_KL
 
 EXPERIMENTS = {
-    "bias": BIAS,
-    "reasoning": REASONING,
     "reranker": RERANKER,
     "safety": SAFETY,
     "dpo_kl": DPO_KL,
