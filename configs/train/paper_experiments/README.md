@@ -50,3 +50,22 @@ python src/train.py --config-path train/paper_experiments/safety --config-name=s
 Distributed / DeepSpeed: add your usual launcher flags or `Acceleration`/`deepspeed` entries via `cfg.train.hf_args` overrides on the CLI.
 
 Results in the paper for **Base** correspond to evaluating the alpaca-long-1k SFT backbone without safety fine-tuning; there is no training config row for Base.
+
+## Evaluation: PKU SafeRLHF prompts + Beaver-7B unified cost
+
+After fine-tuning, you can reproduce the **harmlessness / Beaver cost-model**–style scoring used alongside AlpacaEval in the paper via:
+
+[`scripts/eval_saferlhf_beaver.py`](../../../scripts/eval_saferlhf_beaver.py)
+
+That script pulls deduplicated prompts from **`PKU-Alignment/PKU-SafeRLHF-30K`** (test split by default), **runs greedy generation** from your checkpoints (either Hugging Face model IDs via `--hf_models`, or LoRA checkpoints downloaded from Weight & Biases runs via `--entity` / `--project` / `--tag` or `--run_ids`), then **scores completions** with **`PKU-Alignment/beaver-7b-unified-reward`** and **`PKU-Alignment/beaver-7b-unified-cost`** (`--reward_model` / `--cost_model` override the defaults). Outputs go under `--out_root` (CSV plus aggregate metrics).
+
+Run from outside a directory that shadows the `wandb` package when using W&B mode (see the docstring at the top of that file). Example (HF checkpoints only):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/eval_saferlhf_beaver.py \
+  --hf_models ihounie/huggy-2-1k-alpaca-f16 \
+  --out_root ./outputs/beaver_eval \
+  --num_samples 500
+```
+
+For full options (batch sizes, `--max_new_tokens`, logging back to runs, etc.), use `python scripts/eval_saferlhf_beaver.py --help`.

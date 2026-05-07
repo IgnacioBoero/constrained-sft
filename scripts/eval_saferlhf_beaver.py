@@ -27,6 +27,8 @@ wandb package):
 
     cd /tmp
     CUDA_VISIBLE_DEVICES=1 python /home/chiche/constrained-sft-3/scripts/eval_saferlhf_beaver.py --entity alelab --project SAFE-long1k --tag xtest
+
+Project docs: configs/train/paper_experiments/README.md (section on PKU + Beaver cost eval).
 """
 from __future__ import annotations
 
