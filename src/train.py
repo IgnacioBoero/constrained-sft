@@ -201,8 +201,8 @@ def main(cfg: DictConfig):
 
     train_ds = train_ds.map(preprocess, remove_columns=cols)
     eval_ds = eval_ds.map(preprocess, remove_columns=cols)
-    if complete_ds is not None:
-        complete_ds = complete_ds.map(preprocess, remove_columns=cols)
+    # Keep complete_ds un-tokenized to avoid an extra expensive map pass.
+    # The trainer only needs complete_ds for index/subset metadata lookups.
     
     collator = exp.get_collator(tok)
     include_for_metrics = []
