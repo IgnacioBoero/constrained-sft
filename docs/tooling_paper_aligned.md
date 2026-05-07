@@ -79,4 +79,4 @@ Supporting notes: **`src/experiments/README_dpo_kl_losses.md`**.
 
 ## Layout
 
-See **`scripts/README.md`** for directory conventions after the repo reorg (`paper_eval/`, `when2call/`, `datasets/`, `aux_training/`, `release/`).
+See **`scripts/README.md`** for directory conventions (`paper_eval/`, `when2call/`, `datasets/`, `release/`).

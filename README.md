@@ -43,7 +43,7 @@ Index + cross-links: **`configs/train/paper_experiments/README.md`**.
 The default **`configs/train/default.yaml`** composes **`paper_experiments/safety/paper_safety_shared`** for a minimal safety-shape run—override **`--config-path` / `--config-name`** for When2Call, reranking, or other setups.
 
 **Tooling:** maps scripts → paper metrics → [`docs/tooling_paper_aligned.md`](docs/tooling_paper_aligned.md).  
-Candidates to delete or relocate → [`docs/tooling_review_for_deletion.md`](docs/tooling_review_for_deletion.md).
+Optional packaging / metadata cleanup → [`docs/tooling_review_for_deletion.md`](docs/tooling_review_for_deletion.md).
 
 ---
 
