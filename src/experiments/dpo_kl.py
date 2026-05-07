@@ -1,0 +1,2726 @@
+import json
+import os
+import re
+import shutil
+import tempfile
+import atexit
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+from types import SimpleNamespace
+
+import numpy as np
+from omegaconf import ListConfig
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from accelerate.utils import extract_model_from_parallel
+from datasets import Dataset, load_dataset, concatenate_datasets
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer
+
+from peft import LoraConfig, PeftModel, get_peft_model
+
+from .base import Experiment
+from utils import right_padding
+
+
+class DPO_KL(Experiment):
+    """
+    Constrained preference finetuning:
+      - Objective: minimize KL(πθ || π0) on response tokens (π0 = pretrained/base model)
+      - Constraint: logp(chosen) - logp(rejected) >= tol
+        slack := tol + logp(rejected) - logp(chosen)   (constraint satisfied when slack <= 0)
+      - Optional two-constraint mode:
+        logp(chosen) >= tol_win and logp(rejected) <= tol_loose
+
+    Loss types (mirroring `SAFETY`):
+      - erm: objective only
+      - avg: average dual variable
+      - aug_dual: augmented Lagrangian with per-example dual variables
+      - penalty: linear penalty
+      - _both_avg: avg dual on (win, loose) slacks with separate duals
+      - _both_aug_dual: augmented dual on (win, loose) slacks with separate per-sample duals
+      - _both_penalty: linear penalty with separate multipliers for (win, loose) slacks
+      - aug_dual_three: augmented dual with three per-sample constraints
+        (win, loose, and pairwise gap)
+      - simpo: SimPO objective (no KL regularization), margin gamma = tol
+      - dpo: standard DPO objective against the frozen base policy
+    """
+    DEFAULT_CHAT_TEMPLATE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+    def _get_default_chat_template(self) -> str:
+        cached = getattr(self, "_default_chat_template", None)
+        if cached:
+            return cached
+
+        fallback_tok = AutoTokenizer.from_pretrained(
+            self.DEFAULT_CHAT_TEMPLATE_MODEL,
+            use_fast=True,
+        )
+        template = getattr(fallback_tok, "chat_template", None)
+        if not template:
+            raise ValueError(
+                "Fallback tokenizer has no chat template: "
+                f"{self.DEFAULT_CHAT_TEMPLATE_MODEL}"
+            )
+        self._default_chat_template = template
+        return template
+
+    def _ensure_chat_template(self, tok):
+        if getattr(tok, "chat_template", None):
+            return tok
+        tok.chat_template = self._get_default_chat_template()
+        print(
+            "[dpo_kl] tokenizer has no chat template; "
+            f"using template from {self.DEFAULT_CHAT_TEMPLATE_MODEL}"
+        )
+        return tok
+
+    def _should_append_chatml_im_end(self, cfg) -> bool:
+        # Default off: only enable for explicitly ChatML-formatted workflows.
+        return bool(getattr(cfg.train, "append_chatml_im_end", False))
+
+    def _format_answer_text(self, text: str, cfg) -> str:
+        text = text or ""
+        if self._should_append_chatml_im_end(cfg):
+            return text + "<|im_end|>\n"
+        return text
+
+    XLAM_DEFAULT_SYSTEM_PROMPT = (
+        "You are a helpful assistant that can use tools. You are developed by Salesforce xLAM team."
+    )
+    XLAM_TOOL_FORMAT_INSTRUCTION = (
+        "You have access to a set of tools. When using tools, make calls in a single JSON array:\n\n"
+        "[{\"name\": \"tool_call_name\", \"arguments\": {\"arg1\": \"value1\", \"arg2\": \"value2\"}}, "
+        "... (additional parallel tool calls as needed)]\n\n"
+        "If no tool is suitable, state that explicitly. If the user's input lacks required parameters, "
+        "ask for clarification. Do not interpret or respond until tool results are returned. Once they are "
+        "available, process them or make additional calls if needed. For tasks that don't require tools, "
+        "such as casual conversation or general advice, respond directly in plain text. The available tools are:"
+    )
+
+    def _is_xlam_model(self, cfg) -> bool:
+        model_name = str(getattr(getattr(cfg, "exp", object()), "model_name", "")).lower()
+        return ("salesforce/xlam" in model_name) or ("salesforce/llama-xlam" in model_name)
+
+    def _parse_json_maybe(self, value: Any) -> Any:
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return value
+            try:
+                return json.loads(s)
+            except Exception:
+                return value
+        return value
+
+    def _normalize_tools_for_xlam(self, tools_value: Any) -> List[Dict[str, Any]]:
+        tools_raw = self._parse_json_maybe(tools_value)
+        if isinstance(tools_raw, list):
+            items = tools_raw
+        elif tools_raw in (None, ""):
+            items = []
+        else:
+            items = [tools_raw]
+
+        normalized: List[Dict[str, Any]] = []
+        for item in items:
+            parsed = self._parse_when2call_tool(item)
+            parsed = self._parse_json_maybe(parsed)
+            if isinstance(parsed, dict):
+                normalized.append(parsed)
+        return normalized
+
+    def _normalize_xlam_tool_call_dict(self, call: Any) -> Dict[str, Any] | None:
+        if not isinstance(call, dict):
+            return None
+        if isinstance(call.get("function"), dict):
+            call = call["function"]
+
+        name = str(call.get("name") or "").strip()
+        if not name:
+            return None
+
+        arguments = call.get("arguments", call.get("parameters", {}))
+        arguments = self._parse_json_maybe(arguments)
+        if not isinstance(arguments, dict):
+            arguments = {}
+        return {"name": name, "arguments": arguments}
+
+    def _normalize_xlam_tool_calls_array(self, value: Any) -> List[Dict[str, Any]]:
+        raw = self._parse_json_maybe(value)
+        if isinstance(raw, dict) and isinstance(raw.get("tool_calls"), list):
+            raw = raw["tool_calls"]
+
+        if isinstance(raw, dict):
+            calls = [raw]
+        elif isinstance(raw, list):
+            calls = raw
+        else:
+            calls = []
+
+        normalized: List[Dict[str, Any]] = []
+        for call in calls:
+            norm = self._normalize_xlam_tool_call_dict(call)
+            if norm is not None:
+                normalized.append(norm)
+        return normalized
+
+    def _normalize_tool_call_response_for_xlam(self, text: str) -> str:
+        text = text or ""
+        pattern = re.compile(r"<TOOLCALL>\s*(.*?)\s*</TOOLCALL>", flags=re.DOTALL)
+
+        def _replace(match: re.Match) -> str:
+            payload = (match.group(1) or "").strip()
+            if not payload:
+                return "[]"
+            parsed = self._parse_json_maybe(payload)
+            calls = self._normalize_xlam_tool_calls_array(parsed)
+            return json.dumps(calls, ensure_ascii=False) if calls else "[]"
+
+        normalized = pattern.sub(_replace, text).strip()
+        parsed = self._parse_json_maybe(normalized)
+        calls = self._normalize_xlam_tool_calls_array(parsed)
+        if calls:
+            return json.dumps(calls, ensure_ascii=False)
+        return normalized
+
+    def _normalize_apigen_conversations(self, value: Any) -> List[Dict[str, Any]]:
+        raw = self._parse_json_maybe(value)
+        if not isinstance(raw, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for turn in raw:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("from") or "").strip().lower()
+            if not role:
+                continue
+            out.append({"from": role, "value": turn.get("value")})
+        return out
+
+    def _build_xlam_prompt(
+        self,
+        tok,
+        messages: List[Dict[str, Any]],
+        tools_value: Any,
+        force_tool_instruction: bool = False,
+    ) -> str:
+        tools = self._normalize_tools_for_xlam(tools_value)
+
+        normalized_messages: List[Dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if not role:
+                continue
+            if role == "assistant" and isinstance(message.get("tool_calls"), list):
+                norm_calls: List[Dict[str, Any]] = []
+                for call in self._normalize_xlam_tool_calls_array(message.get("tool_calls")):
+                    norm_calls.append({"function": call})
+                normalized_messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": norm_calls,
+                        "content": str(message.get("content") or ""),
+                    }
+                )
+                continue
+            if role == "tool":
+                content = message.get("content")
+                parsed_content = self._parse_json_maybe(content)
+                if isinstance(parsed_content, (dict, list)):
+                    content = parsed_content
+                else:
+                    content = "" if content is None else str(content)
+                normalized_messages.append({"role": "tool", "content": content})
+                continue
+            normalized_messages.append(
+                {"role": role, "content": "" if message.get("content") is None else str(message.get("content"))}
+            )
+
+        if not normalized_messages:
+            normalized_messages = [{"role": "user", "content": ""}]
+
+        if (
+            force_tool_instruction
+            and tools
+            and normalized_messages
+            and normalized_messages[0].get("role") == "system"
+        ):
+            sys_text = str(normalized_messages[0].get("content") or "").strip()
+            if self.XLAM_TOOL_FORMAT_INSTRUCTION not in sys_text:
+                sys_text = (
+                    f"{sys_text}\n\n{self.XLAM_TOOL_FORMAT_INSTRUCTION}"
+                    if sys_text
+                    else self.XLAM_TOOL_FORMAT_INSTRUCTION
+                )
+                normalized_messages[0] = {"role": "system", "content": sys_text}
+
+        return tok.apply_chat_template(
+            normalized_messages,
+            tools=tools if tools else None,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    WHEN2CALL_LLAMA32_SYSTEM_PROMPT = (
+        "You are an expert in composing functions. You are given a question and a set of "
+        "possible functions.\nBased on the question, you will need to make one or more "
+        "function/tool calls to achieve the purpose.\nIf none of the functions can be used, "
+        "point it out. If the given question lacks the parameters required by the function,"
+        "also point it out. You should only return the function call in tools call sections.\n"
+        "If you decide to invoke any of the function(s), you MUST put it in the format of "
+        "[func_name1(params_name1=params_value1, params_name2=params_value2...), "
+        "func_name2(params)]\nYou SHOULD NOT include any other text in the response.\n"
+        "Here is a list of functions in JSON format that you can invoke."
+    )
+
+    def _normalize_when2call_messages(self, value: Any) -> List[Dict[str, str]]:
+        if value is None:
+            return []
+        raw = value
+        if isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                return []
+            try:
+                raw = json.loads(s)
+            except Exception:
+                return []
+        if not isinstance(raw, list):
+            return []
+        normalized: List[Dict[str, str]] = []
+        for msg in raw:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip()
+            content = msg.get("content")
+            if not role:
+                continue
+            if content is None:
+                content = ""
+            normalized.append({"role": role, "content": str(content)})
+        return normalized
+
+    def _parse_when2call_tool(self, tool: Any) -> Any | None:
+        if isinstance(tool, str):
+            s = tool.strip()
+            if not s:
+                return None
+            try:
+                return json.loads(s)
+            except Exception:
+                return s
+        if isinstance(tool, (dict, list)):
+            return tool
+        return None
+
+    def _format_when2call_tools_json(self, tools_value: Any) -> str:
+        tools_raw = tools_value
+        if isinstance(tools_raw, str):
+            s = tools_raw.strip()
+            if s:
+                try:
+                    tools_raw = json.loads(s)
+                except Exception:
+                    tools_raw = s
+            else:
+                tools_raw = []
+
+        if isinstance(tools_raw, list):
+            items = tools_raw
+        elif tools_raw in (None, ""):
+            items = []
+        else:
+            items = [tools_raw]
+
+        parsed_tools: List[Any] = []
+        for item in items:
+            parsed = self._parse_when2call_tool(item)
+            if parsed is not None:
+                parsed_tools.append(parsed)
+        return json.dumps(parsed_tools, ensure_ascii=False)
+
+    def _build_when2call_system_message(self, tools_value: Any) -> str:
+        tools_json = self._format_when2call_tools_json(tools_value)
+        return f"{self.WHEN2CALL_LLAMA32_SYSTEM_PROMPT}\n{tools_json}"
+
+    def _is_when2call_strict_prompt(self, cfg) -> bool:
+        return bool(getattr(cfg.train, "when2call_strict_prompt", False))
+
+    def _extract_when2call_user_query(self, messages: List[Dict[str, str]]) -> str:
+        # Prefer the last user turn if available; fallback to the last message content.
+        for msg in reversed(messages):
+            if str(msg.get("role") or "").strip().lower() == "user":
+                return str(msg.get("content") or "")
+        if messages:
+            return str(messages[-1].get("content") or "")
+        return ""
+
+    def _build_when2call_strict_prompt(self, tools_value: Any, user_query: str) -> str:
+        tools_json = self._format_when2call_tools_json(tools_value)
+        # Match NVIDIA's lm_eval_harness `process_docs_llama3_2` prompt format.
+        return (
+            "<|start_header_id|>system<|end_header_id|>\n\n"
+            "You are an expert in composing functions. You are given a question and a set of possible functions. \n"
+            "Based on the question, you will need to make one or more function/tool calls to achieve the purpose. \n"
+            "If none of the functions can be used, point it out. If the given question lacks the parameters required by the function,also point it out. You should only return the function call in tools call sections.\n"
+            "If you decide to invoke any of the function(s), you MUST put it in the format of [func_name1(params_name1=params_value1, params_name2=params_value2...), func_name2(params)]\n"
+            "You SHOULD NOT include any other text in the response.\n"
+            "Here is a list of functions in JSON format that you can invoke.\n"
+            f"{tools_json}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+            f"{user_query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+
+    def _extract_when2call_response_text(self, response_value: Any) -> str:
+        if response_value is None:
+            return ""
+        if isinstance(response_value, dict):
+            content = response_value.get("content")
+            return "" if content is None else str(content)
+        return str(response_value)
+
+    def _format_when2call_tool_call(self, tool_call: Any) -> str:
+        if not isinstance(tool_call, dict):
+            return ""
+        name = str(tool_call.get("name") or "").strip()
+        if not name:
+            return ""
+        arguments = tool_call.get("arguments", tool_call.get("parameters", {}))
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        arg_parts: List[str] = []
+        for arg_name, arg_value in arguments.items():
+            arg_key = str(arg_name)
+            if isinstance(arg_value, str):
+                arg_val = json.dumps(arg_value, ensure_ascii=False)
+            else:
+                # Match NVIDIA lm-eval formatting behavior in utils.process_docs_llama3_2.
+                arg_val = str(arg_value)
+            arg_parts.append(f"{arg_key}={arg_val}")
+        if arg_parts:
+            return f"{name}({', '.join(arg_parts)})"
+        return f"{name}()"
+
+    def _normalize_when2call_response_text(self, text: str) -> str:
+        text = text or ""
+        pattern = re.compile(r"<TOOLCALL>\s*(.*?)\s*</TOOLCALL>", flags=re.DOTALL)
+
+        def _replace(match: re.Match) -> str:
+            payload = (match.group(1) or "").strip()
+            if not payload:
+                return "[]"
+            try:
+                parsed = json.loads(payload)
+            except Exception:
+                return payload
+
+            if isinstance(parsed, dict):
+                calls = [parsed]
+            elif isinstance(parsed, list):
+                calls = parsed
+            else:
+                return payload
+
+            formatted_calls = [
+                self._format_when2call_tool_call(call)
+                for call in calls
+                if isinstance(call, dict)
+            ]
+            formatted_calls = [c for c in formatted_calls if c]
+            return f"[{', '.join(formatted_calls)}]" if formatted_calls else "[]"
+
+        return pattern.sub(_replace, text)
+
+    def _optional_str(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s or s.lower() in {"none", "null"}:
+            return None
+        return s
+
+    def _parse_wandb_run_reference(self, value: str, cfg) -> Dict[str, str] | None:
+        """
+        Supported formats:
+          - wandb://<run_id>
+          - wandb://<entity>/<project>/<run_id>
+          - <run_id>                    (must look like a W&B run id, e.g. 8-char alnum)
+          - <entity>/<project>/<run_id> (only if run_id token looks like a run id)
+        """
+        raw = self._optional_str(value)
+        if raw is None:
+            return None
+
+        is_explicit_wandb = raw.startswith("wandb://")
+        target = raw[len("wandb://") :] if is_explicit_wandb else raw
+        parts = [p.strip() for p in target.split("/") if p.strip()]
+
+        # Typical W&B run ids are 8-char base62-ish tokens.
+        def _looks_like_run_id(x: str) -> bool:
+            return bool(re.fullmatch(r"[A-Za-z0-9]{8}", x))
+
+        entity = self._optional_str(getattr(cfg.train, "wandb_entity", None)) or self._optional_str(
+            os.environ.get("WANDB_ENTITY")
+        )
+        project = self._optional_str(getattr(cfg.train, "wandb_project", None))
+
+        if len(parts) == 1 and (is_explicit_wandb or _looks_like_run_id(parts[0])):
+            run_id = parts[0]
+            if entity and project:
+                return {"entity": entity, "project": project, "run_id": run_id}
+            raise ValueError(
+                "W&B run-id base model requested but entity/project are missing. "
+                "Set `train.wandb_entity` and `train.wandb_project` (or WANDB_ENTITY env var)."
+            )
+
+        if len(parts) == 3 and (is_explicit_wandb or _looks_like_run_id(parts[2])):
+            return {"entity": parts[0], "project": parts[1], "run_id": parts[2]}
+
+        # Anything else is treated as a normal model id/path.
+        return None
+
+    def _extract_field(self, config: Any, key: str) -> Any:
+        if config is None:
+            return None
+        if isinstance(config, dict):
+            return config.get(key)
+        if hasattr(config, key):
+            return getattr(config, key)
+        return None
+
+    def _pick_base_model_from_run(self, run_obj: Any, override: str | None = None) -> str:
+        if override:
+            return override
+        cfg = getattr(run_obj, "config", {}) or {}
+        candidates = [
+            self._extract_field(self._extract_field(cfg, "exp"), "model_name"),
+            self._extract_field(cfg, "exp.model_name"),
+            self._extract_field(cfg, "model_name"),
+        ]
+        for c in candidates:
+            if isinstance(c, str) and c.strip():
+                return c.strip()
+        raise RuntimeError(
+            "Could not infer base model from W&B run config. "
+            "Set `exp.base_model_override` to a valid base model."
+        )
+
+    def _artifact_aliases(self, artifact_obj: Any) -> set[str]:
+        aliases = getattr(artifact_obj, "aliases", None) or []
+        out: set[str] = set()
+        for x in aliases:
+            out.add(x if isinstance(x, str) else getattr(x, "name", str(x)))
+        return out
+
+    def _pick_lora_artifact_for_run(self, run_obj: Any) -> Any:
+        run_id = str(getattr(run_obj, "id"))
+        candidates = []
+        for art in run_obj.logged_artifacts():
+            if getattr(art, "type", None) != "lora_adapters":
+                continue
+            name = str(getattr(art, "name", ""))
+            if not name.startswith(f"{run_id}-lora_adapters:"):
+                continue
+            aliases = self._artifact_aliases(art)
+            has_latest = "latest" in aliases
+            created = getattr(art, "created_at", None) or getattr(art, "updated_at", None)
+            candidates.append((1 if has_latest else 0, created, art))
+        if not candidates:
+            raise RuntimeError(
+                f"No logged lora_adapters artifact found on run {run_id}. "
+                "Expected '<run_id>-lora_adapters:...'."
+            )
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[-1][2]
+
+    def _merge_lora_to_local_model(
+        self,
+        base_model: str,
+        adapter_dir: Path,
+        merged_dir: Path,
+        torch_dtype: torch.dtype,
+    ) -> None:
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        tok = AutoTokenizer.from_pretrained(base_model, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "right"
+
+        base = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            device_map="cpu",
+        )
+        peft_model = PeftModel.from_pretrained(base, str(adapter_dir))
+        merged = peft_model.merge_and_unload()
+        merged.save_pretrained(str(merged_dir), safe_serialization=True)
+        tok.save_pretrained(str(merged_dir))
+
+    def _resolve_model_source(self, cfg, torch_dtype: torch.dtype) -> str:
+        model_ref = str(cfg.exp.model_name)
+        run_ref = self._parse_wandb_run_reference(model_ref, cfg)
+        if run_ref is None:
+            return model_ref
+
+        import wandb
+
+        run_path = f"{run_ref['entity']}/{run_ref['project']}/{run_ref['run_id']}"
+        api = wandb.Api()
+        run_obj = api.run(run_path)
+        base_override = self._optional_str(getattr(cfg.exp, "base_model_override", None))
+        base_model = self._pick_base_model_from_run(run_obj=run_obj, override=base_override)
+        artifact = self._pick_lora_artifact_for_run(run_obj)
+
+        work_root = Path(
+            tempfile.mkdtemp(prefix=f"dpo_kl_wandb_base_{run_ref['run_id']}_")
+        )
+        adapter_dir = Path(artifact.download(root=str(work_root / "adapter")))
+        merged_dir = work_root / "merged_model"
+        self._merge_lora_to_local_model(
+            base_model=base_model,
+            adapter_dir=adapter_dir,
+            merged_dir=merged_dir,
+            torch_dtype=torch_dtype,
+        )
+
+        # Keep merged model around for the full process lifetime.
+        self._wandb_merged_base_dir = str(work_root)
+        atexit.register(lambda p=str(work_root): shutil.rmtree(p, ignore_errors=True))
+        print(
+            "[dpo_kl] Resolved base model from W&B run "
+            f"{run_path} using artifact {getattr(artifact, 'name', '')}; "
+            f"merged model at {merged_dir}"
+        )
+        return str(merged_dir)
+
+    def load_model_and_tok(self, cfg):
+        dtype = torch.bfloat16 if getattr(cfg.train.hf_args, "bf16", False) else torch.float16
+        model_source = self._resolve_model_source(cfg, torch_dtype=dtype)
+        self._resolved_model_source = model_source
+
+        tok = AutoTokenizer.from_pretrained(model_source, use_fast=True)
+        tok = self._ensure_chat_template(tok)
+        tok.model_max_length = int(getattr(cfg.train, "max_length", 2048))
+
+        # Ensure pad token exists (common for Llama-family)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        # Right padding keeps response masks aligned with shifted labels in training.
+        tok.padding_side = "right"
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_source,
+            #low_cpu_mem_usage=True,
+            dtype=dtype,
+            attn_implementation="flash_attention_2",
+        )
+        # Training/eval in this script never uses KV-cache; disable it to reduce GPU memory.
+        model.config.use_cache = False
+
+        if getattr(cfg.train, "lora", False):
+            model = get_peft_model(
+                model,
+                LoraConfig(
+                    r=int(cfg.train.lora.r),
+                    lora_alpha=int(cfg.train.lora.lora_alpha),
+                    lora_dropout=float(getattr(cfg.train.lora, "lora_dropout", 0.05)),
+                    target_modules=[
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "o_proj",
+                    ],
+                ),
+            )
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+
+        # With gradient checkpointing + PEFT, inputs must require grads or loss has no grad_fn.
+        if (
+            getattr(cfg.train, "hf_args", None) is not None
+            and getattr(cfg.train.hf_args, "gradient_checkpointing", False)
+        ):
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+
+        return model, tok
+
+    def load_datasets(self, cfg):
+        cache_dir = getattr(cfg.train, "cache_dir", None)
+        val_fraction = float(getattr(cfg.train, "val_fraction", 0.1))
+        sanity_check = bool(getattr(cfg.train, "sanity_check", False))
+        do_shuffle = bool(getattr(cfg.train, "shuffle", True))
+
+        dataset_name = str(getattr(cfg.train, "dataset", "orca")).strip().lower()
+        print(f"[dpo_kl] Dataset name: {dataset_name}")
+        helpsteer_pref_aliases = {
+            "helpsteer2",
+            "helpsteer2_pref",
+            "helpsteer2_preference",
+            "helpsteer2_preferences",
+        }
+        when2call_pref_aliases = {
+            "when2call",
+            "when2call_pref",
+            "when2call_preference",
+            "when2call_preferences",
+        }
+        when2call_request_aliases = {
+            "when2call_request",
+            "when2call_imbalanced_request",
+        }
+        when2call_refusal_aliases = {
+            "when2call_refusal",
+            "when2call_imbalanced_refusal",
+        }
+        when2call_toolcall_aliases = {
+            "when2call_toolcall",
+            "when2call_imbalanced_toolcall",
+        }
+        mixed_apigen_when2call_aliases = {
+            "when2call_apigen_xlam",
+            "apigen_when2call_xlam",
+            "when2call_apigen",
+            "apigen_when2call",
+        }
+        is_helpsteer_pref = dataset_name in helpsteer_pref_aliases
+        is_when2call_pref = dataset_name in when2call_pref_aliases
+        is_when2call_request = dataset_name in when2call_request_aliases
+        is_when2call_refusal = dataset_name in when2call_refusal_aliases
+        is_when2call_toolcall = dataset_name in when2call_toolcall_aliases
+        is_mixed_apigen_when2call = dataset_name in mixed_apigen_when2call_aliases
+        is_xlam_model = self._is_xlam_model(cfg)
+        use_xlam_prompt_format = bool(getattr(cfg.train, "use_xlam_prompt_format", False)) or is_xlam_model
+        is_when2call_variant = (
+            is_when2call_pref
+            or is_when2call_request
+            or is_when2call_refusal
+            or is_when2call_toolcall
+        )
+        force_original_when2call_xlam = (
+            dataset_name == "when2call"
+            and is_xlam_model
+        )
+        if force_original_when2call_xlam:
+            print(
+                "[dpo_kl] Using original nvidia/When2Call train_pref split with xLAM formatting "
+                "(no APIGen mixed objective data)."
+            )
+
+        if is_mixed_apigen_when2call:
+            tok_source = getattr(self, "_resolved_model_source", cfg.exp.model_name)
+            tok = AutoTokenizer.from_pretrained(tok_source, use_fast=True)
+            tok = self._ensure_chat_template(tok)
+            if tok.pad_token is None:
+                tok.pad_token = tok.eos_token
+            tok.padding_side = "right"
+
+            data_prop = float(getattr(cfg.train, "data_proportion", 1.0))
+            objective_prop = float(getattr(cfg.train, "objective_data_proportion", data_prop))
+            constraint_prop = float(getattr(cfg.train, "constraint_data_proportion", data_prop))
+            objective_val_fraction = float(getattr(cfg.train, "objective_val_fraction", val_fraction))
+            constraint_val_fraction = float(getattr(cfg.train, "constraint_val_fraction", val_fraction))
+
+            def _validate_fraction(name: str, value: float) -> None:
+                if not (0.0 < value < 1.0):
+                    raise ValueError(f"{name} must be in (0,1), got {value}")
+
+            def _validate_proportion(name: str, value: float) -> None:
+                if not (0.0 < value <= 1.0):
+                    raise ValueError(f"{name} must be in (0,1], got {value}")
+
+            _validate_fraction("cfg.train.val_fraction", val_fraction)
+            _validate_fraction("cfg.train.objective_val_fraction", objective_val_fraction)
+            _validate_fraction("cfg.train.constraint_val_fraction", constraint_val_fraction)
+            _validate_proportion("cfg.train.data_proportion", data_prop)
+            _validate_proportion("cfg.train.objective_data_proportion", objective_prop)
+            _validate_proportion("cfg.train.constraint_data_proportion", constraint_prop)
+
+            def _split_dataset(raw_ds: Dataset, frac: float) -> Tuple[Dataset, Dataset]:
+                if len(raw_ds) == 0:
+                    return raw_ds, raw_ds
+                n_val = max(1, int(len(raw_ds) * frac))
+                n_val = min(n_val, len(raw_ds))
+                ev_part = raw_ds.select(range(n_val))
+                tr_part = raw_ds.select(range(n_val, len(raw_ds)))
+                return tr_part, ev_part
+
+            def _add_split_col(raw_ds: Dataset, split_name: str) -> Dataset:
+                return raw_ds.add_column("split", [split_name] * len(raw_ds))
+
+            def _select_proportion(raw_ds: Dataset, prop: float) -> Dataset:
+                if prop >= 1.0:
+                    return raw_ds
+                keep = max(1, int(prop * len(raw_ds)))
+                keep = min(keep, len(raw_ds))
+                return raw_ds.select(range(keep))
+
+            # Constraint source: When2Call preference pairs.
+            constraint_ds = load_dataset(
+                "nvidia/When2Call",
+                "train_pref",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            constraint_ds = _select_proportion(constraint_ds, constraint_prop)
+            if sanity_check:
+                constraint_ds = constraint_ds.select(range(min(len(constraint_ds), 256)))
+
+            def _format_constraint_row(row: Dict[str, Any]) -> Dict[str, Any]:
+                messages = self._normalize_when2call_messages(row.get("messages"))
+                prompt = self._build_xlam_prompt(tok, messages, row.get("tools"))
+                chosen_text = self._normalize_tool_call_response_for_xlam(
+                    self._extract_when2call_response_text(row.get("chosen_response"))
+                )
+                rejected_text = self._normalize_tool_call_response_for_xlam(
+                    self._extract_when2call_response_text(row.get("rejected_response"))
+                )
+                return {
+                    "prompt": prompt,
+                    "chosen": self._format_answer_text(chosen_text, cfg),
+                    "rejected": self._format_answer_text(rejected_text, cfg),
+                    "is_constraint": True,
+                    "is_objective": False,
+                    "objective_use_chosen_only": False,
+                    "source": "when2call",
+                }
+
+            constraint_ds = constraint_ds.map(
+                _format_constraint_row,
+                remove_columns=constraint_ds.column_names,
+            )
+            tr_constraint, ev_constraint = _split_dataset(constraint_ds, constraint_val_fraction)
+            tr_constraint = _add_split_col(tr_constraint, "train")
+            ev_constraint = _add_split_col(ev_constraint, "validation")
+
+            # Objective source: APIGen-MT (non-pair trajectory data).
+            apigen_raw = load_dataset(
+                "Salesforce/APIGen-MT-5k",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            apigen_raw = _select_proportion(apigen_raw, objective_prop)
+            if sanity_check:
+                apigen_raw = apigen_raw.select(range(min(len(apigen_raw), 64)))
+
+            objective_records: List[Dict[str, Any]] = []
+            for row in apigen_raw:
+                conversations = self._normalize_apigen_conversations(row.get("conversations"))
+                tools_value = row.get("tools")
+                system_text = str(row.get("system") or "").strip()
+                history: List[Dict[str, Any]] = []
+                if system_text:
+                    history.append({"role": "system", "content": system_text})
+
+                for turn in conversations:
+                    turn_type = str(turn.get("from") or "").strip().lower()
+                    value = turn.get("value")
+                    if turn_type == "human":
+                        history.append({"role": "user", "content": "" if value is None else str(value)})
+                        continue
+
+                    if turn_type == "observation":
+                        content = self._parse_json_maybe(value)
+                        if not isinstance(content, (dict, list)):
+                            content = "" if value is None else str(value)
+                        history.append({"role": "tool", "content": content})
+                        continue
+
+                    if turn_type == "function_call":
+                        tool_calls = self._normalize_xlam_tool_calls_array(value)
+                        if not tool_calls:
+                            continue
+                        prompt = self._build_xlam_prompt(
+                            tok,
+                            history,
+                            tools_value,
+                            force_tool_instruction=True,
+                        )
+                        objective_records.append(
+                            {
+                                "prompt": prompt,
+                                "chosen": self._format_answer_text(
+                                    json.dumps(tool_calls, ensure_ascii=False),
+                                    cfg,
+                                ),
+                                "rejected": "",
+                                "is_constraint": False,
+                                "is_objective": True,
+                                "objective_use_chosen_only": True,
+                                "source": "apigen_mt",
+                            }
+                        )
+                        history.append(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [{"function": c} for c in tool_calls],
+                                "content": "",
+                            }
+                        )
+                        continue
+
+                    if turn_type == "gpt":
+                        assistant_text = "" if value is None else str(value)
+                        prompt = self._build_xlam_prompt(
+                            tok,
+                            history,
+                            tools_value,
+                            force_tool_instruction=True,
+                        )
+                        objective_records.append(
+                            {
+                                "prompt": prompt,
+                                "chosen": self._format_answer_text(assistant_text, cfg),
+                                "rejected": "",
+                                "is_constraint": False,
+                                "is_objective": True,
+                                "objective_use_chosen_only": True,
+                                "source": "apigen_mt",
+                            }
+                        )
+                        history.append({"role": "assistant", "content": assistant_text})
+
+            if not objective_records:
+                raise ValueError(
+                    "No objective APIGen assistant-turn samples were produced. "
+                    "Check APIGen conversation parsing and dataset availability."
+                )
+
+            objective_ds = Dataset.from_list(objective_records)
+            tr_objective, ev_objective = _split_dataset(objective_ds, objective_val_fraction)
+            tr_objective = _add_split_col(tr_objective, "train")
+            ev_objective = _add_split_col(ev_objective, "validation")
+
+            train_parts = [d for d in [tr_constraint, tr_objective] if len(d) > 0]
+            eval_parts = [d for d in [ev_constraint, ev_objective] if len(d) > 0]
+
+            if not train_parts:
+                raise ValueError("Mixed dataset build produced no training samples.")
+            if not eval_parts:
+                raise ValueError("Mixed dataset build produced no evaluation samples.")
+
+            tr_raw = concatenate_datasets(train_parts) if len(train_parts) > 1 else train_parts[0]
+            ev_raw = concatenate_datasets(eval_parts) if len(eval_parts) > 1 else eval_parts[0]
+
+            complete_ds = concatenate_datasets([tr_raw, ev_raw])
+            complete_ds = complete_ds.add_column("index", list(range(len(complete_ds))))
+
+            tr = complete_ds.filter(lambda x: x["split"] == "train")
+            ev = complete_ds.filter(lambda x: x["split"] == "validation")
+            if do_shuffle:
+                tr = tr.shuffle(seed=int(cfg.train.seed))
+                ev = ev.shuffle(seed=int(cfg.train.seed))
+
+            filter_shortest = float(getattr(cfg.train, "filter_shortest_train", 1.0))
+            if not (0.0 < filter_shortest <= 1.0):
+                raise ValueError(
+                    f"cfg.train.filter_shortest_train must be in (0,1], got {filter_shortest}"
+                )
+            if filter_shortest < 1.0 and len(tr) > 0:
+                is_objective_rows = [bool(v) for v in tr["is_objective"]]
+                objective_indices = [i for i, flag in enumerate(is_objective_rows) if flag]
+                constraint_indices = [i for i, flag in enumerate(is_objective_rows) if not flag]
+
+                if objective_indices:
+                    keep_obj_n = max(1, int(filter_shortest * len(objective_indices)))
+                    objective_sorted = sorted(
+                        objective_indices,
+                        key=lambda i: len(tr[i]["chosen"]),
+                    )
+                    keep_objective = set(objective_sorted[:keep_obj_n])
+                    keep_constraints = set(constraint_indices)
+                    keep_indices = [
+                        i
+                        for i in range(len(tr))
+                        if (i in keep_objective) or (i in keep_constraints)
+                    ]
+                    tr = tr.select(keep_indices)
+                    print(
+                        "[dpo_kl] filter_shortest_train (mixed): "
+                        f"kept objective={keep_obj_n}/{len(objective_indices)} shortest, "
+                        f"kept constraints={len(constraint_indices)}/{len(constraint_indices)}"
+                    )
+
+            print(
+                f"[dpo_kl] Mixed dataset source counts: "
+                f"train_constraint={len(tr_constraint)}, train_objective={len(tr_objective)}, "
+                f"eval_constraint={len(ev_constraint)}, eval_objective={len(ev_objective)}"
+            )
+            print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
+            return tr, ev, complete_ds
+
+        if dataset_name == "ultra":
+            ds = load_dataset(
+                "HuggingFaceH4/ultrafeedback_binarized",
+                split="train_prefs",
+                cache_dir=cache_dir,
+            )
+            if sanity_check:
+                ds = ds.select(range(min(len(ds), 1000)))
+        elif is_helpsteer_pref:
+            ds = load_dataset(
+                "nvidia/HelpSteer2",
+                data_dir="preference",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            print(f"[dpo_kl] HelpSteer2 preference columns: {ds.column_names}")
+
+            preference_strength_filter = getattr(cfg.train, "preference_strength", None)
+            if preference_strength_filter is not None:
+                if isinstance(preference_strength_filter, (list, tuple, set, ListConfig)):
+                    raw_strengths = {int(x) for x in preference_strength_filter}
+                else:
+                    raw_strengths = {int(preference_strength_filter)}
+                if not raw_strengths:
+                    raise ValueError(
+                        "cfg.train.preference_strength is empty; provide an int "
+                        "or a non-empty list of ints."
+                    )
+                # Filter by absolute preference strength so `2` keeps both +2 and -2.
+                allowed_strengths_abs = {abs(x) for x in raw_strengths}
+                valid_strengths_abs = {0, 1, 2, 3}
+                invalid_strengths = sorted(
+                    allowed_strengths_abs.difference(valid_strengths_abs)
+                )
+                if invalid_strengths:
+                    raise ValueError(
+                        "cfg.train.preference_strength must be within "
+                        f"{sorted(valid_strengths_abs)} in absolute value, got invalid values "
+                        f"{invalid_strengths}"
+                    )
+                allowed_strengths_tuple = tuple(sorted(allowed_strengths_abs))
+                ds = ds.filter(
+                    lambda r: abs(int(r["preference_strength"])) in allowed_strengths_tuple
+                )
+                print(
+                    "[dpo_kl] HelpSteer2 preference_strength abs-filter: "
+                    f"{allowed_strengths_tuple}"
+                )
+
+            # Drop ties; this trainer expects strict chosen vs rejected pairs.
+            ds = ds.filter(lambda r: int(r["preference_strength"]) != 0)
+        elif is_when2call_variant:
+            dataset_repo = "nvidia/When2Call"
+            data_dir = "train_pref"
+            if is_when2call_request:
+                dataset_repo = "ihounie/when2call_imbalanced_request_80"
+            elif is_when2call_refusal:
+                dataset_repo = "ihounie/when2call_imbalanced_refusal"
+            elif is_when2call_toolcall:
+                dataset_repo = "ihounie/when2call_imbalanced_toolcall"
+            elif force_original_when2call_xlam:
+                # Explicit safeguard for xLAM runs with `dataset=when2call`:
+                # keep the pure NVIDIA preference split, never APIGen-mixed data.
+                dataset_repo = "nvidia/When2Call"
+                data_dir = "train_pref"
+
+            try:
+                ds = load_dataset(
+                    dataset_repo,
+                    "train_pref" if dataset_repo == "nvidia/When2Call" else None,
+                    split="train",
+                    cache_dir=cache_dir,
+                    data_dir=None if dataset_repo == "nvidia/When2Call" else data_dir,
+                )
+            except Exception as exc:
+                # Fallback for parquet-only repos with incompatible embedded feature metadata.
+                if dataset_repo == "nvidia/When2Call":
+                    raise
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                from huggingface_hub import hf_hub_download, list_repo_files
+
+                repo_files = list_repo_files(dataset_repo, repo_type="dataset")
+                parquet_files = sorted(
+                    f
+                    for f in repo_files
+                    if f.startswith(f"{data_dir}/") and f.endswith(".parquet")
+                )
+                if not parquet_files:
+                    raise ValueError(
+                        f"No parquet files found in {dataset_repo}/{data_dir} for fallback loading."
+                    ) from exc
+
+                tables = []
+                for file_path in parquet_files:
+                    local_path = hf_hub_download(
+                        repo_id=dataset_repo,
+                        repo_type="dataset",
+                        filename=file_path,
+                        cache_dir=cache_dir,
+                    )
+                    tables.append(pq.read_table(local_path))
+                ds = Dataset.from_pyarrow(pa.concat_tables(tables))
+                print(
+                    "[dpo_kl] Falling back to parquet loader for "
+                    f"{dataset_repo} due to: {exc}"
+                )
+
+            print(
+                f"[dpo_kl] When2Call dataset source: {dataset_repo}, "
+                f"columns: {ds.column_names}"
+            )
+        else:
+            # Default: Orca DPO pairs
+            ds = load_dataset(
+                "argilla/distilabel-intel-orca-dpo-pairs",
+                split="train",
+                cache_dir=cache_dir,
+            )
+            # Filter as requested
+            ds = ds.filter(
+                lambda r: (r["status"] != "tie")
+                and (r["chosen_score"] >= 8)
+                and (not r["in_gsm8k_train"])
+            )
+
+        # Optional: proportion cap
+        data_prop = float(getattr(cfg.train, "data_proportion", 1.0))
+        if not (0.0 < data_prop <= 1.0):
+            raise ValueError(f"cfg.train.data_proportion must be in (0,1], got {data_prop}")
+        if data_prop < 1.0 and not is_helpsteer_pref:
+            keep = max(1, int(data_prop * len(ds)))
+            ds = ds.select(range(keep))
+
+        # Remove unused / heavy columns up-front (keeps behavior similar to the provided snippet)
+        original_columns = ds.column_names
+
+        tok_source = getattr(self, "_resolved_model_source", cfg.exp.model_name)
+        tok = AutoTokenizer.from_pretrained(tok_source, use_fast=True)
+        tok = self._ensure_chat_template(tok)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "right"
+        append_chatml_im_end = self._should_append_chatml_im_end(cfg)
+        if append_chatml_im_end:
+            print("[dpo_kl] train.append_chatml_im_end=True; appending ChatML <|im_end|> to completions")
+
+        if dataset_name == "ultra":
+            def chatml_format(r):
+                # UltraFeedback: chosen/rejected are message lists;
+                # extract the assistant response from index 1.
+                msgs = [{"role": "user", "content": r.get("prompt") or ""}]
+                prompt = tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+                chosen = self._format_answer_text(
+                    (r["chosen"][1]["content"] if r.get("chosen") else ""),
+                    cfg,
+                )
+                rejected = self._format_answer_text(
+                    (r["rejected"][1]["content"] if r.get("rejected") else ""),
+                    cfg,
+                )
+                return {
+                    "prompt": prompt,
+                    "chosen": chosen,
+                    "rejected": rejected,
+                }
+        elif is_helpsteer_pref:
+            def chatml_format(r):
+                msgs = [{"role": "user", "content": r.get("prompt") or ""}]
+                prompt = tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+                strength = int(r.get("preference_strength", 0) or 0)
+                response_1 = r.get("response_1") or ""
+                response_2 = r.get("response_2") or ""
+                if strength > 0:
+                    chosen_raw, rejected_raw = response_2, response_1
+                elif strength < 0:
+                    chosen_raw, rejected_raw = response_1, response_2
+                else:
+                    # Ties are filtered above; keep deterministic fallback for safety.
+                    chosen_raw, rejected_raw = response_1, response_2
+                split_raw = str(r.get("split") or "train").lower()
+                split = "validation" if split_raw in {"val", "validation"} else "train"
+                return {
+                    "prompt": prompt,
+                    "chosen": self._format_answer_text(chosen_raw, cfg),
+                    "rejected": self._format_answer_text(rejected_raw, cfg),
+                    "split": split,
+                    "preference_strength": strength,
+                }
+        elif is_when2call_variant:
+            def chatml_format(r):
+                messages = self._normalize_when2call_messages(r.get("messages"))
+                if use_xlam_prompt_format:
+                    prompt = self._build_xlam_prompt(tok, messages, r.get("tools"))
+                else:
+                    user_query = self._extract_when2call_user_query(messages)
+                    if self._is_when2call_strict_prompt(cfg):
+                        prompt = self._build_when2call_strict_prompt(
+                            tools_value=r.get("tools"),
+                            user_query=user_query,
+                        )
+                    else:
+                        tool_system_message = self._build_when2call_system_message(r.get("tools"))
+                        msgs = [
+                            {"role": "system", "content": tool_system_message},
+                            {"role": "user", "content": user_query},
+                        ]
+                        prompt = tok.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                        )
+                raw_chosen = self._extract_when2call_response_text(r.get("chosen_response"))
+                raw_rejected = self._extract_when2call_response_text(r.get("rejected_response"))
+                if use_xlam_prompt_format:
+                    chosen_text = self._normalize_tool_call_response_for_xlam(raw_chosen)
+                    rejected_text = self._normalize_tool_call_response_for_xlam(raw_rejected)
+                else:
+                    chosen_text = self._normalize_when2call_response_text(raw_chosen)
+                    rejected_text = self._normalize_when2call_response_text(raw_rejected)
+                return {
+                    "prompt": prompt,
+                    "chosen": self._format_answer_text(chosen_text, cfg),
+                    "rejected": self._format_answer_text(rejected_text, cfg),
+                }
+        else:
+            def chatml_format(r):
+                # Match the reference notebook formatting (ChatML-style strings)
+                system_text = r.get("system") or ""
+                msgs = []
+                if len(system_text) > 0:
+                    msgs.append({"role": "system", "content": system_text})
+                msgs.append({"role": "user", "content": r.get("input") or ""})
+                prompt = tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+                chosen = self._format_answer_text((r.get("chosen") or ""), cfg)
+                rejected = self._format_answer_text((r.get("rejected") or ""), cfg)
+                return {
+                    "prompt": prompt,
+                    "chosen": chosen,
+                    "rejected": rejected,
+                }
+
+        ds = ds.map(chatml_format, remove_columns=original_columns)
+
+        # Backward-compatible defaults: for legacy datasets objective and constraints
+        # are both computed on the same rows.
+        if "is_constraint" not in ds.column_names:
+            ds = ds.add_column("is_constraint", [True] * len(ds))
+        if "is_objective" not in ds.column_names:
+            ds = ds.add_column("is_objective", [True] * len(ds))
+        if "objective_use_chosen_only" not in ds.column_names:
+            ds = ds.add_column("objective_use_chosen_only", [False] * len(ds))
+        if "source" not in ds.column_names:
+            ds = ds.add_column("source", [dataset_name] * len(ds))
+
+        if is_helpsteer_pref:
+            tr_raw = ds.filter(lambda x: x["split"] == "train")
+            ev_raw = ds.filter(lambda x: x["split"] == "validation")
+
+            if data_prop < 1.0:
+                keep = max(1, int(data_prop * len(tr_raw)))
+                tr_raw = tr_raw.select(range(keep))
+
+            # Fallback for unexpected split naming/absence.
+            if len(ev_raw) == 0:
+                if not (0.0 < val_fraction < 1.0):
+                    raise ValueError(
+                        f"cfg.train.val_fraction must be in (0,1), got {val_fraction}"
+                    )
+                n_val = max(1, int(len(tr_raw) * val_fraction))
+                ev_raw = tr_raw.select(range(n_val))
+                tr_raw = tr_raw.select(range(n_val, len(tr_raw)))
+        else:
+            if not (0.0 < val_fraction < 1.0):
+                raise ValueError(f"cfg.train.val_fraction must be in (0,1), got {val_fraction}")
+
+            n_val = max(1, int(len(ds) * val_fraction))
+            ev_raw = ds.select(range(n_val))
+            tr_raw = ds.select(range(n_val, len(ds)))
+
+        if sanity_check:
+            tr_raw = tr_raw.select(range(min(len(tr_raw), 16)))
+            ev_raw = ev_raw.select(range(min(len(ev_raw), 16)))
+
+        if "split" not in tr_raw.column_names:
+            tr_raw = tr_raw.add_column("split", ["train"] * len(tr_raw))
+        if "split" not in ev_raw.column_names:
+            ev_raw = ev_raw.add_column("split", ["validation"] * len(ev_raw))
+
+        complete_ds = concatenate_datasets([tr_raw, ev_raw])
+        complete_ds = complete_ds.add_column("index", list(range(len(complete_ds))))
+
+        tr = complete_ds.filter(lambda x: x["split"] == "train")
+        ev = complete_ds.filter(lambda x: x["split"] == "validation")
+        if do_shuffle:
+            tr = tr.shuffle(seed=int(cfg.train.seed))
+            ev = ev.shuffle(seed=int(cfg.train.seed))
+
+        # Keep only the shortest `filter_shortest_train` fraction of training
+        # samples, measured by character length of the "chosen" response.
+        filter_shortest = float(getattr(cfg.train, "filter_shortest_train", 1.0))
+        if not (0.0 < filter_shortest <= 1.0):
+            raise ValueError(
+                f"cfg.train.filter_shortest_train must be in (0,1], got {filter_shortest}"
+            )
+        if filter_shortest < 1.0:
+            chosen_lengths = [len(r["chosen"]) for r in tr]
+            keep_n = max(1, int(filter_shortest * len(tr)))
+            sorted_indices = sorted(range(len(tr)), key=lambda i: chosen_lengths[i])
+            tr = tr.select(sorted_indices[:keep_n])
+
+        print(f"Training samples: {len(tr)}, Eval samples: {len(ev)}")
+        return tr, ev, complete_ds
+
+    def preprocessing_fn(self, tok, cfg):
+        max_length = int(getattr(cfg.train, "max_length", 1536))
+        max_prompt_length = int(getattr(cfg.train, "max_prompt_length", max_length))
+
+        if tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "right"
+
+        eos_id = tok.eos_token_id
+        if eos_id is None:
+            raise ValueError("Tokenizer must have eos_token_id set for this experiment.")
+
+        def _prompt_ids(prompt_text: str) -> List[int]:
+            prompt_text = prompt_text or ""
+            ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
+
+            # Truncate from the LEFT to keep the end-of-prompt (assistant header) intact.
+            if len(ids) > max_prompt_length:
+                ids = ids[-max_prompt_length:]
+            # Ensure room for EOS at end of full sequence.
+            if len(ids) > max_length - 1:
+                ids = ids[-(max_length - 1) :]
+            return ids
+
+        def _build_full(prompt_ids: List[int], answer_text: str) -> Tuple[List[int], List[bool]]:
+            ans_ids = tok(answer_text or "", add_special_tokens=False)["input_ids"]
+            # Reserve space for EOS
+            max_ans = max(0, max_length - len(prompt_ids) - 1)
+            ans_ids = ans_ids[:max_ans]
+            full = prompt_ids + ans_ids + [eos_id]
+            # Response mask: score only answer+EOS (not prompt)
+            resp = [False] * len(prompt_ids) + [True] * (len(full) - len(prompt_ids))
+            return full, resp
+
+        def fn(sample: Dict[str, Any]):
+            prompt_text = sample.get("prompt", "")
+            chosen_text = sample.get("chosen", "")
+            rejected_text = sample.get("rejected", "")
+
+            p_ids = _prompt_ids(prompt_text)
+            chosen_ids, chosen_mask = _build_full(p_ids, chosen_text)
+            rejected_ids, rejected_mask = _build_full(p_ids, rejected_text)
+
+            out = {
+                "chosen_input_ids": chosen_ids,
+                "rejected_input_ids": rejected_ids,
+                "chosen_response_mask": chosen_mask,
+                "rejected_response_mask": rejected_mask,
+                "index": int(sample["index"]),
+                "is_constraint": bool(sample.get("is_constraint", True)),
+                "is_objective": bool(sample.get("is_objective", True)),
+                "objective_use_chosen_only": bool(sample.get("objective_use_chosen_only", False)),
+            }
+            if "preference_strength" in sample and sample.get("preference_strength") is not None:
+                out["preference_strength"] = int(sample["preference_strength"])
+            return out
+
+        return fn
+
+    def get_collator(self, tok):
+        pad_id = tok.pad_token_id
+        if pad_id is None:
+            tok.pad_token = tok.eos_token
+            pad_id = tok.pad_token_id
+        tok.padding_side = "right"
+
+        class Collator:
+            def __init__(self, pad_token_id: int) -> None:
+                self.pad_token_id = pad_token_id
+
+            def __call__(self, samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+                B = len(samples)
+
+                # Pad chosen + rejected together to a shared max length for a single stacked forward pass.
+                seqs = (
+                    [torch.tensor(s["chosen_input_ids"], dtype=torch.long) for s in samples]
+                    + [torch.tensor(s["rejected_input_ids"], dtype=torch.long) for s in samples]
+                )
+                padded = right_padding(seqs, padding_value=self.pad_token_id)  # (2B, L)
+                chosen_input_ids = padded[:B]
+                rejected_input_ids = padded[B:]
+
+                masks = (
+                    [torch.tensor(s["chosen_response_mask"], dtype=torch.bool) for s in samples]
+                    + [torch.tensor(s["rejected_response_mask"], dtype=torch.bool) for s in samples]
+                )
+                padded_masks = right_padding(masks, padding_value=0).bool()  # (2B, L)
+                chosen_response_mask = padded_masks[:B]
+                rejected_response_mask = padded_masks[B:]
+
+                chosen_attn = chosen_input_ids.ne(self.pad_token_id)
+                rejected_attn = rejected_input_ids.ne(self.pad_token_id)
+
+                index = torch.tensor([s["index"] for s in samples], dtype=torch.long)
+                is_constraint = torch.tensor(
+                    [bool(s.get("is_constraint", True)) for s in samples],
+                    dtype=torch.bool,
+                )
+                is_objective = torch.tensor(
+                    [bool(s.get("is_objective", True)) for s in samples],
+                    dtype=torch.bool,
+                )
+                objective_use_chosen_only = torch.tensor(
+                    [bool(s.get("objective_use_chosen_only", False)) for s in samples],
+                    dtype=torch.bool,
+                )
+
+                return {
+                    "chosen_input_ids": chosen_input_ids,
+                    "rejected_input_ids": rejected_input_ids,
+                    "chosen_attention_mask": chosen_attn.bool(),
+                    "rejected_attention_mask": rejected_attn.bool(),
+                    "chosen_response_mask": chosen_response_mask,
+                    "rejected_response_mask": rejected_response_mask,
+                    "index": index,
+                    "is_constraint": is_constraint,
+                    "is_objective": is_objective,
+                    "objective_use_chosen_only": objective_use_chosen_only,
+                }
+
+        return Collator(pad_id)
+
+    def get_trainer_class(self):
+        class CustomTrainer(Trainer):
+            def __init__(
+                self,
+                *args,
+                custom_cfg=None,
+                complete_dataset=None,
+                experiment=None,
+                **kwargs,
+            ):
+                super().__init__(*args, **kwargs)
+                self.custom_cfg = custom_cfg
+                self.complete_ds = complete_dataset
+                self.experiment = experiment
+                self.init_dual_vars()
+                # Use per-example `index` as the label returned to metrics/prediction loops.
+                self.label_names = ["index"]
+                self._generated_eval_answers = False
+                self._generated_eval_keys = set()
+                self._index_to_preference_strength = None
+                self._index_to_is_constraint = None
+                self._index_to_is_objective = None
+                self.compute_metrics = self._compute_metrics
+                self._pbar_objective_sum = 0.0
+                self._pbar_slack_sum = 0.0
+                self._pbar_loss_sum = 0.0
+                self._pbar_objective_count = 0
+                self._pbar_slack_count = 0
+                self._pbar_loss_count = 0
+
+            def _accumulate_pbar_means(
+                self,
+                objective_mean: float = None,
+                slack_mean: float = None,
+                loss_mean: float = None,
+            ) -> None:
+                if objective_mean is not None:
+                    self._pbar_objective_sum += float(objective_mean)
+                    self._pbar_objective_count += 1
+                if slack_mean is not None:
+                    self._pbar_slack_sum += float(slack_mean)
+                    self._pbar_slack_count += 1
+                if loss_mean is not None:
+                    self._pbar_loss_sum += float(loss_mean)
+                    self._pbar_loss_count += 1
+
+            def log(self, logs: Dict[str, float], start_time=None) -> None:
+                logs = dict(logs or {})
+                is_eval_log = any(str(k).startswith("eval_") for k in logs.keys())
+                if not is_eval_log:
+                    if self._pbar_objective_count > 0:
+                        logs["mean_objective"] = self._pbar_objective_sum / self._pbar_objective_count
+                    if self._pbar_slack_count > 0:
+                        logs["mean_slack"] = self._pbar_slack_sum / self._pbar_slack_count
+                    if self._pbar_loss_count > 0:
+                        logs["mean_loss"] = self._pbar_loss_sum / self._pbar_loss_count
+                super().log(logs, start_time=start_time)
+
+            def init_dual_vars(self):
+                loss_type = str(self.custom_cfg.exp.loss_type)
+                both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
+                both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                resilient_both_aliases = {
+                    "_both_resilient",
+                    "both_resilient",
+                    "resilient_both",
+                }
+                three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
+
+                needs_single_avg_dual = loss_type == "avg"
+                needs_both_avg_duals = loss_type in both_avg_aliases
+                needs_single_aug_dual = loss_type in {"aug_dual", "resilient"}
+                needs_both_aug_duals = (
+                    loss_type in both_aug_aliases or loss_type in resilient_both_aliases
+                )
+                needs_three_aug_duals = loss_type in three_aug_aliases
+                needs_any_per_example_duals = (
+                    needs_single_aug_dual or needs_both_aug_duals or needs_three_aug_duals
+                )
+
+                # Always define attributes so other code paths can safely check/use them.
+                self.dual_vars = None
+                self.avg_dual = None
+                self.dual_vars_win = None
+                self.dual_vars_loose = None
+                self.avg_dual_win = None
+                self.avg_dual_loose = None
+                self.dual_vars_three_gap = None
+                self.dual_vars_three_win = None
+                self.dual_vars_three_loose = None
+
+                if needs_any_per_example_duals:
+                    n = (
+                        len(self.complete_ds)
+                        if self.complete_ds is not None
+                        else len(self.train_dataset or []) + len(self.eval_dataset or [])
+                    )
+                    if needs_single_aug_dual:
+                        self.dual_vars = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                    if needs_both_aug_duals:
+                        # State for two-constraint (_both*) augmented-dual losses.
+                        self.dual_vars_win = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                        self.dual_vars_loose = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                    if needs_three_aug_duals:
+                        # State for three-constraint augmented-dual loss:
+                        # gap + explicit win/loose constraints.
+                        self.dual_vars_three_gap = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                        self.dual_vars_three_win = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+                        self.dual_vars_three_loose = torch.zeros(
+                            n, dtype=torch.float, requires_grad=False, device=self.model.device
+                        )
+
+                if needs_single_avg_dual:
+                    self.avg_dual = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                if needs_both_avg_duals:
+                    self.avg_dual_win = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+                    self.avg_dual_loose = torch.tensor(0.0, device=self.model.device, dtype=torch.float)
+
+            def train(self, *args, **kwargs):
+                out = super().train(*args, **kwargs)
+                self._generate_eval_answers_end_of_training()
+                return out
+
+            def evaluate(self, *args, **kwargs):
+                metrics = super().evaluate(*args, **kwargs)
+                self._generate_eval_answers_on_epoch_eval()
+                return metrics
+
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                cfg = self.custom_cfg.exp
+                loss_type = str(cfg.loss_type)
+                both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
+                both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                resilient_both_aliases = {
+                    "_both_resilient",
+                    "both_resilient",
+                    "resilient_both",
+                }
+                both_penalty_aliases = {"_both_penalty", "both_penalty", "penalty_both"}
+                three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
+                needs_pairwise_slack = loss_type in {
+                    "avg",
+                    "aug_dual",
+                    "resilient",
+                    "penalty",
+                } or (loss_type in three_aug_aliases)
+                needs_two_constraint_slacks = (
+                    loss_type in both_avg_aliases
+                    or loss_type in both_aug_aliases
+                    or loss_type in resilient_both_aliases
+                    or loss_type in both_penalty_aliases
+                    or loss_type in three_aug_aliases
+                )
+
+                chosen_ids = inputs["chosen_input_ids"]
+                rejected_ids = inputs["rejected_input_ids"]
+                chosen_attn = inputs["chosen_attention_mask"]
+                rejected_attn = inputs["rejected_attention_mask"]
+                chosen_resp = inputs["chosen_response_mask"]
+                rejected_resp = inputs["rejected_response_mask"]
+                index = inputs["index"]
+                is_constraint = inputs.get("is_constraint")
+                is_objective = inputs.get("is_objective")
+                objective_use_chosen_only = inputs.get("objective_use_chosen_only")
+
+                if is_constraint is None:
+                    is_constraint = torch.ones_like(index, dtype=torch.bool)
+                if is_objective is None:
+                    is_objective = torch.ones_like(index, dtype=torch.bool)
+                if objective_use_chosen_only is None:
+                    objective_use_chosen_only = torch.zeros_like(index, dtype=torch.bool)
+
+                is_constraint = is_constraint.to(index.device).bool()
+                is_objective = is_objective.to(index.device).bool()
+                objective_use_chosen_only = objective_use_chosen_only.to(index.device).bool()
+
+                def _masked_mean(values: torch.Tensor | None, mask: torch.Tensor | None) -> torch.Tensor:
+                    if values is None:
+                        return torch.tensor(0.0, device=index.device, dtype=torch.float)
+                    if mask is None:
+                        return values.mean()
+                    if bool(mask.any()):
+                        return values[mask].mean()
+                    # Keep a valid grad path when no rows are active.
+                    return values.sum() * 0.0
+
+                B = chosen_ids.shape[0]
+
+                input_ids = torch.cat([chosen_ids, rejected_ids], dim=0)  # (2B, L)
+                attention_mask = torch.cat([chosen_attn, rejected_attn], dim=0)
+                response_mask = torch.cat([chosen_resp, rejected_resp], dim=0)
+
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
+                logits = outputs.logits[:, :-1]  # (2B, L-1, V)
+                del outputs
+                log_probs = F.log_softmax(logits, dim=-1)
+
+                # logp of the realized tokens (average over response tokens)
+                token_logp = torch.gather(
+                    log_probs,
+                    dim=-1,
+                    index=input_ids[:, 1:].unsqueeze(-1),
+                ).squeeze(-1)  # (2B, L-1)
+                token_logp = token_logp * response_mask[:, 1:]
+                num_tokens = response_mask[:, 1:].sum(dim=-1).clamp_min(1)
+                avg_logp = token_logp.sum(dim=-1) / num_tokens  # (2B,)
+                logp_chosen = avg_logp[:B]
+                logp_rejected = avg_logp[B:]
+                gap = None
+                if loss_type in {"simpo", "dpo"} or needs_pairwise_slack:
+                    gap = logp_chosen - logp_rejected  # (B,)
+
+                # SimPO objective (no KL regularization / no base model pass):
+                #   log σ( β/|y_w| logπ(y_w|x) - β/|y_l| logπ(y_l|x) - γ )
+                # We use per-token average logprobs, so this becomes:
+                #   log σ( β*(logp_chosen - logp_rejected) - γ )
+                # and set γ from the existing constraint tolerance (cfg.tol).
+                if loss_type == "simpo":
+                    gamma = cfg.tol
+                    beta_simpo = cfg.loss_alpha
+                    if gap is None:
+                        gap = logp_chosen - logp_rejected
+                    score = beta_simpo * gap - gamma  # (B,)
+                    # -log σ(score) == softplus(-score)
+                    active_mask = is_constraint
+                    loss_vec = F.softplus(-score)
+                    loss = _masked_mean(loss_vec, active_mask)
+                    if model.training:
+                        slack_simpo = gamma - beta_simpo * gap
+                        self._accumulate_pbar_means(
+                            objective_mean=float(loss.detach().cpu().item()),
+                            slack_mean=float(_masked_mean(slack_simpo, active_mask).detach().cpu().item()),
+                            loss_mean=float(loss.detach().cpu().item()),
+                        )
+                    if return_outputs:
+                        packed = torch.stack([logp_chosen, logp_rejected, score], dim=-1)
+                        return loss, {"logits": packed}
+                    return loss
+
+                # Reference model pass vs pretrained/base (adapters disabled)
+                with torch.no_grad():
+                    if hasattr(model, "disable_adapter"):
+                        with model.disable_adapter():
+                            base_out = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                use_cache=False,
+                            )
+                    elif hasattr(model, "module") and hasattr(model.module, "disable_adapter"):
+                        with model.module.disable_adapter():
+                            base_out = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                use_cache=False,
+                            )
+                    else:
+                        raise RuntimeError(
+                            "KL/DPO objectives require PEFT LoRA adapters. "
+                            "Expected model to expose `.disable_adapter()` (PeftModel)."
+                        )
+                    base_logits = base_out.logits[:, :-1]
+                    del base_out
+                    base_log_probs = F.log_softmax(base_logits, dim=-1)
+
+                base_token_logp = torch.gather(
+                    base_log_probs,
+                    dim=-1,
+                    index=input_ids[:, 1:].unsqueeze(-1),
+                ).squeeze(-1)  # (2B, L-1)
+                base_token_logp = base_token_logp * response_mask[:, 1:]
+                base_avg_logp = base_token_logp.sum(dim=-1) / num_tokens  # (2B,)
+                base_logp_chosen = base_avg_logp[:B]
+                base_logp_rejected = base_avg_logp[B:]
+
+                # Reference-adjusted sequence log-probs used by training constraints.
+                rel_logp_chosen = logp_chosen - base_logp_chosen
+                rel_logp_rejected = logp_rejected - base_logp_rejected
+                rel_gap = rel_logp_chosen - rel_logp_rejected
+                use_pretrained_slacks = bool(getattr(cfg, "use_pretrained_slacks", True))
+                if use_pretrained_slacks:
+                    slack_logp_chosen = rel_logp_chosen
+                    slack_logp_rejected = rel_logp_rejected
+                else:
+                    slack_logp_chosen = logp_chosen
+                    slack_logp_rejected = logp_rejected
+                slack_gap = slack_logp_chosen - slack_logp_rejected
+
+                if loss_type == "dpo":
+                    beta_dpo = float(getattr(cfg, "loss_alpha", 1.0))
+                    # Standard DPO score:
+                    #   beta * [ (logπ(y_w)-logπ(y_l)) - (logπ_ref(y_w)-logπ_ref(y_l)) ]
+                    score = beta_dpo * rel_gap
+                    active_mask = is_constraint
+                    loss_vec = F.softplus(-score)
+                    loss = _masked_mean(loss_vec, active_mask)
+                    if model.training:
+                        self._accumulate_pbar_means(
+                            objective_mean=float(loss.detach().cpu().item()),
+                            loss_mean=float(loss.detach().cpu().item()),
+                        )
+                    if return_outputs:
+                        packed = torch.stack([rel_logp_chosen, rel_logp_rejected, score], dim=-1)
+                        return loss, {"logits": packed}
+                    return loss
+
+                probs = log_probs.exp()
+                kl_token = (probs * (log_probs - base_log_probs)).sum(dim=-1)  # (2B, L-1)
+                kl_token = kl_token * response_mask[:, 1:]
+                kl_seq = kl_token.sum(dim=-1) / num_tokens  # (2B,)
+                kl_chosen = kl_seq[:B]
+                kl_rejected = kl_seq[B:]
+                kl_mean = 0.5 * (kl_chosen + kl_rejected)  # (B,)
+                kl_objective = torch.where(objective_use_chosen_only, kl_chosen, kl_mean)
+
+                # Objective: minimize KL (matches `SAFETY`; no separate beta scaling)
+                loss = torch.where(is_objective, kl_objective, kl_objective * 0.0)
+
+                slack = None
+                if needs_pairwise_slack:
+                    gap = slack_gap
+                    # Constraint slack: tol + logp(rejected) - logp(chosen) == tol - (logp_chosen - logp_rejected)
+                    slack = cfg.tol - gap  # (B,)
+                    slack = torch.where(is_constraint, slack, slack * 0.0)
+
+                slack_win = None
+                slack_loose = None
+                if needs_two_constraint_slacks:
+                    # Two explicit constraints:
+                    #   logp(chosen) >= tol_win      -> slack_win <= 0
+                    #   logp(rejected) <= tol_loose  -> slack_loose <= 0
+                    eps_win = float(
+                        getattr(
+                            cfg,
+                            "tol_win",
+                            getattr(cfg, "epsilon_win", getattr(cfg, "tol", 0.0)),
+                        )
+                    )
+                    eps_loose = float(
+                        getattr(
+                            cfg,
+                            "tol_loose",
+                            getattr(cfg, "epsilon_loose", getattr(cfg, "tol2", getattr(cfg, "tol", 0.0))),
+                        )
+                    )
+                    slack_win = eps_win - slack_logp_chosen
+                    slack_loose = slack_logp_rejected - eps_loose
+                    slack_win = torch.where(is_constraint, slack_win, slack_win * 0.0)
+                    slack_loose = torch.where(is_constraint, slack_loose, slack_loose * 0.0)
+
+                # Loss schemes (as in SAFETY)
+                if loss_type == "erm":
+                    pass
+
+                elif loss_type == "avg":
+                    if model.training:
+                        with torch.no_grad():
+                            dual_avg = self.avg_dual.clone()
+                            dual_avg = torch.clamp(
+                                dual_avg + cfg.dual_step_size * _masked_mean(slack, is_constraint),
+                                min=0.0,
+                            )
+                        self.avg_dual = dual_avg.detach()
+                    loss = loss + self.avg_dual * slack
+
+                elif loss_type == "aug_dual":
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
+                        dual_var = self.dual_vars[constrained_indexes].clone()
+                        a = slack[is_constraint]
+                        b = dual_var / (cfg.loss_alpha)
+                        z = 2 * a + b
+                        with torch.no_grad():
+                            dual_grad = torch.where(z > 0, a, -0.5 * b)
+                            if model.training:
+                                dual_var = dual_var + cfg.dual_step_size * dual_grad
+                                self.dual_vars[constrained_indexes] = dual_var.detach()
+                        aug_term = slack * 0.0
+                        aug_update = cfg.loss_alpha / 4 * (torch.clamp(z, min=0.0) ** 2 - b**2)
+                        aug_term[is_constraint] = aug_update.to(dtype=aug_term.dtype)
+                        loss = loss + aug_term
+                elif loss_type == "resilient":
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
+                        dual_var = self.dual_vars[constrained_indexes].clone()
+                        a = slack[is_constraint]
+                        a_resilient = a - dual_var / 2 * (cfg.resilient_coef)
+                        b = dual_var / (cfg.loss_alpha)
+                        coef = (cfg.resilient_coef) / (cfg.loss_alpha + cfg.resilient_coef)
+                        z = 2 * a + b
+                        with torch.no_grad():
+                            dual_grad = torch.where(z > 0, coef * a_resilient, -0.5 * b)
+                            if model.training:
+                                dual_var += cfg.dual_step_size * dual_grad
+                                self.dual_vars[constrained_indexes] = dual_var.detach()
+                        resilient_term = slack * 0.0
+                        resilient_update = cfg.loss_alpha / 4 * (
+                            coef * torch.clamp(z, min=0.0) ** 2 - b**2
+                        )
+                        resilient_term[is_constraint] = resilient_update.to(dtype=resilient_term.dtype)
+                        loss = loss + resilient_term
+
+                elif loss_type == "penalty":
+                    loss = loss + cfg.loss_alpha * slack
+
+                elif loss_type in both_avg_aliases:
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
+                    with torch.no_grad():
+                        if model.training:
+                            dual_avg_win = self.avg_dual_win.clone()
+                            dual_avg_win = torch.clamp(
+                                dual_avg_win + cfg.dual_step_size * _masked_mean(slack_win, is_constraint),
+                                min=0.0,
+                            )
+                            self.avg_dual_win = dual_avg_win.detach()
+
+                            dual_avg_loose = self.avg_dual_loose.clone()
+                            dual_avg_loose = torch.clamp(
+                                dual_avg_loose + cfg.dual_step_size * _masked_mean(slack_loose, is_constraint),
+                                min=0.0,
+                            )
+                            self.avg_dual_loose = dual_avg_loose.detach()
+
+                    loss = (
+                        loss
+                        + alpha_win * self.avg_dual_win.detach() * slack_win
+                        + alpha_loose * self.avg_dual_loose.detach() * slack_loose
+                    )
+
+                elif loss_type in both_aug_aliases:
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_win = max(alpha_win, 1e-12)
+                    alpha_loose = max(alpha_loose, 1e-12)
+
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
+                        dual_var_win = self.dual_vars_win[constrained_indexes].clone()
+                        a_win = slack_win[is_constraint]
+                        b_win = dual_var_win / alpha_win
+                        z_win = 2 * a_win + b_win
+                        with torch.no_grad():
+                            dual_grad_win = torch.where(z_win > 0, a_win, -0.5 * b_win)
+                            if model.training:
+                                dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
+                                self.dual_vars_win[constrained_indexes] = dual_var_win.detach()
+                        win_term = slack_win * 0.0
+                        win_update = alpha_win / 4 * (torch.clamp(z_win, min=0.0) ** 2 - b_win**2)
+                        win_term[is_constraint] = win_update.to(dtype=win_term.dtype)
+                        loss = loss + win_term
+
+                        dual_var_loose = self.dual_vars_loose[constrained_indexes].clone()
+                        a_loose = slack_loose[is_constraint]
+                        b_loose = dual_var_loose / alpha_loose
+                        z_loose = 2 * a_loose + b_loose
+                        with torch.no_grad():
+                            dual_grad_loose = torch.where(z_loose > 0, a_loose, -0.5 * b_loose)
+                            if model.training:
+                                dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
+                                self.dual_vars_loose[constrained_indexes] = dual_var_loose.detach()
+                        loose_term = slack_loose * 0.0
+                        loose_update = alpha_loose / 4 * (
+                            torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2
+                        )
+                        loose_term[is_constraint] = loose_update.to(dtype=loose_term.dtype)
+                        loss = loss + loose_term
+
+                elif loss_type in resilient_both_aliases:
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_win = max(alpha_win, 1e-12)
+                    alpha_loose = max(alpha_loose, 1e-12)
+                    resilient_coef = float(getattr(cfg, "resilient_coef", 1.0))
+
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
+
+                        dual_var_win = self.dual_vars_win[constrained_indexes].clone()
+                        a_win = slack_win[is_constraint]
+                        a_resilient_win = a_win - dual_var_win / 2 * resilient_coef
+                        b_win = dual_var_win / alpha_win
+                        coef_win = resilient_coef / (alpha_win + resilient_coef)
+                        z_win = 2 * a_win + b_win
+                        with torch.no_grad():
+                            dual_grad_win = torch.where(
+                                z_win > 0,
+                                coef_win * a_resilient_win,
+                                -0.5 * b_win,
+                            )
+                            if model.training:
+                                dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
+                                self.dual_vars_win[constrained_indexes] = dual_var_win.detach()
+                        win_term = slack_win * 0.0
+                        win_update = alpha_win / 4 * (
+                            coef_win * torch.clamp(z_win, min=0.0) ** 2 - b_win**2
+                        )
+                        win_term[is_constraint] = win_update.to(dtype=win_term.dtype)
+                        loss = loss + win_term
+
+                        dual_var_loose = self.dual_vars_loose[constrained_indexes].clone()
+                        a_loose = slack_loose[is_constraint]
+                        a_resilient_loose = a_loose - dual_var_loose / 2 * resilient_coef
+                        b_loose = dual_var_loose / alpha_loose
+                        coef_loose = resilient_coef / (alpha_loose + resilient_coef)
+                        z_loose = 2 * a_loose + b_loose
+                        with torch.no_grad():
+                            dual_grad_loose = torch.where(
+                                z_loose > 0,
+                                coef_loose * a_resilient_loose,
+                                -0.5 * b_loose,
+                            )
+                            if model.training:
+                                dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
+                                self.dual_vars_loose[constrained_indexes] = dual_var_loose.detach()
+                        loose_term = slack_loose * 0.0
+                        loose_update = alpha_loose / 4 * (
+                            coef_loose * torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2
+                        )
+                        loose_term[is_constraint] = loose_update.to(dtype=loose_term.dtype)
+                        loss = loss + loose_term
+
+                elif loss_type in three_aug_aliases:
+                    alpha_gap = float(getattr(cfg, "loss_alpha_gap", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(
+                        getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0))
+                    )
+                    alpha_gap = max(alpha_gap, 1e-12)
+                    alpha_win = max(alpha_win, 1e-12)
+                    alpha_loose = max(alpha_loose, 1e-12)
+
+                    if bool(is_constraint.any()):
+                        constrained_indexes = index[is_constraint]
+
+                        dual_var_gap = self.dual_vars_three_gap[constrained_indexes].clone()
+                        a_gap = slack[is_constraint]
+                        b_gap = dual_var_gap / alpha_gap
+                        z_gap = 2 * a_gap + b_gap
+                        with torch.no_grad():
+                            dual_grad_gap = torch.where(z_gap > 0, a_gap, -0.5 * b_gap)
+                            if model.training:
+                                dual_var_gap = dual_var_gap + cfg.dual_step_size * dual_grad_gap
+                                self.dual_vars_three_gap[constrained_indexes] = dual_var_gap.detach()
+                        gap_term = slack * 0.0
+                        gap_update = alpha_gap / 4 * (torch.clamp(z_gap, min=0.0) ** 2 - b_gap**2)
+                        gap_term[is_constraint] = gap_update.to(dtype=gap_term.dtype)
+                        loss = loss + gap_term
+
+                        dual_var_win = self.dual_vars_three_win[constrained_indexes].clone()
+                        a_win = slack_win[is_constraint]
+                        b_win = dual_var_win / alpha_win
+                        z_win = 2 * a_win + b_win
+                        with torch.no_grad():
+                            dual_grad_win = torch.where(z_win > 0, a_win, -0.5 * b_win)
+                            if model.training:
+                                dual_var_win = dual_var_win + cfg.dual_step_size * dual_grad_win
+                                self.dual_vars_three_win[constrained_indexes] = dual_var_win.detach()
+                        win_term = slack_win * 0.0
+                        win_update = alpha_win / 4 * (torch.clamp(z_win, min=0.0) ** 2 - b_win**2)
+                        win_term[is_constraint] = win_update.to(dtype=win_term.dtype)
+                        loss = loss + win_term
+
+                        dual_var_loose = self.dual_vars_three_loose[constrained_indexes].clone()
+                        a_loose = slack_loose[is_constraint]
+                        b_loose = dual_var_loose / alpha_loose
+                        z_loose = 2 * a_loose + b_loose
+                        with torch.no_grad():
+                            dual_grad_loose = torch.where(z_loose > 0, a_loose, -0.5 * b_loose)
+                            if model.training:
+                                dual_var_loose = dual_var_loose + cfg.dual_step_size * dual_grad_loose
+                                self.dual_vars_three_loose[constrained_indexes] = dual_var_loose.detach()
+                        loose_term = slack_loose * 0.0
+                        loose_update = alpha_loose / 4 * (
+                            torch.clamp(z_loose, min=0.0) ** 2 - b_loose**2
+                        )
+                        loose_term[is_constraint] = loose_update.to(dtype=loose_term.dtype)
+                        loss = loss + loose_term
+
+                elif loss_type in both_penalty_aliases:
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
+                    loss = loss + alpha_win * slack_win + alpha_loose * slack_loose
+
+                else:
+                    raise ValueError(f"Unknown loss_type: {loss_type}")
+
+                loss = loss.mean()
+                if model.training:
+                    objective_mean = float(_masked_mean(kl_objective, is_objective).detach().cpu().item())
+                    slack_mean = None
+                    if slack is not None:
+                        slack_mean = float(_masked_mean(slack, is_constraint).detach().cpu().item())
+                    elif slack_win is not None and slack_loose is not None:
+                        slack_mean = float(
+                            (
+                                0.5
+                                * (
+                                    _masked_mean(slack_win, is_constraint)
+                                    + _masked_mean(slack_loose, is_constraint)
+                                )
+                            )
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
+                    self._accumulate_pbar_means(
+                        objective_mean=objective_mean,
+                        slack_mean=slack_mean,
+                        loss_mean=float(loss.detach().cpu().item()),
+                    )
+
+                if return_outputs:
+                    # Return compact predictions for metrics: [logp_chosen, logp_rejected, third]
+                    # third = KL mean for KL-based methods; score for SimPO/DPO
+                    # Use raw policy log-probs here so eval slacks are not reference-normalized.
+                    packed = torch.stack([logp_chosen, logp_rejected, kl_objective], dim=-1)
+                    return loss, {"logits": packed}
+                return loss
+
+            def _compute_metrics(self, pred):
+                cfg = self.custom_cfg
+                exp_cfg = cfg.exp
+                loss_type = str(exp_cfg.loss_type)
+                both_avg_aliases = {"_both_avg", "both_avg", "avg_both"}
+                both_aug_aliases = {"_both_aug_dual", "both_aug_dual", "aug_dual_both"}
+                resilient_both_aliases = {
+                    "_both_resilient",
+                    "both_resilient",
+                    "resilient_both",
+                }
+                three_aug_aliases = {"aug_dual_three", "_aug_dual_three", "three_aug_dual"}
+                arr = pred.predictions
+                # Flatten prediction chunks robustly (match SAFETY behavior):
+                # keep all rows from the full evaluated dataset.
+                if isinstance(arr, (list, tuple)):
+                    parts = []
+                    for x in arr:
+                        x_np = np.asarray(x)
+                        if x_np.ndim == 1:
+                            x_np = x_np[:, None]
+                        parts.append(x_np)
+                    if not parts:
+                        return {}
+                    arr = np.concatenate(parts, axis=0)
+                else:
+                    arr = np.asarray(arr)
+                if arr.ndim != 2 or arr.shape[1] < 3:
+                    return {}
+                idx_chunks = pred.label_ids
+                if isinstance(idx_chunks, (list, tuple)):
+                    indexes = np.concatenate([np.asarray(x) for x in idx_chunks], axis=0)
+                else:
+                    indexes = np.asarray(idx_chunks)
+                indexes = np.asarray(indexes).reshape(-1)
+                logp_chosen = arr[:, 0]
+                logp_rejected = arr[:, 1]
+                gap = logp_chosen - logp_rejected
+                gap_positive_count = int(np.sum(gap > 0.0))
+                gap_positive_rate = float(np.mean(gap > 0.0))
+                preference_strength_values = None
+                if (
+                    self.complete_ds is not None
+                    and hasattr(self.complete_ds, "column_names")
+                    and "preference_strength" in self.complete_ds.column_names
+                ):
+                    try:
+                        if self._index_to_preference_strength is None:
+                            full_indexes = np.asarray(self.complete_ds["index"], dtype=np.int64)
+                            full_strengths = np.asarray(
+                                self.complete_ds["preference_strength"], dtype=np.int64
+                            )
+                            self._index_to_preference_strength = {
+                                int(i): int(s)
+                                for i, s in zip(full_indexes.tolist(), full_strengths.tolist())
+                            }
+                        mapped_strengths = [
+                            self._index_to_preference_strength.get(int(idx))
+                            for idx in indexes.tolist()
+                        ]
+                        if all(v is not None for v in mapped_strengths):
+                            preference_strength_values = np.asarray(mapped_strengths, dtype=np.int64)
+                    except Exception:
+                        preference_strength_values = None
+
+                constraint_mask = np.ones_like(indexes, dtype=bool)
+                objective_mask = np.ones_like(indexes, dtype=bool)
+                if self.complete_ds is not None and hasattr(self.complete_ds, "column_names"):
+                    try:
+                        if "is_constraint" in self.complete_ds.column_names:
+                            if self._index_to_is_constraint is None:
+                                full_indexes = np.asarray(self.complete_ds["index"], dtype=np.int64)
+                                full_values = np.asarray(self.complete_ds["is_constraint"], dtype=bool)
+                                self._index_to_is_constraint = {
+                                    int(i): bool(v)
+                                    for i, v in zip(full_indexes.tolist(), full_values.tolist())
+                                }
+                            mapped = [self._index_to_is_constraint.get(int(idx)) for idx in indexes.tolist()]
+                            if all(v is not None for v in mapped):
+                                constraint_mask = np.asarray(mapped, dtype=bool)
+                        if "is_objective" in self.complete_ds.column_names:
+                            if self._index_to_is_objective is None:
+                                full_indexes = np.asarray(self.complete_ds["index"], dtype=np.int64)
+                                full_values = np.asarray(self.complete_ds["is_objective"], dtype=bool)
+                                self._index_to_is_objective = {
+                                    int(i): bool(v)
+                                    for i, v in zip(full_indexes.tolist(), full_values.tolist())
+                                }
+                            mapped = [self._index_to_is_objective.get(int(idx)) for idx in indexes.tolist()]
+                            if all(v is not None for v in mapped):
+                                objective_mask = np.asarray(mapped, dtype=bool)
+                    except Exception:
+                        constraint_mask = np.ones_like(indexes, dtype=bool)
+                        objective_mask = np.ones_like(indexes, dtype=bool)
+
+                constraint_indexes = indexes[constraint_mask]
+                objective_indexes = indexes[objective_mask]
+                eps_win = float(
+                    getattr(
+                        exp_cfg,
+                        "tol_win",
+                        getattr(exp_cfg, "epsilon_win", getattr(exp_cfg, "tol", 0.0)),
+                    )
+                )
+                eps_loose = float(
+                    getattr(
+                        exp_cfg,
+                        "tol_loose",
+                        getattr(exp_cfg, "epsilon_loose", getattr(exp_cfg, "tol2", getattr(exp_cfg, "tol", 0.0))),
+                    )
+                )
+                slack_win_values = eps_win - logp_chosen
+                slack_loose_values = logp_rejected - eps_loose
+                # Match SAFETY convention: "constraint" is the negated log-ratio.
+                # constraint = -(logp_chosen - logp_rejected)
+                constraint_values = -gap
+                if indexes.shape[0] != constraint_values.shape[0]:
+                    # Fallback for unexpected prediction/label packing mismatch.
+                    indexes = np.arange(constraint_values.shape[0], dtype=np.int64)
+                    constraint_mask = np.ones_like(indexes, dtype=bool)
+                    objective_mask = np.ones_like(indexes, dtype=bool)
+                    constraint_indexes = indexes
+                    objective_indexes = indexes
+
+                constraint_values = constraint_values[constraint_mask]
+                slack_win_values = slack_win_values[constraint_mask]
+                slack_loose_values = slack_loose_values[constraint_mask]
+                gap_constraint = gap[constraint_mask]
+                gap_positive_count = int(np.sum(gap_constraint > 0.0)) if gap_constraint.size > 0 else 0
+                gap_positive_rate = float(np.mean(gap_constraint > 0.0)) if gap_constraint.size > 0 else 0.0
+                objective_values = arr[:, 2]
+                objective_values = objective_values[objective_mask]
+
+                # Store full-eval tensors for shared eval callbacks (eval/train prefixes).
+                self._last_constraint_slacks = torch.tensor(constraint_values, dtype=torch.float).detach().cpu()
+                self._last_constraint_indexes = torch.tensor(constraint_indexes, dtype=torch.long).detach().cpu()
+                self._last_constraint_slacks_win = torch.tensor(slack_win_values, dtype=torch.float).detach().cpu()
+                self._last_constraint_slacks_loose = torch.tensor(slack_loose_values, dtype=torch.float).detach().cpu()
+                self._last_objective_ratios = torch.tensor(objective_values, dtype=torch.float).detach().cpu()
+                self._last_objective_indexes = torch.tensor(objective_indexes, dtype=torch.long).detach().cpu()
+
+                def _slack_stats(values_np: np.ndarray) -> Dict[str, float]:
+                    if values_np.size == 0:
+                        return {
+                            "mean": 0.0,
+                            "min": 0.0,
+                            "max": 0.0,
+                            "q90": 0.0,
+                            "q99": 0.0,
+                            "cvar": 0.0,
+                        }
+                    mean_v = float(np.mean(values_np))
+                    min_v = float(np.min(values_np))
+                    max_v = float(np.max(values_np))
+                    q90_v = float(np.quantile(values_np, 0.9))
+                    q99_v = float(np.quantile(values_np, 0.99))
+                    tail_v = values_np[values_np > q90_v]
+                    cvar_v = float(np.mean(tail_v)) if tail_v.size > 0 else max_v
+                    return {
+                        "mean": mean_v,
+                        "min": min_v,
+                        "max": max_v,
+                        "q90": q90_v,
+                        "q99": q99_v,
+                        "cvar": cvar_v,
+                    }
+
+                constraint_stats = _slack_stats(constraint_values)
+                win_stats = _slack_stats(slack_win_values)
+                loose_stats = _slack_stats(slack_loose_values)
+
+                out = {
+                    "logp_gap": float(np.mean(gap_constraint)) if gap_constraint.size > 0 else 0.0,
+                    "gap_positive_count": gap_positive_count,
+                    "gap_positive_rate": gap_positive_rate,
+                    "objective_count": int(objective_mask.sum()),
+                    "constraint_count": int(constraint_mask.sum()),
+                    "constraint_mean": constraint_stats["mean"],
+                    "constraint_min": constraint_stats["min"],
+                    "constraint_max": constraint_stats["max"],
+                    "constraint_q90": constraint_stats["q90"],
+                    "constraint_q99": constraint_stats["q99"],
+                    "constraint_cvar": constraint_stats["cvar"],
+                    "slack_win_mean": win_stats["mean"],
+                    "slack_win_min": win_stats["min"],
+                    "slack_win_max": win_stats["max"],
+                    "slack_win_q90": win_stats["q90"],
+                    "slack_win_q99": win_stats["q99"],
+                    "slack_win_cvar": win_stats["cvar"],
+                    "slack_loose_mean": loose_stats["mean"],
+                    "slack_loose_min": loose_stats["min"],
+                    "slack_loose_max": loose_stats["max"],
+                    "slack_loose_q90": loose_stats["q90"],
+                    "slack_loose_q99": loose_stats["q99"],
+                    "slack_loose_cvar": loose_stats["cvar"],
+                }
+                dual_stats = None
+                dual_stats_win = None
+                dual_stats_loose = None
+                dual_stats_gap = None
+                if (
+                    loss_type in {"aug_dual", "resilient"}
+                    or loss_type in both_aug_aliases
+                    or loss_type in resilient_both_aliases
+                    or loss_type in three_aug_aliases
+                ):
+                    if (
+                        self.train_dataset is not None
+                        and hasattr(self.train_dataset, "column_names")
+                        and "index" in self.train_dataset.column_names
+                    ):
+                        train_indexes = list(self.train_dataset["index"])
+                        if "is_constraint" in self.train_dataset.column_names:
+                            train_constraints = [
+                                bool(v) for v in list(self.train_dataset["is_constraint"])
+                            ]
+                            train_indexes = [
+                                int(idx)
+                                for idx, is_c in zip(train_indexes, train_constraints)
+                                if bool(is_c)
+                            ]
+                    else:
+                        train_indexes = (
+                            list(range(len(self.train_dataset)))
+                            if self.train_dataset is not None
+                            else []
+                        )
+
+                    def _dual_stats_for(dual_tensor):
+                        if not train_indexes:
+                            return None
+                        dual_vals = dual_tensor.detach().cpu().numpy()
+                        selected = [
+                            float(dual_vals[int(idx)])
+                            for idx in train_indexes
+                            if 0 <= int(idx) < len(dual_vals)
+                        ]
+                        if not selected:
+                            return None
+                        selected_np = np.asarray(selected, dtype=np.float64)
+                        dual_q90 = float(np.quantile(selected_np, 0.9))
+                        dual_q99 = float(np.quantile(selected_np, 0.99))
+                        dual_tail = selected_np[selected_np > dual_q90]
+                        dual_cvar = (
+                            float(np.mean(dual_tail))
+                            if dual_tail.size > 0
+                            else float(np.max(selected_np))
+                        )
+                        return {
+                            "dual_vars_mean": float(np.mean(selected_np)),
+                            "dual_vars_min": float(np.min(selected_np)),
+                            "dual_vars_max": float(np.max(selected_np)),
+                            "dual_vars_q90": dual_q90,
+                            "dual_vars_q99": dual_q99,
+                            "dual_vars_cvar": dual_cvar,
+                            "_train_indexes": train_indexes,
+                            "_dual_vals": dual_vals if train_indexes else None,
+                        }
+
+                    if loss_type in {"aug_dual", "resilient"}:
+                        dual_stats = _dual_stats_for(self.dual_vars)
+                        if dual_stats is not None:
+                            out.update(
+                                {
+                                    "dual_vars_mean": dual_stats["dual_vars_mean"],
+                                    "dual_vars_min": dual_stats["dual_vars_min"],
+                                    "dual_vars_max": dual_stats["dual_vars_max"],
+                                    "dual_vars_q90": dual_stats["dual_vars_q90"],
+                                    "dual_vars_q99": dual_stats["dual_vars_q99"],
+                                    "dual_vars_cvar": dual_stats["dual_vars_cvar"],
+                                }
+                            )
+                    elif loss_type in both_aug_aliases or loss_type in resilient_both_aliases:
+                        dual_stats_win = _dual_stats_for(self.dual_vars_win)
+                        dual_stats_loose = _dual_stats_for(self.dual_vars_loose)
+                        if dual_stats_win is not None:
+                            out.update(
+                                {
+                                    "dual_vars_win_mean": dual_stats_win["dual_vars_mean"],
+                                    "dual_vars_win_min": dual_stats_win["dual_vars_min"],
+                                    "dual_vars_win_max": dual_stats_win["dual_vars_max"],
+                                    "dual_vars_win_q90": dual_stats_win["dual_vars_q90"],
+                                    "dual_vars_win_q99": dual_stats_win["dual_vars_q99"],
+                                    "dual_vars_win_cvar": dual_stats_win["dual_vars_cvar"],
+                                }
+                            )
+                        if dual_stats_loose is not None:
+                            out.update(
+                                {
+                                    "dual_vars_loose_mean": dual_stats_loose["dual_vars_mean"],
+                                    "dual_vars_loose_min": dual_stats_loose["dual_vars_min"],
+                                    "dual_vars_loose_max": dual_stats_loose["dual_vars_max"],
+                                    "dual_vars_loose_q90": dual_stats_loose["dual_vars_q90"],
+                                    "dual_vars_loose_q99": dual_stats_loose["dual_vars_q99"],
+                                    "dual_vars_loose_cvar": dual_stats_loose["dual_vars_cvar"],
+                                }
+                            )
+                    else:
+                        dual_stats_gap = _dual_stats_for(self.dual_vars_three_gap)
+                        dual_stats_win = _dual_stats_for(self.dual_vars_three_win)
+                        dual_stats_loose = _dual_stats_for(self.dual_vars_three_loose)
+                        if dual_stats_gap is not None:
+                            out.update(
+                                {
+                                    "dual_vars_gap_mean": dual_stats_gap["dual_vars_mean"],
+                                    "dual_vars_gap_min": dual_stats_gap["dual_vars_min"],
+                                    "dual_vars_gap_max": dual_stats_gap["dual_vars_max"],
+                                    "dual_vars_gap_q90": dual_stats_gap["dual_vars_q90"],
+                                    "dual_vars_gap_q99": dual_stats_gap["dual_vars_q99"],
+                                    "dual_vars_gap_cvar": dual_stats_gap["dual_vars_cvar"],
+                                }
+                            )
+                        if dual_stats_win is not None:
+                            out.update(
+                                {
+                                    "dual_vars_win_mean": dual_stats_win["dual_vars_mean"],
+                                    "dual_vars_win_min": dual_stats_win["dual_vars_min"],
+                                    "dual_vars_win_max": dual_stats_win["dual_vars_max"],
+                                    "dual_vars_win_q90": dual_stats_win["dual_vars_q90"],
+                                    "dual_vars_win_q99": dual_stats_win["dual_vars_q99"],
+                                    "dual_vars_win_cvar": dual_stats_win["dual_vars_cvar"],
+                                }
+                            )
+                        if dual_stats_loose is not None:
+                            out.update(
+                                {
+                                    "dual_vars_loose_mean": dual_stats_loose["dual_vars_mean"],
+                                    "dual_vars_loose_min": dual_stats_loose["dual_vars_min"],
+                                    "dual_vars_loose_max": dual_stats_loose["dual_vars_max"],
+                                    "dual_vars_loose_q90": dual_stats_loose["dual_vars_q90"],
+                                    "dual_vars_loose_q99": dual_stats_loose["dual_vars_q99"],
+                                    "dual_vars_loose_cvar": dual_stats_loose["dual_vars_cvar"],
+                                }
+                            )
+
+                if getattr(cfg.train, "use_wandb", False):
+                    try:
+                        import wandb
+
+                        if wandb.run is not None:
+                            epoch = self.state.epoch
+                            constraint_strength_values = None
+                            if (
+                                preference_strength_values is not None
+                                and preference_strength_values.shape[0] == constraint_mask.shape[0]
+                            ):
+                                constraint_strength_values = preference_strength_values[constraint_mask]
+
+                            if constraint_strength_values is not None:
+                                table = wandb.Table(columns=["constraint_slack", "preference_strength"])
+                                table_win = wandb.Table(columns=["slack_win", "preference_strength"])
+                                table_loose = wandb.Table(columns=["slack_loose", "preference_strength"])
+                                for s, strength in zip(
+                                    constraint_values.tolist(), constraint_strength_values.tolist()
+                                ):
+                                    table.add_data(s, int(strength))
+                                for s, strength in zip(
+                                    slack_win_values.tolist(), constraint_strength_values.tolist()
+                                ):
+                                    table_win.add_data(s, int(strength))
+                                for s, strength in zip(
+                                    slack_loose_values.tolist(), constraint_strength_values.tolist()
+                                ):
+                                    table_loose.add_data(s, int(strength))
+                            else:
+                                table = wandb.Table(columns=["constraint_slack"])
+                                for s in constraint_values.tolist():
+                                    table.add_data(s)
+                                table_win = wandb.Table(columns=["slack_win"])
+                                for s in slack_win_values.tolist():
+                                    table_win.add_data(s)
+                                table_loose = wandb.Table(columns=["slack_loose"])
+                                for s in slack_loose_values.tolist():
+                                    table_loose.add_data(s)
+                            prefix = getattr(self, "_current_eval_prefix", "eval")
+                            wandb.log(
+                                {
+                                    f"constraint_slacks_epoch_{epoch}_{prefix}": table,
+                                    f"constraint_slacks_win_epoch_{epoch}_{prefix}": table_win,
+                                    f"constraint_slacks_loose_epoch_{epoch}_{prefix}": table_loose,
+                                    f"gap_positive_count_{prefix}": gap_positive_count,
+                                    f"gap_positive_rate_{prefix}": gap_positive_rate,
+                                }
+                            )
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                if loss_type in {"aug_dual", "resilient"} and getattr(cfg.train, "use_wandb", False):
+                    try:
+                        import wandb
+
+                        if wandb.run is not None and dual_stats is not None:
+                            epoch = self.state.epoch
+                            table = wandb.Table(columns=["index", "dual_var"])
+                            train_indexes = dual_stats["_train_indexes"]
+                            dual_vals = dual_stats["_dual_vals"]
+                            if train_indexes:
+                                for idx in train_indexes:
+                                    if 0 <= int(idx) < len(dual_vals):
+                                        table.add_data(int(idx), float(dual_vals[int(idx)]))
+                            prefix = getattr(self, "_current_eval_prefix", "eval")
+                            wandb.log(
+                                {
+                                    f"dual_vars_{prefix}_epoch_{epoch}": table,
+                                    f"dual_vars_mean_{prefix}": dual_stats["dual_vars_mean"],
+                                    f"dual_vars_min_{prefix}": dual_stats["dual_vars_min"],
+                                    f"dual_vars_max_{prefix}": dual_stats["dual_vars_max"],
+                                    f"dual_vars_q90_{prefix}": dual_stats["dual_vars_q90"],
+                                    f"dual_vars_q99_{prefix}": dual_stats["dual_vars_q99"],
+                                    f"dual_vars_cvar_{prefix}": dual_stats["dual_vars_cvar"],
+                                }
+                            )
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                if (
+                    loss_type in both_aug_aliases or loss_type in resilient_both_aliases
+                ) and getattr(cfg.train, "use_wandb", False):
+                    try:
+                        import wandb
+
+                        if wandb.run is not None:
+                            epoch = self.state.epoch
+                            prefix = getattr(self, "_current_eval_prefix", "eval")
+                            payload = {}
+
+                            if dual_stats_win is not None:
+                                table_win_dual = wandb.Table(columns=["index", "dual_var_win"])
+                                train_indexes = dual_stats_win["_train_indexes"]
+                                dual_vals = dual_stats_win["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_win_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_win_{prefix}_epoch_{epoch}": table_win_dual,
+                                        f"dual_vars_win_mean_{prefix}": dual_stats_win["dual_vars_mean"],
+                                        f"dual_vars_win_min_{prefix}": dual_stats_win["dual_vars_min"],
+                                        f"dual_vars_win_max_{prefix}": dual_stats_win["dual_vars_max"],
+                                        f"dual_vars_win_q90_{prefix}": dual_stats_win["dual_vars_q90"],
+                                        f"dual_vars_win_q99_{prefix}": dual_stats_win["dual_vars_q99"],
+                                        f"dual_vars_win_cvar_{prefix}": dual_stats_win["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if dual_stats_loose is not None:
+                                table_loose_dual = wandb.Table(columns=["index", "dual_var_loose"])
+                                train_indexes = dual_stats_loose["_train_indexes"]
+                                dual_vals = dual_stats_loose["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_loose_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_loose_{prefix}_epoch_{epoch}": table_loose_dual,
+                                        f"dual_vars_loose_mean_{prefix}": dual_stats_loose["dual_vars_mean"],
+                                        f"dual_vars_loose_min_{prefix}": dual_stats_loose["dual_vars_min"],
+                                        f"dual_vars_loose_max_{prefix}": dual_stats_loose["dual_vars_max"],
+                                        f"dual_vars_loose_q90_{prefix}": dual_stats_loose["dual_vars_q90"],
+                                        f"dual_vars_loose_q99_{prefix}": dual_stats_loose["dual_vars_q99"],
+                                        f"dual_vars_loose_cvar_{prefix}": dual_stats_loose["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if payload:
+                                wandb.log(payload)
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                if loss_type in three_aug_aliases and getattr(cfg.train, "use_wandb", False):
+                    try:
+                        import wandb
+
+                        if wandb.run is not None:
+                            epoch = self.state.epoch
+                            prefix = getattr(self, "_current_eval_prefix", "eval")
+                            payload = {}
+
+                            if dual_stats_gap is not None:
+                                table_gap_dual = wandb.Table(columns=["index", "dual_var_gap"])
+                                train_indexes = dual_stats_gap["_train_indexes"]
+                                dual_vals = dual_stats_gap["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_gap_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_gap_{prefix}_epoch_{epoch}": table_gap_dual,
+                                        f"dual_vars_gap_mean_{prefix}": dual_stats_gap["dual_vars_mean"],
+                                        f"dual_vars_gap_min_{prefix}": dual_stats_gap["dual_vars_min"],
+                                        f"dual_vars_gap_max_{prefix}": dual_stats_gap["dual_vars_max"],
+                                        f"dual_vars_gap_q90_{prefix}": dual_stats_gap["dual_vars_q90"],
+                                        f"dual_vars_gap_q99_{prefix}": dual_stats_gap["dual_vars_q99"],
+                                        f"dual_vars_gap_cvar_{prefix}": dual_stats_gap["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if dual_stats_win is not None:
+                                table_win_dual = wandb.Table(columns=["index", "dual_var_win"])
+                                train_indexes = dual_stats_win["_train_indexes"]
+                                dual_vals = dual_stats_win["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_win_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_win_{prefix}_epoch_{epoch}": table_win_dual,
+                                        f"dual_vars_win_mean_{prefix}": dual_stats_win["dual_vars_mean"],
+                                        f"dual_vars_win_min_{prefix}": dual_stats_win["dual_vars_min"],
+                                        f"dual_vars_win_max_{prefix}": dual_stats_win["dual_vars_max"],
+                                        f"dual_vars_win_q90_{prefix}": dual_stats_win["dual_vars_q90"],
+                                        f"dual_vars_win_q99_{prefix}": dual_stats_win["dual_vars_q99"],
+                                        f"dual_vars_win_cvar_{prefix}": dual_stats_win["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if dual_stats_loose is not None:
+                                table_loose_dual = wandb.Table(columns=["index", "dual_var_loose"])
+                                train_indexes = dual_stats_loose["_train_indexes"]
+                                dual_vals = dual_stats_loose["_dual_vals"]
+                                if train_indexes:
+                                    for idx in train_indexes:
+                                        if 0 <= int(idx) < len(dual_vals):
+                                            table_loose_dual.add_data(int(idx), float(dual_vals[int(idx)]))
+                                payload.update(
+                                    {
+                                        f"dual_vars_loose_{prefix}_epoch_{epoch}": table_loose_dual,
+                                        f"dual_vars_loose_mean_{prefix}": dual_stats_loose["dual_vars_mean"],
+                                        f"dual_vars_loose_min_{prefix}": dual_stats_loose["dual_vars_min"],
+                                        f"dual_vars_loose_max_{prefix}": dual_stats_loose["dual_vars_max"],
+                                        f"dual_vars_loose_q90_{prefix}": dual_stats_loose["dual_vars_q90"],
+                                        f"dual_vars_loose_q99_{prefix}": dual_stats_loose["dual_vars_q99"],
+                                        f"dual_vars_loose_cvar_{prefix}": dual_stats_loose["dual_vars_cvar"],
+                                    }
+                                )
+
+                            if payload:
+                                wandb.log(payload)
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                if loss_type == "avg":
+                    out["avg_dual"] = float(self.avg_dual.detach().cpu().item())
+                if loss_type in both_avg_aliases:
+                    out["avg_dual_win"] = float(self.avg_dual_win.detach().cpu().item())
+                    out["avg_dual_loose"] = float(self.avg_dual_loose.detach().cpu().item())
+
+                if loss_type == "simpo":
+                    # third column is the SimPO score used inside logsigmoid
+                    score = arr[:, 2]
+                    if constraint_mask.any():
+                        score = score[constraint_mask]
+                    # logsigmoid(score) = -softplus(-score) = -logaddexp(0, -score)
+                    out["objective_simpo_logsigmoid"] = (
+                        float(np.mean(-np.logaddexp(0.0, -score))) if score.size > 0 else 0.0
+                    )
+                    # softplus(-score) = logaddexp(0, -score)
+                    out["objective_simpo_loss"] = (
+                        float(np.mean(np.logaddexp(0.0, -score))) if score.size > 0 else 0.0
+                    )
+                    out["simpo_margin_sat_rate"] = float(np.mean(score >= 0.0)) if score.size > 0 else 0.0
+                elif loss_type == "dpo":
+                    # third column is the DPO score used inside logsigmoid
+                    score = arr[:, 2]
+                    if constraint_mask.any():
+                        score = score[constraint_mask]
+                    # logsigmoid(score) = -softplus(-score) = -logaddexp(0, -score)
+                    out["objective_dpo_logsigmoid"] = (
+                        float(np.mean(-np.logaddexp(0.0, -score))) if score.size > 0 else 0.0
+                    )
+                    # softplus(-score) = logaddexp(0, -score)
+                    out["objective_dpo_loss"] = (
+                        float(np.mean(np.logaddexp(0.0, -score))) if score.size > 0 else 0.0
+                    )
+                    out["dpo_pref_sat_rate"] = float(np.mean(score >= 0.0)) if score.size > 0 else 0.0
+                else:
+                    out["objective_kl"] = float(np.mean(objective_values)) if objective_values.size > 0 else 0.0
+
+                return out
+
+            def _generate_eval_answers_end_of_training(self):
+                if self._generated_eval_answers:
+                    return None
+                self._generated_eval_answers = True
+                return self._generate_eval_answers(file_tag="end_of_training")
+
+            def _generate_eval_answers_on_epoch_eval(self):
+                # Run generation when eval is configured per-epoch.
+                strategy = getattr(self.args, "eval_strategy", None)
+                if strategy is None:
+                    strategy = getattr(self.args, "evaluation_strategy", None)
+                strategy_str = str(strategy).lower() if strategy is not None else ""
+                if "epoch" not in strategy_str:
+                    return None
+
+                epoch = self.state.epoch
+                if epoch is None:
+                    key = f"step_{int(self.state.global_step)}"
+                else:
+                    key = f"epoch_{int(round(float(epoch)))}"
+                if key in self._generated_eval_keys:
+                    return None
+                self._generated_eval_keys.add(key)
+
+                return self._generate_eval_answers(file_tag=key)
+
+            def _generate_eval_answers(self, file_tag: str):
+
+                # Rank-0 only
+                rank = int(os.environ.get("RANK", "0"))
+                if rank != 0:
+                    return None
+
+                cfg = self.custom_cfg
+                n = int(getattr(cfg.train, "max_gen", 10) or 10)
+                if n <= 0:
+                    return None
+
+                ev_ds = self.eval_dataset
+                if ev_ds is None or len(ev_ds) == 0:
+                    return None
+
+                n = min(n, len(ev_ds))
+                # Deterministic subset selection for comparability across runs:
+                # pick the rows with the smallest global `index` values (stable across shuffles/DDP).
+                row_idxs = None
+                try:
+                    if hasattr(ev_ds, "column_names") and "index" in ev_ds.column_names:
+                        idx_col = np.asarray(ev_ds["index"], dtype=np.int64)
+                        row_idxs = np.argsort(idx_col)[:n].tolist()
+                except Exception:
+                    row_idxs = None
+                if row_idxs is None:
+                    row_idxs = list(range(n))
+
+                model = extract_model_from_parallel(self.model)
+                was_training = model.training
+                model.eval()
+
+                rows = []
+                for i in row_idxs:
+                    sample = ev_ds[int(i)]
+                    ids = torch.tensor(sample["chosen_input_ids"], dtype=torch.long, device=model.device)
+                    mask = torch.tensor(sample["chosen_response_mask"], dtype=torch.bool, device=model.device)
+                    true_pos = torch.where(mask)[0]
+                    if true_pos.numel() == 0:
+                        continue
+                    prompt_end = int(true_pos[0].item())
+                    if prompt_end <= 0:
+                        continue
+                    prompt_ids = ids[:prompt_end].unsqueeze(0)
+                    attn = torch.ones_like(prompt_ids, device=model.device)
+                    with torch.no_grad():
+                        out_ids = model.generate(
+                            input_ids=prompt_ids,
+                            attention_mask=attn,
+                            max_new_tokens=512,
+                        )
+                    gen_ids = out_ids[0][prompt_ids.shape[1] :]
+                    prompt_text = self.tokenizer.decode(prompt_ids[0], skip_special_tokens=True) if self.tokenizer is not None else ""
+                    decoded = self.tokenizer.decode(gen_ids, skip_special_tokens=True) if self.tokenizer is not None else ""
+                    rows.append({"index": int(sample.get("index", -1)), "prompt": prompt_text, "output": decoded})
+
+                if was_training:
+                    model.train()
+
+                if not rows:
+                    return None
+
+                # Log to wandb + json artifact in output_dir
+                out_dir = Path(cfg.train.output_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"dpo_kl_generate_val10_{file_tag}.json"
+                out_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+                if cfg.train.use_wandb:
+                    try:
+                        import wandb
+
+                        if wandb.run is not None:
+                            table = wandb.Table(columns=["prompt", "output"])
+                            for r in rows:
+                                table.add_data(r.get("prompt"), r.get("output"))
+                            wandb.log({f"dpo_kl_val_generations_{file_tag}": table})
+                            artifact = wandb.Artifact(f"dpo_kl_val_generations_{file_tag}", type="generations")
+                            artifact.add_file(str(out_path))
+                            wandb.log_artifact(artifact)
+                    except Exception as exc:
+                        print(f"[dpo_kl] wandb logging failed: {exc}")
+
+                return rows
+
+        return CustomTrainer
+

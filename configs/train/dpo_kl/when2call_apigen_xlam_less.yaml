@@ -1,0 +1,79 @@
+# @package _global_
+
+hydra:
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+train:
+  seed: 42
+  split_seed: 42
+  output_dir: "./outputs/dpo_kl/${train.dataset}/${exp.loss_type}/tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  do_train: true
+  do_initial_eval: false
+  use_wandb: true
+  save_model: true
+  push_adapters_to_wandb: true
+  wandb_project: "xlam_when2call"
+  wandb_entity: "alelab"
+  run_name: "dpo_kl-${train.dataset}-${exp.loss_type}-tol:${exp.tol}-alpha:${exp.loss_alpha}-dual_lr:${exp.dual_step_size}"
+  eval_at_end: true
+  eval_on_train: true
+
+  # Dataset / preprocessing
+  cache_dir: "./cache"
+  dataset: when2call_apigen_xlam
+  use_xlam_prompt_format: true
+  when2call_strict_prompt: false
+  val_fraction: 0.05
+  objective_val_fraction: 0.05
+  constraint_val_fraction: 0.05
+  shuffle: true
+  sanity_check: false
+  data_proportion: 1.0
+  objective_data_proportion: 1.0
+  constraint_data_proportion: 1.0
+  max_prompt_length: 1024
+  max_length: 2048
+  filter_shortest_train: 0.2
+
+  # Train-end generation: sample validation prompts
+  max_gen: 0
+
+  lora:
+    r: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+
+  hf_args:
+    per_device_train_batch_size: 2
+    per_device_eval_batch_size: 2
+    gradient_accumulation_steps: 16
+    eval_accumulation_steps: 2
+    num_train_epochs: 5
+    learning_rate: 5e-5
+    lr_scheduler_type: "cosine"
+    warmup_ratio: 0.0
+    weight_decay: 0.0
+    eval_strategy: "no"
+    save_strategy: "no"
+    gradient_checkpointing: false
+    eval_do_concat_batches: false
+    bf16: true
+    fp16: false
+
+exp:
+  name: "dpo_kl"
+  model_name: "Salesforce/xLAM-2-1b-fc-r"
+  use_pretrained_slacks: false
+
+  # Constraint settings
+  tol: 2.0
+
+  # Loss/optimizer hyperparams
+  loss_type: aug_dual_both
+  loss_alpha: 10.0
+  loss_alpha_win: 10.0
+  loss_alpha_loose: 10.0
+  dual_step_size: 1.0
+  tol_win: -3.0
+  tol_loose: -10.0
