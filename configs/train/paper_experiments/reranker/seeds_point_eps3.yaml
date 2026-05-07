@@ -1,0 +1,25 @@
+# @package _global_
+# Fig. 4 annotated pointwise curve: ε = 3, augmented dual defaults (Appendix F: α = 1, η = 0.1). Three RNG seeds.
+
+defaults:
+  - paper_rerank_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      train.seed: 42, 43, 44
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun/paper_rerank/seeds_point_eps3
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: aug_dual
+  loss_tol: 3.0
+  loss_alpha: 1.0
+  dual_step_size: 0.1

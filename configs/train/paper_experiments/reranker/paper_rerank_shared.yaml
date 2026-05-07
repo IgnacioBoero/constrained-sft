@@ -1,0 +1,51 @@
+# @package _global_
+# Appendix D.2 — shared training / backbone (Paper Table 7).
+# Data: HF `iboero16/reranker`, config `large` ≡ 55k train / length-stratified 9 negatives.
+
+defaults: []
+
+train:
+  seed: 42
+  output_dir: "./outputs/paper_rerank/${exp.loss_type}/tol${exp.loss_tol}-alpha${exp.loss_alpha}-dual${exp.dual_step_size}-beta${exp.resilient_coef}-seed${train.seed}"
+  do_train: true
+  do_initial_eval: true
+  use_wandb: false
+  include_inputs_for_metrics: true
+  wandb_project: "paper_rerank"
+  run_name: "paper-rerank-${exp.loss_type}-seed${train.seed}"
+  eval_on_train: true
+  enable_profiler: false
+  dropout: 0.05
+  data_proportion: 1.0
+  size: large
+  hf_args:
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 8
+    gradient_accumulation_steps: 8
+    num_train_epochs: 10
+    learning_rate: 2.0e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.0
+    lr_scheduler_type: linear
+    eval_strategy: epoch
+    save_strategy: epoch
+    save_total_limit: 1
+    bf16: true
+    fp16: false
+
+exp:
+  name: reranker
+  model_name: answerdotai/ModernBERT-base
+  num_negatives: 9
+  max_length: 512
+  loss_type: aug_dual
+  loss_tol: 3.0
+  loss_alpha: 1.0
+  dual_step_size: 0.1
+  length_constraint: true
+  ls_clamp: false
+  obj_type: lambda_loss
+  top_k: 3
+  k_lambda: 3
+  resilient_coef: 1.0
+  erm_penalty: 1.0

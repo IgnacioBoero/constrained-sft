@@ -1,0 +1,26 @@
+# @package _global_
+# Table 12 — fixed penalty λ₀ grid (scaled margin penalties on relevance–length slack).
+
+defaults:
+  - paper_rerank_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: penalty
+      exp.loss_alpha: 0.1, 0.2, 0.4, 1.0, 10.0
+      exp.loss_tol: 1.0
+      exp.dual_step_size: 1.0
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweep:
+    dir: ./multirun/paper_rerank/penalty
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: penalty
+  loss_tol: 1.0
+  loss_alpha: 1.0
+  dual_step_size: 1.0

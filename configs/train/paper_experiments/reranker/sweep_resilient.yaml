@@ -1,0 +1,29 @@
+# @package _global_
+# Table 12 — resilient / relaxed quadratic penalty on duals: β ∈ {0.1,…,10} at fixed relevance margin tol = 3
+# (main-text Fig. 14 uses ε = 3 for dual vs augmented-dual comparison).
+
+defaults:
+  - paper_rerank_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: resilient
+      exp.loss_tol: 3.0
+      exp.loss_alpha: 1.0
+      exp.dual_step_size: 0.1
+      exp.resilient_coef: 0.1, 0.15, 0.2, 0.3, 0.4, 1.0, 10.0
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweep:
+    dir: ./multirun/paper_rerank/resilient
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: resilient
+  loss_tol: 3.0
+  loss_alpha: 1.0
+  dual_step_size: 0.1
+  resilient_coef: 0.4

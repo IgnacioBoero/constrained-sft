@@ -1,0 +1,29 @@
+# @package _global_
+# Appendix D.2 relevance-only monoBERT analogue: pairwise CE on relevance (no λ length objective).
+
+defaults:
+  - paper_rerank_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      train.seed: 42, 43, 44
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun/paper_rerank/baseline_mono_bert
+    subdir: ${hydra.job.num}
+
+train:
+  output_dir: "./outputs/paper_rerank/baseline_erm/seeds_${train.seed}"
+
+exp:
+  loss_type: erm
+  length_constraint: false
+  loss_tol: 1.0
+  dual_step_size: 0.1
+  loss_alpha: 1.0

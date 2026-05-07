@@ -1,0 +1,26 @@
+# @package _global_
+# Fig. 4 “relax” point: β = 10 with constrained margin tol = 3 (appendix wording).
+
+defaults:
+  - paper_rerank_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      train.seed: 42, 43, 44
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun/paper_rerank/seeds_relax_beta10
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: resilient
+  loss_tol: 3.0
+  loss_alpha: 1.0
+  dual_step_size: 0.1
+  resilient_coef: 10.0

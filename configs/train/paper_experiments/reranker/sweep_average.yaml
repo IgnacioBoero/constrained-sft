@@ -1,0 +1,27 @@
+# @package _global_
+# Table 12 — scalar average-constraint analogue: ε sweep {50, 60, 75, 90, 100} (Paper Table 12 “avg” rows).
+# These match the appendix table’s reported grid; slack uses s_pos − s_neg ≥ tol in reranker.py.
+
+defaults:
+  - paper_rerank_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: avg
+      exp.dual_step_size: 0.1
+      exp.loss_alpha: 1.0
+      exp.loss_tol: 50.0, 60.0, 75.0, 90.0, 100.0
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweep:
+    dir: ./multirun/paper_rerank/average
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: avg
+  loss_tol: 75.0
+  loss_alpha: 1.0
+  dual_step_size: 0.1

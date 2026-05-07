@@ -20,6 +20,8 @@ Training entry point:
 
 ```bash
 python src/train.py --config-path train/paper_experiments/<area>/<subdir> --config-name=<stem>
+# Reranker paper grids live one level shorter (YAMLs alongside paper_rerank_shared):
+python src/train.py --config-path train/paper_experiments/reranker --config-name=sweep_pointwise
 ```
 
 Add **`-m`** when the chosen YAML declares `hydra.mode: MULTIRUN`.
@@ -34,12 +36,13 @@ Unified layout:
 |--------|-------------|-----------------|---------------|
 | **`paper_experiments/safety/`** | Appendix D.3 — helpfulness KL + refusal constraints | **`safety`** | [`configs/train/paper_experiments/safety/README.md`](configs/train/paper_experiments/safety/README.md) |
 | **`paper_experiments/function_calling/`** | Appendix D — When2Call / preference margins | **`dpo_kl`** | [`configs/train/paper_experiments/function_calling/README.md`](configs/train/paper_experiments/function_calling/README.md) |
+| **`paper_experiments/reranker/`** | Appendix D.2 — cross-encoder relevance + length \(\Lambda\) loss | **`reranker`** | [`configs/train/paper_experiments/reranker/README.md`](configs/train/paper_experiments/reranker/README.md) |
 
 Index + cross-links: **`configs/train/paper_experiments/README.md`**.
 
-The default **`configs/train/default.yaml`** composes **`paper_experiments/safety/paper_safety_shared`** for a minimal safety-shape run—override **`--config-path` / `--config-name`** when working on When2Call or other tasks.
+The default **`configs/train/default.yaml`** composes **`paper_experiments/safety/paper_safety_shared`** for a minimal safety-shape run—override **`--config-path` / `--config-name`** for When2Call, reranking, or other setups.
 
-Legacy task folders under **`configs/train/`** (`bias`, `reranker`, `debug`, etc.) remain for exploratory configs.
+Legacy exploratory YAMLs remain under **`configs/train/reranker/`**, **`configs/train/bias/`**, **`debug/`**, etc. Prefer **`configs/train/paper_experiments/reranker/`** for appendix-matched grids.
 
 ---
 
@@ -57,6 +60,7 @@ Structured notes for pairwise / margin objectives on When2Call: **`src/experimen
 | **Refusal phrase counts** from W&B train-end dumps | `scripts/compute_refusal_metrics.py` (see **`safety` README**) |
 | **PKU SafeRLHF + Beaver-7B unified cost / reward** | `scripts/eval_saferlhf_beaver.py` |
 | **When2Call lm-eval** (optional post-train hook) | `configs/eval/wandb_when2call_lm_eval_vllm.yaml`, `src/eval/wandb_when2call_lm_eval_vllm.py` |
+| **MS MARCO length-aware reranker** | Train with `configs/train/paper_experiments/reranker/*.yaml`; see [`paper_experiments/reranker/README.md`](configs/train/paper_experiments/reranker/README.md) — **Table 12** grids (add `-m` for multiruns), **`seeds_*` / Fig. 4** bundles, Appendix **F dual / α** YAMLs |
 
 Scripts live in **`scripts/`**; HF datasets bundled or downloaded as configured in YAML.
 
@@ -64,4 +68,4 @@ Scripts live in **`scripts/`**; HF datasets bundled or downloaded as configured 
 
 ## Branches
 
-**`safe-func`** merges **safety-double-sided**, **eval**, and **when2call** tooling: paper configs split into **`safety/`** and **`function_calling/`** with per-task READMEs plus this overview.
+**`submission`** further merges **`main`** (reranker experiment codepaths) atop **`safe-func`** (**safety + eval + when2call**). **`paper_experiments/reranker/`** documents the appendix reranking grids on that line.
