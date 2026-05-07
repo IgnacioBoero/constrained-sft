@@ -33,7 +33,18 @@ Add **`-m`** for Hydra multirun sweeps:
 python src/train.py -m --config-path train/paper_experiments/function_calling/sweep --config-name=dpo
 ```
 
-**Multi-GPU launcher (example):** `scripts/when2call/run_pref.sh` — cds to repo root then runs **`torch.distributed.run`** with **`--config-path train/paper_experiments/function_calling/<subdir> --config-name <stem>`** (e.g. `llama/dpo`, `sweep/simpo`).
+**Multi-GPU (example)** — from repo root, mirror the **`--config-path` / `--config-name`** splits above inside **`torch.distributed.run`** (two processes in this snippet; adjust GPUs / rendezvous flags as needed):
+
+```bash
+export MASTER_ADDR=localhost
+export MASTER_PORT=29500
+python -m torch.distributed.run \
+  --nproc_per_node=2 --nnodes=1 --rdzv_backend=c10d \
+  --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  src/train.py \
+  --config-path train/paper_experiments/function_calling/llama \
+  --config-name dpo
+```
 
 Historical entry point still supported:
 

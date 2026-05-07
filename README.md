@@ -42,8 +42,7 @@ Index + cross-links: **`configs/train/paper_experiments/README.md`**.
 
 The default **`configs/train/default.yaml`** composes **`paper_experiments/safety/paper_safety_shared`** for a minimal safety-shape run—override **`--config-path` / `--config-name`** for When2Call, reranking, or other setups.
 
-**Tooling:** maps scripts → paper metrics → [`docs/tooling_paper_aligned.md`](docs/tooling_paper_aligned.md).  
-Optional packaging / metadata cleanup → [`docs/tooling_review_for_deletion.md`](docs/tooling_review_for_deletion.md).
+**Tooling:** maps scripts → paper metrics → [`docs/tooling_paper_aligned.md`](docs/tooling_paper_aligned.md).
 
 ---
 
@@ -64,7 +63,7 @@ Structured notes for pairwise / margin objectives on When2Call: **`src/experimen
 | **When2Call lm-eval** (optional post-train hook) | `configs/eval/wandb_when2call_lm_eval_vllm.yaml`, `src/eval/wandb_when2call_lm_eval_vllm.py`; extra metrics helper: **`src/eval/when2call_additional_metrics.py`** |
 | **MS MARCO length-aware reranker** | Train with `configs/train/paper_experiments/reranker/*.yaml`; batch checkpoint **metrics** → **`scripts/paper_eval/eval_reranker_checkpoints.py`**; see [`paper_experiments/reranker/README.md`](configs/train/paper_experiments/reranker/README.md) |
 
-Layout: **`scripts/README.md`** indexes subfolders (`paper_eval/`, `when2call/`, `datasets/`, …).
+Layout: **`scripts/README.md`** indexes subfolders (`paper_eval/`, `datasets/`, `release/`).
 
 ---
 

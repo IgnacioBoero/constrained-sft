@@ -40,7 +40,7 @@ Supporting notes: **`src/experiments/README_dpo_kl_losses.md`**.
 | Artifact | Metrics / experiment tie-in |
 |----------|-----------------------------|
 | `src/experiments/dpo_kl.py` + YAMLs under `paper_experiments/function_calling/` | Table 6 loss types (`dpo`, `simpo`, `penalty_both`, …); Table 5 shared knobs in each YAML cluster. |
-| **`scripts/when2call/run_pref.sh`** | Launcher for **`torch.distributed.run`** + **`src/train.py --config-path train/paper_experiments/function_calling/<subdir> --config-name <stem>`**. |
+| **Multi-GPU (example)** | From repo root: `python -m torch.distributed.run --nproc_per_node=2 … src/train.py --config-path train/paper_experiments/function_calling/<subdir> --config-name <stem>` (see [`configs/train/paper_experiments/function_calling/README.md`](../configs/train/paper_experiments/function_calling/README.md)). |
 | `src/train.py` · `train.post_train_when2call_lm_eval*` | Optional post-epoch hook invoking lm-eval harness. |
 | **`src/eval/wandb_when2call_lm_eval_vllm.py`** + `configs/eval/wandb_when2call_lm_eval_vllm.yaml` | Stand-alone **lm-eval** over a finished W&B run (merge LoRA → score). |
 | **`src/eval/when2call_additional_metrics.py`** | Extra When2Call metrics from **lm-eval `samples_*.jsonl`** (NVIDIA-style add-ons; same data as post-train hook). |
@@ -79,4 +79,4 @@ Supporting notes: **`src/experiments/README_dpo_kl_losses.md`**.
 
 ## Layout
 
-See **`scripts/README.md`** for directory conventions (`paper_eval/`, `when2call/`, `datasets/`, `release/`).
+See **`scripts/README.md`** for directory conventions (`paper_eval/`, `datasets/`, `release/`).
