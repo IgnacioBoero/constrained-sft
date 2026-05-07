@@ -1,0 +1,25 @@
+# @package _global_
+# Figure 3 / Table 11: Safe-DPO with ∆ = 10. Three RNG seeds.
+
+defaults:
+  - paper_safety_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      train.seed: 42,43,44
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun/paper_safety/fig3_seeds/safe_dpo_d10
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: daa
+  loss_alpha: 0.1
+  dual_step_size: 0.0
+  tol: 10

@@ -1,0 +1,11 @@
+# @package _global_
+#
+# Loaded by `python src/train.py` (Hydra `--config-path=train` resolves under `configs/`).
+# Prefer explicit paper configs, e.g. `train/paper_experiments/safety/<name>`.
+
+defaults:
+  - paper_experiments/safety/paper_safety_shared
+
+hydra:
+  run:
+    dir: ./outputs/paper_safety/quick_default_single_run

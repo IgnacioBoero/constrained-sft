@@ -1,0 +1,28 @@
+# @package _global_
+# Table 9: Safe-DPO — sweep margin ∆ (implemented as loss_type=daa, exp.tol).
+
+defaults:
+  - paper_safety_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      exp.loss_type: daa
+      exp.loss_alpha: 0.1
+      exp.dual_step_size: 0.0
+      exp.tol: 2, 5, 10
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun/paper_safety/safe_dpo
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: daa
+  loss_alpha: 0.1
+  dual_step_size: 0.0
+  tol: 5

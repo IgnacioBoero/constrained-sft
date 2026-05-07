@@ -1,0 +1,27 @@
+# @package _global_
+# Figure 3: relax (β = 20). Three RNG seeds.
+
+defaults:
+  - paper_safety_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      train.seed: 42,43,44
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun/paper_safety/fig3_seeds/relax_b20
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: resilient
+  loss_alpha: 1000.0
+  dual_step_size: 1.0
+  tol: 0.08
+  tol2: -2.0
+  resilient_coef: 20.0

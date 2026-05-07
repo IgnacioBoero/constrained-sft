@@ -1,0 +1,27 @@
+# @package _global_
+# Figure 3: fixed penalty pen (λ0 = 5). Three RNG seeds.
+# ε_U and ε_H encoded as tol / tol2 (same as Table 9 shared constrained setup).
+
+defaults:
+  - paper_safety_shared
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    params:
+      train.seed: 42,43,44
+
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+
+  sweep:
+    dir: ./multirun/paper_safety/fig3_seeds/pen_lambda5
+    subdir: ${hydra.job.num}
+
+exp:
+  loss_type: penalty
+  loss_alpha: 5.0
+  dual_step_size: 0.0
+  tol: 0.08
+  tol2: -2.0
