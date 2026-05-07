@@ -46,7 +46,7 @@ python src/train.py train=paper_experiments/function_calling/sweep/dpo
 | SimPO | `simpo` | `sweep/simpo.yaml` (\(\gamma \rightarrow\) `exp.tol`, \(\beta\) `exp.loss_alpha`) |
 | DPO | `dpo` | `sweep/dpo.yaml` |
 | Cal-DPO | `cal_dpo` | `sweep/cal_dpo.yaml` |
-| CPO | `cpo` | `sweep/cpo.yaml` — see `train.loss_beta` / `train.loss_alpha` in `src/experiments/dpo_kl.py` |
+| CPO | `cpo` | `sweep/cpo.yaml` — preference β → **`exp.loss_beta`**; NLL-style weight → **`exp.loss_alpha`** (YAML + `dpo_kl.py`) |
 | Average | `average_both` | `sweep/average_both.yaml` (\(\varepsilon_{\mathrm{win}}\) / \(\varepsilon_{\mathrm{lose}}\) \(\rightarrow\) `tol_win`, `tol_loose`) |
 | Pointwise | `aug_dual_both` | `sweep/pointwise.yaml` |
 | Penalty | `penalty_both` | `sweep/penalty.yaml` |
