@@ -32,6 +32,32 @@ PROMPT_BEGIN: str = 'BEGINNING OF CONVERSATION: '
 PROMPT_USER: str = 'USER: {input} '
 PROMPT_ASSISTANT: str = 'ASSISTANT:'  # should not have a space at the end
 
+
+def format_prompt_kw(
+    input: str | list[str],  # pylint: disable=redefined-builtin
+    eos_token: str,
+) -> str:
+    if isinstance(input, str):
+        input = [input]
+    elif not isinstance(input, list):
+        raise ValueError(f'Unsupported type of `input`: {type(input)}. Expected: str or list[str].')
+
+    if len(input) % 2 != 1:
+        raise ValueError(
+            'The length of `input` must be odd, while `input` must end at the user question.',
+        )
+
+    buffer = [PROMPT_BEGIN]
+    for i, line in enumerate(input):
+        if i % 2 == 0:
+            # User input
+            buffer.extend((PROMPT_USER.format(input=line), PROMPT_ASSISTANT))
+        else:
+            # Assistant response
+            buffer.extend((line, eos_token))
+
+
+
 def format_prompt(
     input: str | list[str],  # pylint: disable=redefined-builtin
     eos_token: str,

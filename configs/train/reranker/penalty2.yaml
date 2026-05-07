@@ -5,11 +5,10 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_type: avg
-      exp.dual_step_size: 0.1
-      exp.loss_alpha: 1.0
-      exp.loss_tol: 100
-      train.seed: 0,1
+      exp.loss_type: penalty
+      exp.loss_alpha: 10.0
+      exp.loss_tol: 1
+      exp.dual_step_size: 1.0
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -52,10 +51,10 @@ exp:
   model_name: "answerdotai/ModernBERT-base"
   num_negatives: 9                 # Use 4 negatives to match our dataset
   max_length: 512
-  loss_type: avg                 # Options: "erm", "l2", "l1", "dual"
-  loss_tol: 10.0
+  loss_type: penalty                 # Options: "erm", "l2", "l1", "dual"
+  loss_tol: 1.0
   loss_alpha: 1                       # Only used for dual loss
-  dual_step_size: 0.1             # Only used for dual loss
+  dual_step_size: 1.0             # Only used for dual loss
   length_constraint: true
   ls_clamp: false
   obj_type: lambda_loss        # Options: "pearson_corr", "rank_weighted_length", "spearman_corr", "top_k_length", "exp_length_penalty", "kendall_tau"

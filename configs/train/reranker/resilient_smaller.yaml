@@ -5,11 +5,11 @@ hydra:
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
-      exp.loss_type: avg
-      exp.dual_step_size: 0.1
-      exp.loss_alpha: 1.0
-      exp.loss_tol: 100
-      train.seed: 0,1
+      exp.loss_type: resilient
+      exp.loss_tol: 1
+      train.dropout: 0.05
+      exp.model_name: answerdotai/ModernBERT-base
+      exp.resilient_coef: 2.5,5.0
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
@@ -23,8 +23,8 @@ train:
   output_dir: "outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   do_train: true
   do_initial_eval: true
-  use_wandb: true
   include_inputs_for_metrics: true
+  use_wandb: true
   wandb_project: "RERANKER-final-v2"
   run_name: "reranker-${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
   eval_on_train: true
@@ -34,15 +34,15 @@ train:
   size: large
   hf_args:
     per_device_train_batch_size: 8          # ST recipe
-    per_device_eval_batch_size: 8
-    gradient_accumulation_steps: 8
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 16
     num_train_epochs: 10                      # ST example uses 1 epoch
     learning_rate: 2e-5
     warmup_ratio: 0.1
     weight_decay: 0.0
     lr_scheduler_type: "linear"
-    eval_strategy: "epoch"
-    save_strategy: "epoch"
+    eval_strategy: "no"
+    save_strategy: "no"
     save_total_limit: 1
     bf16: true
     fp16: false
@@ -52,8 +52,8 @@ exp:
   model_name: "answerdotai/ModernBERT-base"
   num_negatives: 9                 # Use 4 negatives to match our dataset
   max_length: 512
-  loss_type: avg                 # Options: "erm", "l2", "l1", "dual"
-  loss_tol: 10.0
+  loss_type: resilient                 # Options: "erm", "l2", "l1", "dual"
+  loss_tol: 1.0
   loss_alpha: 1                       # Only used for dual loss
   dual_step_size: 0.1             # Only used for dual loss
   length_constraint: true
@@ -62,3 +62,4 @@ exp:
   top_k: 3                      # Only used for top_k_length objective
   k_lambda: 3
   resilient_coef: 1.0
+  
