@@ -14,7 +14,7 @@ Usage
 # Dry-run (print metrics without logging):
     python scripts/compute_refusal_metrics.py --dry-run
 
-See configs/train/paper_experiments/README.md (sections on AlpacaEval vs. refusal metrics).
+See configs/train/paper_experiments/README.md and configs/train/paper_experiments/safety/README.md (refusal metrics & AlpacaEval).
 """
 
 from __future__ import annotations

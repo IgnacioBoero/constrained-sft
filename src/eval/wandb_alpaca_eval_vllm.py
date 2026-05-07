@@ -9,7 +9,7 @@ Flow:
 4) Optionally log outputs to W&B (``wandb.upload_results``); always write JSON under
    ``eval.local_output_dir``.
 
-Project overview: configs/train/paper_experiments/README.md ("AlpacaEval sampling").
+Project overview: configs/train/paper_experiments/README.md · safety eval details: configs/train/paper_experiments/safety/README.md.
 """
 
 from __future__ import annotations
