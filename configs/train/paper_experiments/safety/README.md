@@ -2,9 +2,7 @@
 
 Safety tuning setups from **Appendix D.3** (instruction following + safety refusal), matching **Table 8** (shared training / LoRA) and **Table 9** (per-method hyperparameter grids).
 
-**Branch lineage:** Evaluation helpers (AlpacaEval vLLM, refusal metrics, etc.) come from merges with `eval`; this folder is authoritative for safety **paper sweeps**.
-
-## Location
+## Config layout
 
 Configs live under **`configs/train/paper_experiments/safety/`**:
 
@@ -14,9 +12,9 @@ Configs live under **`configs/train/paper_experiments/safety/`**:
 
 Notation (config → paper): `\(\alpha\)` → `exp.loss_alpha`; unsafe refusal level \(\varepsilon_U\) → `exp.tol`; `\(\varepsilon_H\)` → `exp.tol2`; `\(\eta_{\mathrm{dual}}\)` → `exp.dual_step_size`; relaxation \(\beta\) → `exp.resilient_coef`. Safe-DPO margin \(\Delta\) → `exp.tol` with `loss_type: daa` (Table 9 only lists \(\Delta\); `loss_alpha = 0.1` elsewhere unless overridden).
 
-## How to run training
+## Training
 
-Hydra resolves from `configs/`. Prefer explicit path + stem:
+From repo root (`export PYTHONPATH=.`); Hydra resolves configs from `configs/`:
 
 ```bash
 export PYTHONPATH=.
@@ -91,4 +89,4 @@ Phrase list / ratios: **`scripts/paper_eval/compute_refusal_metrics.py`** (ortho
 - **`scripts/paper_eval/compute_kl_safe_dpo.py`** — recomputes **mean KL** to the frozen base model on the **eval** split (matches the helpfulness surrogate in **`safety.py`**) and can log **`eval/kl_to_base_*`** back to tagged runs (e.g. Safe-DPO / Table 9 rows).
 - **`scripts/paper_eval/compute_slack_cvar.py`** — upper-tail **CVaR** of constraint **slacks** from end-of-training W&B tables; supports tail analyses aligned with abstract claim (C4) about violation distributions.
 
-See **[`docs/tooling_paper_aligned.md`](../../../../docs/tooling_paper_aligned.md)** for full paths and prerequisites.
+More scripts and prerequisites: [`docs/tooling_paper_aligned.md`](../../../../docs/tooling_paper_aligned.md).

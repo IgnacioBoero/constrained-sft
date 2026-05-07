@@ -4,7 +4,7 @@ Experiment configs for **Appendix D**, **“Tool Calling / Function Calling Pref
 
 The main narrative uses **Llama-3.2-1B-Instruct**-class checkpoints; **`function_calling/llama/`** targets **`meta-llama/Llama-3.2-1B-Instruct`** (public ID used in-repo). **`function_calling/xlam/`** uses **`Salesforce/xLAM-2-1b-fc-r`** with **`train.use_xlam_prompt_format`** (Appendix notes reusing Llama-found hyperparameters for xLAM).
 
-## Directory layout
+## Config layout
 
 All YAMLs live under **`configs/train/paper_experiments/function_calling/`**.
 
@@ -16,9 +16,9 @@ All YAMLs live under **`configs/train/paper_experiments/function_calling/`**.
 
 **Sweep files:** `simpo.yaml`, `dpo.yaml`, `cal_dpo.yaml`, `cpo.yaml`, `average_both.yaml`, `pointwise.yaml`, `penalty.yaml`.
 
-## Launch
+## Training
 
-Canonical (matches safety paper configs):
+From repo root (`export PYTHONPATH=.`):
 
 ```bash
 export PYTHONPATH=.
@@ -27,13 +27,13 @@ python src/train.py --config-path train/paper_experiments/function_calling/llama
 python src/train.py --config-path train/paper_experiments/function_calling/xlam --config-name=dpo
 ```
 
-Add **`-m`** for Hydra multirun sweeps:
+Multirun sweep:
 
 ```bash
 python src/train.py -m --config-path train/paper_experiments/function_calling/sweep --config-name=dpo
 ```
 
-**Multi-GPU (example)** — from repo root, mirror the **`--config-path` / `--config-name`** splits above inside **`torch.distributed.run`** (two processes in this snippet; adjust GPUs / rendezvous flags as needed):
+Multi-GPU (example—adjust `nproc_per_node` / rendezvous as needed):
 
 ```bash
 export MASTER_ADDR=localhost
@@ -43,10 +43,10 @@ python -m torch.distributed.run \
   --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
   src/train.py \
   --config-path train/paper_experiments/function_calling/llama \
-  --config-name dpo
+  --config-name=dpo
 ```
 
-Historical entry point still supported:
+Legacy grouped config:
 
 ```bash
 python src/train.py train=paper_experiments/function_calling/sweep/dpo
@@ -74,8 +74,8 @@ Defaults for W&B: **`paper_when2call`** (override with `train.wandb_project=`).
 
 ## Post-train LM eval / metrics
 
-`src/train.py` can spawn **When2Call lm-eval–style** subprocesses via `train.post_train_when2call_*` hooks (see **`configs/eval/wandb_when2call_lm_eval_vllm.yaml`**). Loss shapes and `exp.*` fields correspond to **`src/experiments/dpo_kl.py`** and the **`Table 6` mapping** above.  
-Tooling catalogue: **[`docs/tooling_paper_aligned.md`](../../../../docs/tooling_paper_aligned.md)**.
+`src/train.py` can spawn **When2Call lm-eval–style** subprocesses via `train.post_train_when2call_*` hooks (see **`configs/eval/wandb_when2call_lm_eval_vllm.yaml`**). Loss shapes and `exp.*` fields correspond to **`src/experiments/dpo_kl.py`** and the Table 6 mapping above.  
+More scripts and paths: [`docs/tooling_paper_aligned.md`](../../../../docs/tooling_paper_aligned.md).
 
 ## xLAM vs Llama
 

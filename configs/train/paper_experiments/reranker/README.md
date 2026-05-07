@@ -18,7 +18,7 @@ Cross-encoder **ModernBERT-base** tuning on MS MARCO v2.1–derived pairs with
 
 **`datasets.load_dataset("iboero16/reranker", cfg.train.size, …)`**. Use **`train.size: large`** (default) as the pooled **55 k-example** stratified subset described in appendix D.2.
 
-## Location
+## Config layout
 
 | YAML | Appendix ref |
 |------|----------------|
@@ -35,16 +35,19 @@ Cross-encoder **ModernBERT-base** tuning on MS MARCO v2.1–derived pairs with
 
 **`scripts/paper_eval/eval_reranker_checkpoints.py`** (Hydra entry) discovers checkpoints under **`train.output_dir`** from a training YAML **`train_config`** (see **`configs/eval/reranker.yaml`**) and writes **`evaluation_results.csv`**. Prefer this over ad-hoc one-off notebooks when sweeping Table 12 / Appendix F.
 
-## Commands
+## Training
 
 From repo root (`export PYTHONPATH=.`):
 
 ```bash
+export PYTHONPATH=.
 python src/train.py --config-path train/paper_experiments/reranker --config-name=sweep_pointwise
 python src/train.py -m --config-path train/paper_experiments/reranker --config-name=sweep_average
 python src/train.py --config-path train/paper_experiments/reranker --config-name=seeds_point_eps3
 ```
 
-Enable W&B logging with **`train.use_wandb=true`** overrides on the CLI if desired.
+Optional: `train.use_wandb=true` on the CLI.
 
-Metrics match paper notation: **`MRR@10`**, **`Hit@3`**, **`LenRank@10`**, **`AvgLength@3`** (implemented in **`reranker` trainer utilities**).
+**Metrics:** `MRR@10`, `Hit@3`, `LenRank@10`, `AvgLength@3` (trainer utilities under the reranker experiment code).
+
+More scripts and paths: [`docs/tooling_paper_aligned.md`](../../../../docs/tooling_paper_aligned.md).
