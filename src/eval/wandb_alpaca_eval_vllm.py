@@ -3,10 +3,11 @@
 vLLM-based AlpacaEval sampling for a W&B run trained with LoRA adapters.
 
 Flow:
-1) Resolve run and download LoRA adapters from W&B.
+1) Resolve run and download LoRA adapters from W&B (read-only API when not uploading).
 2) Merge adapters into the base model and save a temporary merged model folder.
 3) Run batched generation with vLLM.
-4) Log outputs back to the exact same W&B run.
+4) Optionally log outputs to W&B (``wandb.upload_results``); always write JSON under
+   ``eval.local_output_dir``.
 """
 
 from __future__ import annotations
@@ -353,6 +354,7 @@ def main(cfg: DictConfig) -> None:
     entity = str(cfg.wandb.entity)
     project = str(cfg.wandb.project)
     run_id = _optional_str(cfg.wandb.run_id if "run_id" in cfg.wandb else None)
+    upload_results = bool(cfg.wandb.upload_results) if "upload_results" in cfg.wandb else True
     base_model_override = _optional_str(cfg.model.base_model if "model" in cfg else None)
     use_existing_run = run_id is not None
 
@@ -472,13 +474,23 @@ def main(cfg: DictConfig) -> None:
             for row in out_rows
         ]
 
-        if use_existing_run:
-            assert run_id is not None
-            wb_run = _init_wandb_exact_run(wandb_mod=wandb, entity=entity, project=project, run_id=run_id)
+        if upload_results:
+            if use_existing_run:
+                assert run_id is not None
+                wb_run = _init_wandb_exact_run(
+                    wandb_mod=wandb, entity=entity, project=project, run_id=run_id
+                )
+            else:
+                wb_run = _init_wandb_new_run(wandb_mod=wandb, entity=entity, project=project, mode=mode)
+            eval_run_id = str(wb_run.id)
+            eval_run_path = f"{wb_run.entity}/{wb_run.project}/{wb_run.id}"
         else:
-            wb_run = _init_wandb_new_run(wandb_mod=wandb, entity=entity, project=project, mode=mode)
-        eval_run_id = str(wb_run.id)
-        eval_run_path = f"{wb_run.entity}/{wb_run.project}/{wb_run.id}"
+            if use_existing_run:
+                assert run_id is not None
+                eval_run_id = run_id
+            else:
+                eval_run_id = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ_base")
+            eval_run_path = f"(local-only; no W&B run) outputs id={eval_run_id}"
 
         out_path = tmp_root / f"alpaca_eval_outputs_vllm_{eval_run_id}.json"
         out_path.write_text(
@@ -493,44 +505,55 @@ def main(cfg: DictConfig) -> None:
             encoding="utf-8",
         )
 
-        table = wandb.Table(columns=["instruction", "input", "output", "generator"])
-        for row in out_rows:
-            table.add_data(row["instruction"], row["input"], row["output"], row["generator"])
-        wandb.log(
-            {
-                "alpaca_eval_vllm/outputs_table": table,
-                "alpaca_eval_vllm/num_outputs": len(out_rows),
-                "alpaca_eval_vllm/mode": mode,
-                "alpaca_eval_vllm/base_model": base_model,
-                "alpaca_eval_vllm/artifact_name": getattr(artifact, "name", ""),
-                "alpaca_eval_vllm/source_run_path": source_run_path or "",
-                "alpaca_eval_vllm/tensor_parallel_size": tp_size,
-            }
-        )
+        if upload_results:
+            table = wandb.Table(columns=["instruction", "input", "output", "generator"])
+            for row in out_rows:
+                table.add_data(
+                    row["instruction"], row["input"], row["output"], row["generator"]
+                )
+            wandb.log(
+                {
+                    "alpaca_eval_vllm/outputs_table": table,
+                    "alpaca_eval_vllm/num_outputs": len(out_rows),
+                    "alpaca_eval_vllm/mode": mode,
+                    "alpaca_eval_vllm/base_model": base_model,
+                    "alpaca_eval_vllm/artifact_name": getattr(artifact, "name", ""),
+                    "alpaca_eval_vllm/source_run_path": source_run_path or "",
+                    "alpaca_eval_vllm/tensor_parallel_size": tp_size,
+                }
+            )
 
-        wb_art = wandb.Artifact(
-            name=f"{eval_run_id}-alpaca_eval_outputs-vllm",
-            type="alpaca_eval_outputs_vllm",
-            metadata={
-                "run_id": eval_run_id,
-                "base_model": base_model,
-                "mode": mode,
-                "source_run_path": source_run_path,
-                "num_outputs": len(out_rows),
-                "generated_at_utc": _iso_now(),
-                "dataset_path": str(cfg.eval.dataset_path),
-                "max_new_tokens": int(cfg.eval.max_new_tokens),
-                "temperature": float(cfg.eval.temperature),
-                "top_p": float(cfg.eval.top_p),
-                "greedy": bool(cfg.eval.greedy),
-                "tensor_parallel_size": tp_size,
-            },
-        )
-        wb_art.add_file(str(out_path))
-        wandb.log_artifact(wb_art, aliases=["latest"])
-        wandb.finish()
+            wb_art = wandb.Artifact(
+                name=f"{eval_run_id}-alpaca_eval_outputs-vllm",
+                type="alpaca_eval_outputs_vllm",
+                metadata={
+                    "run_id": eval_run_id,
+                    "base_model": base_model,
+                    "mode": mode,
+                    "source_run_path": source_run_path,
+                    "num_outputs": len(out_rows),
+                    "generated_at_utc": _iso_now(),
+                    "dataset_path": str(cfg.eval.dataset_path),
+                    "max_new_tokens": int(cfg.eval.max_new_tokens),
+                    "temperature": float(cfg.eval.temperature),
+                    "top_p": float(cfg.eval.top_p),
+                    "greedy": bool(cfg.eval.greedy),
+                    "tensor_parallel_size": tp_size,
+                },
+            )
+            wb_art.add_file(str(out_path))
+            wandb.log_artifact(wb_art, aliases=["latest"])
+            wandb.finish()
 
-        print(f"[ok] Logged {len(out_rows)} AlpacaEval outputs with vLLM to run {eval_run_path}")
+        if upload_results:
+            print(
+                f"[ok] Logged {len(out_rows)} AlpacaEval outputs with vLLM to run {eval_run_path}"
+            )
+        else:
+            print(
+                f"[ok] Skipped W&B upload (wandb.upload_results=false); "
+                f"wrote {len(out_rows)} outputs locally ({eval_run_path})"
+            )
         print(f"[ok] Saved local AlpacaEval outputs to {local_out_path}")
 
 

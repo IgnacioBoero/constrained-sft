@@ -550,9 +550,8 @@ def _sanitize_metric_key_part(value: str) -> str:
 
 
 def _append_additional_metrics_to_payload(
-    payload: dict[str, Any], additional: dict[str, Any]
+    payload: dict[str, Any], additional: dict[str, Any], *, root: str = "when2call_lm_eval_vllm"
 ) -> None:
-    root = "when2call_lm_eval_vllm"
     payload[f"{root}/hallucination_rate"] = float(additional["hallucination_rate"])
 
     cls = additional.get("classification_metrics", {})
