@@ -2,6 +2,8 @@
 
 Safety tuning setups from **Appendix D.3** (instruction following + safety refusal), matching **Table 8** (shared training / LoRA) and **Table 9** (per-method hyperparameter grids).
 
+**Branch:** `origin/eval` tooling (AlpacaEval sampling, batch helpers, refusal metrics) is merged into `safety-double-sided`; downstream commands assume that tree.
+
 ## Location
 
 YAML files live under:
@@ -69,3 +71,50 @@ CUDA_VISIBLE_DEVICES=0 python scripts/eval_saferlhf_beaver.py \
 ```
 
 For full options (batch sizes, `--max_new_tokens`, logging back to runs, etc.), use `python scripts/eval_saferlhf_beaver.py --help`.
+
+## AlpacaEval sampling (benign Alpaca-style instructions)
+
+Figure 3 (left) **length-controlled win rate** is computed with the official [AlpacaEval](https://github.com/tatsu-lab/alpaca_eval) harness on model outputs for **benign** evaluation prompts. In this repo, prompts are shipped as:
+
+`src/datasets/safety/evaluation/alpaca_eval.json`
+
+**vLLM path (recommended for SAFE-long1k / LoRA runs logged to W&B):**
+
+- Entry point: [`src/eval/wandb_alpaca_eval_vllm.py`](../../../src/eval/wandb_alpaca_eval_vllm.py) (Hydra config [`configs/eval/wandb_alpaca_eval_vllm.yaml`](../../../configs/eval/wandb_alpaca_eval_vllm.yaml)).
+- Downloads the run’s `lora_adapters` artifact, merges adapters into the logged base model, generates with vLLM, writes JSON under `eval.local_output_dir`, and can log an `alpaca_eval_outputs_vllm` artifact back to the same run.
+
+```bash
+export PYTHONPATH=.
+python src/eval/wandb_alpaca_eval_vllm.py \
+  wandb.entity=YOUR_ENTITY \
+  wandb.project=YOUR_PROJECT \
+  wandb.run_id=RUN_ID
+```
+
+**Batch over many finished runs** (default project `alelab` / `SAFE-long1k`): [`scripts/run_safe_long1k_eval.py`](../../../scripts/run_safe_long1k_eval.py) lists qualifying runs; [`scripts/run_safe_long1k_eval.sh`](../../../scripts/run_safe_long1k_eval.sh) launches each eval as a **direct child process** (avoids vLLM multiprocess nesting issues).
+
+**Transformers path (no vLLM):** [`src/eval/wandb_alpaca_eval.py`](../../../src/eval/wandb_alpaca_eval.py) with [`configs/eval/wandb_alpaca_eval.yaml`](../../../configs/eval/wandb_alpaca_eval.yaml).
+
+Feed the produced JSON into upstream AlpacaEval to obtain **LC win rate** vs. a reference model.
+
+## Refusal metrics (held-out harmful / safety-eval prompts)
+
+Figure 3 (left) **refusal rate on harmful prompts** follows the paper’s rule: treat a generation as a refusal if it **starts with** certain phrases (substring list in code; close to Appendix D.3). That is **orthogonal** to AlpacaEval sampling above: Alpaca inputs are **safe** instructions; refusal rates come from generations on **unsafe** rows in the safety evaluation mix.
+
+After training with **`train.use_wandb: true`** and train-end generation enabled (see `eval_at_end` / `SAFETYTrainer` in [`src/experiments/safety.py`](../../../src/experiments/safety.py)), runs log W&B artifacts named like:
+
+`safe_generate_train_end_outputs_epoch_<N>`
+
+(JSON bundles `outputs` = sampled text and `safe` = prompt labels; the refusal script’s docstring describes how that flag is interpreted.)
+
+To aggregate refusal counts / ratios **from those artifacts** and optionally log metrics back into each run:
+
+```bash
+python scripts/compute_refusal_metrics.py --entity YOUR_ENTITY --project YOUR_PROJECT --tag YOUR_TAG
+# Preview only:
+python scripts/compute_refusal_metrics.py --dry-run --tag YOUR_TAG
+```
+
+See [`scripts/compute_refusal_metrics.py`](../../../scripts/compute_refusal_metrics.py) for flags (`--epoch`, phrase list, default denominator used in ratios).
+
+**Related:** [`scripts/eval_saferlhf_beaver.py`](../../../scripts/eval_saferlhf_beaver.py) (section above) samples **PKU-SafeRLHF** test prompts and scores with **Beaver-7B cost** — another safety-related evaluation path, distinct from AlpacaEval and from `compute_refusal_metrics`.

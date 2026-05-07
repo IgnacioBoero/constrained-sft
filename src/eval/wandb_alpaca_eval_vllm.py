@@ -8,6 +8,8 @@ Flow:
 3) Run batched generation with vLLM.
 4) Optionally log outputs to W&B (``wandb.upload_results``); always write JSON under
    ``eval.local_output_dir``.
+
+Project overview: configs/train/paper_experiments/README.md ("AlpacaEval sampling").
 """
 
 from __future__ import annotations
