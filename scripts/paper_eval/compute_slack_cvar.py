@@ -12,7 +12,7 @@ For each run:
 
 Example:
 
-    python scripts/compute_slack_cvar.py \
+    python scripts/paper_eval/compute_slack_cvar.py \
         --run-id dojd9qmj --run-id sg59r2xi \
         --project alelab/SAFE-long1k --alpha 0.95
 """

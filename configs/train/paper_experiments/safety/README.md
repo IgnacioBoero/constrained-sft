@@ -46,23 +46,23 @@ Paper **Base**: alpaca-long-1k SFT backbone only—no extra safety YAML row.
 
 ## Evaluation: PKU SafeRLHF + Beaver-7B cost
 
-[`scripts/eval_saferlhf_beaver.py`](../../../../scripts/eval_saferlhf_beaver.py) loads **`PKU-Alignment/PKU-SafeRLHF-30K`** test prompts (by default), **greedy-generates**, and scores **`beaver-7b-unified-reward`** / **`beaver-7b-unified-cost`**. Example:
+[`scripts/paper_eval/eval_saferlhf_beaver.py`](../../../../scripts/paper_eval/eval_saferlhf_beaver.py) loads **`PKU-Alignment/PKU-SafeRLHF-30K`** test prompts (by default), **greedy-generates**, and scores **`beaver-7b-unified-reward`** / **`beaver-7b-unified-cost`**. Example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/eval_saferlhf_beaver.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/paper_eval/eval_saferlhf_beaver.py \
   --hf_models ihounie/huggy-2-1k-alpaca-f16 \
   --out_root ./outputs/beaver_eval \
   --num_samples 500
 ```
 
-(`python scripts/eval_saferlhf_beaver.py --help` for W&B-backed runs.)
+(`python scripts/paper_eval/eval_saferlhf_beaver.py --help` for W&B-backed runs.)
 
 ## AlpacaEval sampling (benign instructions)
 
 Prompts shipped as **`src/datasets/safety/evaluation/alpaca_eval.json`**.
 
 - **`src/eval/wandb_alpaca_eval_vllm.py`** + **`configs/eval/wandb_alpaca_eval_vllm.yaml`**
-- Batch: **`scripts/run_safe_long1k_eval.py`** / **`scripts/run_safe_long1k_eval.sh`**
+- Batch: **`scripts/paper_eval/run_safe_long1k_eval.py`** / **`scripts/paper_eval/run_safe_long1k_eval.sh`**
 - No vLLM: **`src/eval/wandb_alpaca_eval.py`** + **`configs/eval/wandb_alpaca_eval.yaml`**
 
 ```bash
@@ -80,8 +80,15 @@ Feed JSON into upstream [AlpacaEval](https://github.com/tatsu-lab/alpaca_eval) f
 From W&B **`safe_generate_train_end_outputs_epoch_<N>`** artifacts ( **`train.use_wandb`** + train-end sampling in **`src/experiments/safety.py`**):
 
 ```bash
-python scripts/compute_refusal_metrics.py --entity YOUR_ENTITY --project YOUR_PROJECT --tag YOUR_TAG
-python scripts/compute_refusal_metrics.py --dry-run --tag YOUR_TAG
+python scripts/paper_eval/compute_refusal_metrics.py --entity YOUR_ENTITY --project YOUR_PROJECT --tag YOUR_TAG
+python scripts/paper_eval/compute_refusal_metrics.py --dry-run --tag YOUR_TAG
 ```
 
-Phrase list / ratios: **`scripts/compute_refusal_metrics.py`** (orthogonal to benign AlpacaEval prompts).
+Phrase list / ratios: **`scripts/paper_eval/compute_refusal_metrics.py`** (orthogonal to benign AlpacaEval prompts).
+
+## Post-hoc W&B metrics (optional)
+
+- **`scripts/paper_eval/compute_kl_safe_dpo.py`** — recomputes **mean KL** to the frozen base model on the **eval** split (matches the helpfulness surrogate in **`safety.py`**) and can log **`eval/kl_to_base_*`** back to tagged runs (e.g. Safe-DPO / Table 9 rows).
+- **`scripts/paper_eval/compute_slack_cvar.py`** — upper-tail **CVaR** of constraint **slacks** from end-of-training W&B tables; supports tail analyses aligned with abstract claim (C4) about violation distributions.
+
+See **[`docs/tooling_paper_aligned.md`](../../../../docs/tooling_paper_aligned.md)** for full paths and prerequisites.

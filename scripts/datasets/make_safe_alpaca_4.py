@@ -77,7 +77,7 @@ def try_load_safe_alpaca_3(dataset_name: str) -> DatasetDict:
     try:
         return load_dataset(dataset_name)  # type: ignore[no-any-return]
     except Exception as e:
-        repo_root = Path(__file__).resolve().parents[1]
+        repo_root = Path(__file__).resolve().parents[2]
         local_root = repo_root / "src" / "datasets" / "safety" / "SAFE-ALPACA-3"
         train_files = sorted((local_root / "train").glob("*.json"))
         val_files = sorted((local_root / "validation").glob("*.json"))

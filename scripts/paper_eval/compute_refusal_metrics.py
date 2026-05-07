@@ -6,13 +6,13 @@ tables, and log results back to each run (resume).
 Usage
 -----
 # Default: all "sample"-tagged runs in alelab/SAFE-long1k
-    python scripts/compute_refusal_metrics.py
+    python scripts/paper_eval/compute_refusal_metrics.py
 
 # Custom project / tag / epoch:
-    python scripts/compute_refusal_metrics.py --project MY_PROJECT --tag my_tag --epoch 4
+    python scripts/paper_eval/compute_refusal_metrics.py --project MY_PROJECT --tag my_tag --epoch 4
 
 # Dry-run (print metrics without logging):
-    python scripts/compute_refusal_metrics.py --dry-run
+    python scripts/paper_eval/compute_refusal_metrics.py --dry-run
 
 See configs/train/paper_experiments/README.md and configs/train/paper_experiments/safety/README.md (refusal metrics & AlpacaEval).
 """

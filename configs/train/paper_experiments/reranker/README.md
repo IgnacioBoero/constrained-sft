@@ -31,6 +31,10 @@ Cross-encoder **ModernBERT-base** tuning on MS MARCO v2.1–derived pairs with
 | **`sweep_aug_dual_alpha.yaml`** | Table 13 α ∈ {1, 10, 100, 1000} |
 | **`seeds_*.yaml`**, **`baseline_mono_bert.yaml`** | Fig. 4 illustrative points (**erm** + **`length_constraint: false`** = relevance-only cross-encoder) |
 
+## Checkpoint batch evaluation
+
+**`scripts/paper_eval/eval_reranker_checkpoints.py`** (Hydra entry) discovers checkpoints under **`train.output_dir`** from a training YAML **`train_config`** (see **`configs/eval/reranker.yaml`**) and writes **`evaluation_results.csv`**. Prefer this over ad-hoc one-off notebooks when sweeping Table 12 / Appendix F.
+
 ## Commands
 
 From repo root (`export PYTHONPATH=.`):

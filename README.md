@@ -42,11 +42,14 @@ Index + cross-links: **`configs/train/paper_experiments/README.md`**.
 
 The default **`configs/train/default.yaml`** composes **`paper_experiments/safety/paper_safety_shared`** for a minimal safety-shape run—override **`--config-path` / `--config-name`** for When2Call, reranking, or other setups.
 
+**Tooling:** maps scripts → paper metrics → [`docs/tooling_paper_aligned.md`](docs/tooling_paper_aligned.md).  
+Candidates to delete or relocate → [`docs/tooling_review_for_deletion.md`](docs/tooling_review_for_deletion.md).
+
 ---
 
 ## Losses / objectives
 
-Structured notes for pairwise / margin objectives on When2Call: **`src/experiments/README_dpo_kl_losses.md`.
+Structured notes for pairwise / margin objectives on When2Call: **`src/experiments/README_dpo_kl_losses.md`**.
 
 ---
 
@@ -54,13 +57,14 @@ Structured notes for pairwise / margin objectives on When2Call: **`src/experimen
 
 | Purpose | Starting point |
 |--------|----------------|
-| **AlpacaEval** generations (benign prompts) | `src/eval/wandb_alpaca_eval_vllm.py`, `configs/eval/wandb_alpaca_eval_vllm.yaml`; batch: `scripts/run_safe_long1k_eval.sh` |
-| **Refusal phrase counts** from W&B train-end dumps | `scripts/compute_refusal_metrics.py` (see **`safety` README**) |
-| **PKU SafeRLHF + Beaver-7B unified cost / reward** | `scripts/eval_saferlhf_beaver.py` |
-| **When2Call lm-eval** (optional post-train hook) | `configs/eval/wandb_when2call_lm_eval_vllm.yaml`, `src/eval/wandb_when2call_lm_eval_vllm.py` |
-| **MS MARCO length-aware reranker** | Train with `configs/train/paper_experiments/reranker/*.yaml`; see [`paper_experiments/reranker/README.md`](configs/train/paper_experiments/reranker/README.md) — **Table 12** grids (add `-m` for multiruns), **`seeds_*` / Fig. 4** bundles, Appendix **F dual / α** YAMLs |
+| **AlpacaEval** generations (benign prompts) | `src/eval/wandb_alpaca_eval_vllm.py`, `configs/eval/wandb_alpaca_eval_vllm.yaml`; batch wrappers: **`scripts/paper_eval/run_safe_long1k_eval.sh`**, **`scripts/paper_eval/run_safe_long1k_eval.py`**; tag loop: **`scripts/paper_eval/alpacaeval_by_tag.sh`** |
+| **Refusal phrase counts** from W&B train-end dumps | **`scripts/paper_eval/compute_refusal_metrics.py`** (see **`safety` README**) |
+| **PKU SafeRLHF + Beaver-7B unified cost / reward** | **`scripts/paper_eval/eval_saferlhf_beaver.py`** |
+| **Safety: post-hoc KL to base / CVaR of slacks** (tail diagnostics) | **`scripts/paper_eval/compute_kl_safe_dpo.py`**, **`scripts/paper_eval/compute_slack_cvar.py`** |
+| **When2Call lm-eval** (optional post-train hook) | `configs/eval/wandb_when2call_lm_eval_vllm.yaml`, `src/eval/wandb_when2call_lm_eval_vllm.py`; extra metrics helper: **`src/eval/when2call_additional_metrics.py`** |
+| **MS MARCO length-aware reranker** | Train with `configs/train/paper_experiments/reranker/*.yaml`; batch checkpoint **metrics** → **`scripts/paper_eval/eval_reranker_checkpoints.py`**; see [`paper_experiments/reranker/README.md`](configs/train/paper_experiments/reranker/README.md) |
 
-Scripts live in **`scripts/`**; HF datasets bundled or downloaded as configured in YAML.
+Layout: **`scripts/README.md`** indexes subfolders (`paper_eval/`, `when2call/`, `datasets/`, …).
 
 ---
 

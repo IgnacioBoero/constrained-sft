@@ -8,3 +8,4 @@ multirun/*
 log/*
 plotting/*
 src/plotting/*
+evaluation_results.csv

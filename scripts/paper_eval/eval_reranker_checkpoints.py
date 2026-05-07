@@ -1,12 +1,11 @@
-# eval.py
 """
-Evaluation script for trained models from constrained-sft experiments.
+Batch-evaluate saved reranker checkpoints (Appendix D.2 / `paper_experiments/reranker`).
 
-This script evaluates all models trained during a specific training run, handling 
-hyperparameter sweeps and producing comprehensive evaluation metrics.
+Resolves multirun output dirs from the training YAML (including `defaults:` merges),
+runs `Trainer.evaluate` on train and eval splits, and writes `evaluation_results.csv`.
 
-Usage:
-    python eval.py --config-path configs/eval --config-name reranker.yaml
+Usage (from repo root):
+    python scripts/paper_eval/eval_reranker_checkpoints.py --config-path=eval --config-name=reranker
 
 Features:
 - Automatically discovers all trained model checkpoints from a training run
@@ -28,8 +27,8 @@ from pathlib import Path
 from typing import Dict, List, Any
 from collections import defaultdict
 
-# Add src to Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import hydra
 import torch
@@ -179,13 +178,21 @@ def evaluate_model(exp, checkpoint_path: str, train_ds, eval_ds, cfg: DictConfig
             }
         }
 
-@hydra.main(config_path="configs", config_name="eval/default", version_base=None)
+def _configs_dir() -> str:
+    return str(_REPO_ROOT / "configs")
+
+
+@hydra.main(
+    config_path=_configs_dir(),
+    config_name="eval/default",
+    version_base=None,
+)
 def main(cfg: DictConfig):
     """
-    Evaluate all trained models from a specific training run.
-    
-    Usage:
-        python eval.py --config-path configs/eval --config-name reranker.yaml
+    Evaluate reranker checkpoints for a Hydra train config (`train_config` in eval YAML).
+
+    Usage (from repo root):
+        python scripts/paper_eval/eval_reranker_checkpoints.py --config-path=eval --config-name=reranker
     """
     
     set_seed(cfg.train.seed)

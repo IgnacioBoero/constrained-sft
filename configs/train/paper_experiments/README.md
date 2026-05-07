@@ -31,3 +31,5 @@ python src/train.py train=paper_experiments/function_calling/sweep/dpo
 - **Safety** — sweeps/seeds for constrained vs baseline methods + AlpacaEval / refusal / Beaver-cost evaluation pointers: **[`safety/README.md`](./safety/README.md)**  
 - **Function calling** — Llama vs xLAM, sweep vs seeded finals + Table 5–6 mapping: **[`function_calling/README.md`](./function_calling/README.md)**  
 - **Reranking** — ModernBERT cross-encoder, Table 12 grids + appendix ablations + Fig 4 seeds: **[`reranker/README.md`](./reranker/README.md)**
+
+**Evaluation / scripts index:** **[`docs/tooling_paper_aligned.md`](../../../docs/tooling_paper_aligned.md)** · housekeeping / delete candidates · **[`docs/tooling_review_for_deletion.md`](../../../docs/tooling_review_for_deletion.md)**

@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Run wandb_alpaca_eval_vllm.py for every W&B run in a project that has a given tag.
+# Run from repo root, or invoke directly (script cds to repo root).
 #
 # Usage:
-#   ./alpacaeval_by_tag.sh <wandb_entity> <wandb_project> <tag>
+#   ./scripts/paper_eval/alpacaeval_by_tag.sh <wandb_entity> <wandb_project> <tag>
 # Environment:
 #   CUDA_VISIBLE_DEVICES (default: 0)
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 if [[ $# -lt 3 ]]; then
   echo "Usage: $0 <wandb_entity> <wandb_project> <tag>" >&2

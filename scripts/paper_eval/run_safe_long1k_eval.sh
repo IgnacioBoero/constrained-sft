@@ -7,14 +7,14 @@
 # initialisation failures.
 #
 # Usage:
-#   bash scripts/run_safe_long1k_eval.sh                 # all qualifying runs
-#   bash scripts/run_safe_long1k_eval.sh --tag my_tag    # only runs with tag
-#   bash scripts/run_safe_long1k_eval.sh --include-evaluated
+#   bash scripts/paper_eval/run_safe_long1k_eval.sh                 # all qualifying runs
+#   bash scripts/paper_eval/run_safe_long1k_eval.sh --tag my_tag    # only runs with tag
+#   bash scripts/paper_eval/run_safe_long1k_eval.sh --include-evaluated
 # ──────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
 
 # ── Configurable defaults (override via env vars) ───────────────────────
@@ -29,7 +29,7 @@ export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 # ── Collect qualifying run IDs via the Python helper ────────────────────
 # Forward all CLI args (--tag, --include-evaluated) to the Python script.
 echo "[run_safe_long1k_eval.sh] Querying W&B for qualifying runs …"
-mapfile -t RUN_IDS < <(python scripts/run_safe_long1k_eval.py --print-ids "$@")
+mapfile -t RUN_IDS < <(python scripts/paper_eval/run_safe_long1k_eval.py --print-ids "$@")
 
 if [[ ${#RUN_IDS[@]} -eq 0 ]]; then
     echo "[run_safe_long1k_eval.sh] No qualifying runs found. Nothing to do."

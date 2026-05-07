@@ -6,13 +6,13 @@ in the W&B project **alelab/SAFE-long1k**.
 Usage
 -----
 # Evaluate all finished runs that have LoRA artifacts:
-    python scripts/run_safe_long1k_eval.py
+    python scripts/paper_eval/run_safe_long1k_eval.py
 
 # Only runs with a specific tag:
-    python scripts/run_safe_long1k_eval.py --tag my_tag
+    python scripts/paper_eval/run_safe_long1k_eval.py --tag my_tag
 
 # Dry-run (just print the commands):
-    python scripts/run_safe_long1k_eval.py --dry-run
+    python scripts/paper_eval/run_safe_long1k_eval.py --dry-run
 """
 
 from __future__ import annotations
