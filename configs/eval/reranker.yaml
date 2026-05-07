@@ -1,14 +1,14 @@
 # @package _global_
 
-# Path to the train config file that was used for training
-train_config: "configs/train/reranker.yaml"
+# Path to the train config file that was used for training (paper appendix shared block)
+train_config: "configs/train/paper_experiments/reranker/paper_rerank_shared.yaml"
 
 # Basic evaluation settings
 train:
   seed: 42
   data_proportion: 1.0  # Use full dataset for evaluation
-  size: small           # Match the training dataset size
-  dropout: 0.07         # Default dropout value
+  size: large           # Paper appendix D.2 pooled subset (`iboero16/reranker`, cfg `large`)
+  dropout: 0.05        # Matches `paper_rerank_shared.yaml`
   output_dir: "./outputs/eval"  # Temporary output dir for evaluation
   hf_args:
     per_device_eval_batch_size: 2
@@ -18,6 +18,6 @@ train:
 # Experiment configuration (should match training)
 exp:
   name: "reranker"
-  model_name: "answerdotai/ModernBERT-large"
+  model_name: "answerdotai/ModernBERT-base"
   num_negatives: 9
   max_length: 512

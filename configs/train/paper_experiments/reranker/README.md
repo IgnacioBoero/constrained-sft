@@ -31,8 +31,6 @@ Cross-encoder **ModernBERT-base** tuning on MS MARCO v2.1–derived pairs with
 | **`sweep_aug_dual_alpha.yaml`** | Table 13 α ∈ {1, 10, 100, 1000} |
 | **`seeds_*.yaml`**, **`baseline_mono_bert.yaml`** | Fig. 4 illustrative points (**erm** + **`length_constraint: false`** = relevance-only cross-encoder) |
 
-Older exploratory configs remain under **`configs/train/reranker/`**.
-
 ## Commands
 
 From repo root (`export PYTHONPATH=.`):

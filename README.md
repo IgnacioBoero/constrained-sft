@@ -42,8 +42,6 @@ Index + cross-links: **`configs/train/paper_experiments/README.md`**.
 
 The default **`configs/train/default.yaml`** composes **`paper_experiments/safety/paper_safety_shared`** for a minimal safety-shape run—override **`--config-path` / `--config-name`** for When2Call, reranking, or other setups.
 
-Legacy exploratory YAMLs remain under **`configs/train/reranker/`**, **`debug/`**, etc. Prefer **`configs/train/paper_experiments/reranker/`** for appendix-matched grids.
-
 ---
 
 ## Losses / objectives

@@ -42,6 +42,36 @@ import numpy as np
 def is_global_main_process() -> bool:
     return os.environ.get("RANK", "0") == "0"
 
+def load_train_yaml_merged(path: str | os.PathLike) -> DictConfig:
+    """
+    Resolve a YAML that may declare Hydra-style `defaults: [foo]` by merging those
+    files (in order), then layering the current file on top. Matches how training
+    composes configs so `train.output_dir` and sweeps behave like `hydra.job`.
+    """
+    path_p = Path(path).resolve()
+    cfg = OmegaConf.load(path_p)
+    defaults_list = OmegaConf.select(cfg, "defaults", default=None)
+    if defaults_list is None or len(defaults_list) == 0:
+        return cfg
+
+    merged: DictConfig = OmegaConf.create({})
+    for item in defaults_list:
+        if item is None:
+            continue
+        # Skip overrides like `{override hydra/...: ...}`
+        if not isinstance(item, str):
+            continue
+        if item == "_self_":
+            continue
+        child_path = path_p.parent / f"{item}.yaml"
+        if not child_path.is_file():
+            raise FileNotFoundError(
+                f"Train config '{path_p}' declares default '{item}' but '{child_path}' was not found"
+            )
+        merged = OmegaConf.merge(merged, load_train_yaml_merged(child_path))
+
+    return OmegaConf.merge(merged, cfg)
+
 def find_all_trained_models(output_dir: str) -> List[str]:
     """Find all trained model checkpoints in the output directory."""
     checkpoint_paths = []
@@ -167,7 +197,7 @@ def main(cfg: DictConfig):
     
     # Load train config to understand the hyperparameter sweep structure
     # Load without resolving interpolations to get the raw template
-    train_cfg = OmegaConf.load(train_config_path)
+    train_cfg = load_train_yaml_merged(train_config_path)
     
     # Get experiment class
     ExpCls = EXPERIMENTS[cfg.exp.name]
@@ -211,7 +241,10 @@ def main(cfg: DictConfig):
             
             # Build output directory for this combination
             # Get the raw template string from the config
-            output_dir_template = "./outputs/reranker/${exp.model_name}-${exp.loss_type}-${exp.obj_type}-${exp.loss_tol}-${train.size}"
+            output_dir_template = train_cfg.train.get(
+                "output_dir",
+                "./outputs/paper_rerank/${exp.loss_type}/tol${exp.loss_tol}-alpha${exp.loss_alpha}-dual${exp.dual_step_size}-beta${exp.resilient_coef}-seed${train.seed}",
+            )
             
             # Create a mapping of all variables for substitution
             substitutions = {}
