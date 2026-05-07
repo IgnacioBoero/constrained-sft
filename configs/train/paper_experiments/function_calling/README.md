@@ -74,7 +74,7 @@ Defaults for W&B: **`paper_when2call`** (override with `train.wandb_project=`).
 
 ## Post-train LM eval / metrics
 
-`src/train.py` can spawn **When2Call lm-eval–style** subprocesses via `train.post_train_when2call_*` hooks (see **`configs/eval/wandb_when2call_lm_eval_vllm.yaml`** and **`src/eval/wandb_when2call_lm_eval_vllm.py`**). Loss definitions: **`src/experiments/README_dpo_kl_losses.md`**.  
+`src/train.py` can spawn **When2Call lm-eval–style** subprocesses via `train.post_train_when2call_*` hooks (see **`configs/eval/wandb_when2call_lm_eval_vllm.yaml`**). Loss shapes and `exp.*` fields correspond to **`src/experiments/dpo_kl.py`** and the **`Table 6` mapping** above.  
 Tooling catalogue: **[`docs/tooling_paper_aligned.md`](../../../../docs/tooling_paper_aligned.md)**.
 
 ## xLAM vs Llama

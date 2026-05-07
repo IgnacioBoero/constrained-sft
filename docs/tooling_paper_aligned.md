@@ -15,7 +15,7 @@ or **length-aware reranking (Appendix D.2)** as described in
 | `src/experiments/reranker.py` | Cross-encoder + length constraint / Λ surrogates (Appendix D.2). |
 | `configs/train/paper_experiments/**` | Paper-matched grids and shared YAMLs (`paper_*_shared.yaml`). |
 
-Supporting notes: **`src/experiments/README_dpo_kl_losses.md`**.
+Preference / margin loss details: **`src/experiments/dpo_kl.py`** and the YAMLs in **`paper_experiments/function_calling/`**.
 
 ---
 
