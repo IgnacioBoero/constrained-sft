@@ -57,7 +57,7 @@ class SAFETY(Experiment):
         return model, tok
 
     def load_datasets(self, cfg):
-        dataset_name = getattr(cfg.exp, "dataset", "ihounie/SAFE-ALPACA-4")
+        dataset_name = getattr(cfg.exp, "dataset", "/SAFE-ALPACA-4")
         ds = load_dataset(dataset_name)
 
         tr_raw = ds["train"]
@@ -244,7 +244,7 @@ class SAFETY(Experiment):
         ev_raw = _normalize_pku_split(ev_raw, "validation")
 
         # Optional: keep only unsafe rows (safety_label == True) in train/eval splits.
-        # Dataset convention (ihounie/SAFE-ALPACA-BTails-llama2):
+        # Dataset convention (/SAFE-ALPACA-BTails-llama2):
         #   * safety_label == True  -> UNSAFE prompt; `output` is the refusal target.
         #   * safety_label == False -> SAFE prompt;   `output` is the benign Alpaca answer.
         only_unsafe_train = getattr(cfg.train, "only_unsafe_train", False)
@@ -334,7 +334,7 @@ class SAFETY(Experiment):
         complete_dl = complete_dl.map(_add_safe_output)
 
         # Add `chosen_output` / `rejected_output` columns for preference-based losses (e.g. DAA/SFT).
-        # Dataset convention (ihounie/SAFE-ALPACA-BTails-llama2):
+        # Dataset convention (/SAFE-ALPACA-BTails-llama2):
         #   * safety_label == True  -> UNSAFE prompt; dataset `output` is a refusal, and
         #                              `beavertails_output` is the harmful response.
         #   * safety_label == False -> SAFE prompt;   dataset `output` is the good answer.
@@ -1203,7 +1203,7 @@ class SAFETY(Experiment):
                     return result
 
                 try:
-                    dataset_name = getattr(self.custom_cfg.exp, "dataset", "ihounie/SAFE-ALPACA-4")
+                    dataset_name = getattr(self.custom_cfg.exp, "dataset", "/SAFE-ALPACA-4")
                     gen_ds = load_dataset(dataset_name)["validation"]
                 except Exception as exc:
                     print(f"[safe-generate-eval] Failed to load dataset: {exc}")

@@ -5,7 +5,7 @@ tables, and log results back to each run (resume).
 
 Usage
 -----
-# Default: all "sample"-tagged runs in alelab/SAFE-long1k
+# Default: all "sample"-tagged runs in <WB ENTITY>/SAFE-long1k
     python scripts/paper_eval/compute_refusal_metrics.py
 
 # Custom project / tag / epoch:
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import wandb
 
-ENTITY_DEFAULT = "alelab"
+ENTITY_DEFAULT = "<WB ENTITY>"
 PROJECT_DEFAULT = "SAFE-long1k"
 TAG_DEFAULT = "new"
 TABLE_PREFIX = "safe_generate_train_end_outputs_epoch_"

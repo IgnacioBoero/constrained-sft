@@ -48,7 +48,7 @@ def _is_llama2_style_model(model_name: str) -> bool:
     # Explicitly Llama 2
     if "llama-2" in name_lower or "llama2" in name_lower:
         return True
-    # huggyllama/llama-7b and derivatives (e.g. ihounie/huggy-*)
+    # huggyllama/llama-7b and derivatives (e.g. /huggy-*)
     if "huggyllama" in name_lower:
         return True
     if "huggy" in name_lower:

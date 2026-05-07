@@ -18,7 +18,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
 
 # ── Configurable defaults (override via env vars) ───────────────────────
-ENTITY="${ENTITY:-alelab}"
+ENTITY="${ENTITY:-<WB ENTITY>}"
 PROJECT="${PROJECT:-SAFE-long1k}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/outputs/alpaca_eval_vllm/${PROJECT}}"

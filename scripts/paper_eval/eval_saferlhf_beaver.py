@@ -26,7 +26,7 @@ Run from outside the repo root (the local ./wandb directory shadows the
 wandb package):
 
     cd /tmp
-    CUDA_VISIBLE_DEVICES=1 python /home/chiche/constrained-sft-3/scripts/eval_saferlhf_beaver.py --entity alelab --project SAFE-long1k --tag xtest
+    CUDA_VISIBLE_DEVICES=1 python /home/<user>/constrained-sft-3/scripts/eval_saferlhf_beaver.py --entity <WB ENTITY> --project SAFE-long1k --tag xtest
 
 Project docs: configs/train/paper_experiments/README.md · safety detail: configs/train/paper_experiments/safety/README.md.
 """
@@ -395,7 +395,7 @@ def main() -> None:
         default=None,
         help="HF repo id(s) of pretrained causal LMs to evaluate (no LoRA, no W&B resume).",
     )
-    ap.add_argument("--entity", default="alelab")
+    ap.add_argument("--entity", default="<WB ENTITY>")
     ap.add_argument("--project", default="SAFE-long1k")
     ap.add_argument("--tag", default="xtest")
     ap.add_argument("--run_ids", nargs="*", default=None)

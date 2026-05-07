@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Batch-run ``src/eval/wandb_alpaca_eval_vllm.py`` for every qualifying run
-in the W&B project **alelab/SAFE-long1k**.
+in the W&B project **<WB ENTITY>/SAFE-long1k**.
 
 Usage
 -----
@@ -24,7 +24,7 @@ import sys
 
 import wandb
 
-ENTITY = "alelab"
+ENTITY = "<WB ENTITY>"
 PROJECT = "SAFE-long1k"
 
 
@@ -109,7 +109,7 @@ _SUBPROCESS_ENV: dict[str, str] = {
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Batch AlpacaEval (vLLM) for alelab/SAFE-long1k runs.",
+        description="Batch AlpacaEval (vLLM) for <WB ENTITY>/SAFE-long1k runs.",
     )
     parser.add_argument(
         "--tag",

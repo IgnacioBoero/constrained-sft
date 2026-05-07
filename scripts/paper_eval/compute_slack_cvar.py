@@ -14,7 +14,7 @@ Example:
 
     python scripts/paper_eval/compute_slack_cvar.py \
         --run-id dojd9qmj --run-id sg59r2xi \
-        --project alelab/SAFE-long1k --alpha 0.95
+        --project <WB ENTITY>/SAFE-long1k --alpha 0.95
 """
 from __future__ import annotations
 
@@ -145,7 +145,7 @@ def process_run(run_id: str, project: str, alpha: float, work_dir: Path, dry_run
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", action="append", required=True)
-    ap.add_argument("--project", default="alelab/SAFE-long1k")
+    ap.add_argument("--project", default="<WB ENTITY>/SAFE-long1k")
     ap.add_argument("--alpha", type=float, default=0.95,
                     help="Upper-tail CVaR quantile (0.95 = top 5%)")
     ap.add_argument("--work-dir", default="/tmp/slack_cvar")

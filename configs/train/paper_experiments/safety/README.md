@@ -6,7 +6,7 @@ Safety tuning setups from **Appendix D.3** (instruction following + safety refus
 
 Configs live under **`configs/train/paper_experiments/safety/`**:
 
-- **`paper_safety_shared.yaml`** — shared recipe (epochs, LR, cosine schedule, AdamW weight decay 0.01, global grad clip 1, LoRA \(r{=}64,\ \alpha{=}128\) on `\{q,k,v,o\}_proj`, max length 2048, BF16 effective batch \(1 \times 32\) grad accumulation \(=32\), dataset `ihounie/SAFE-ALPACA-BTails-llama2`, base `ihounie/huggy-2-1k-alpaca-f16`).
+- **`paper_safety_shared.yaml`** — shared recipe (epochs, LR, cosine schedule, AdamW weight decay 0.01, global grad clip 1, LoRA \(r{=}64,\ \alpha{=}128\) on `\{q,k,v,o\}_proj`, max length 2048, BF16 effective batch \(1 \times 32\) grad accumulation \(=32\), dataset `/SAFE-ALPACA-BTails-llama2`, base `/huggy-2-1k-alpaca-f16`).
 - **`sweep_*.yaml`** — Hydra `MULTIRUN` grids (Table 9).
 - **`seeds_fig3_*.yaml`** — three RNG seeds \(\{42,43,44\}\) for **Figure 3 right-table** rows (excluding **Base**, which has no separate safety train stage).
 
@@ -48,7 +48,7 @@ Paper **Base**: alpaca-long-1k SFT backbone only—no extra safety YAML row.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/paper_eval/eval_saferlhf_beaver.py \
-  --hf_models ihounie/huggy-2-1k-alpaca-f16 \
+  --hf_models /huggy-2-1k-alpaca-f16 \
   --out_root ./outputs/beaver_eval \
   --num_samples 500
 ```

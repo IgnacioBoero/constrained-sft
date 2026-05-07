@@ -16,7 +16,7 @@ Cross-encoder **ModernBERT-base** tuning on MS MARCO v2.1–derived pairs with
 
 ## Data
 
-**`datasets.load_dataset("iboero16/reranker", cfg.train.size, …)`**. Use **`train.size: large`** (default) as the pooled **55 k-example** stratified subset described in appendix D.2.
+**`datasets.load_dataset("<hf-user>/reranker", cfg.train.size, …)`**. Use **`train.size: large`** (default) as the pooled **55 k-example** stratified subset described in appendix D.2.
 
 ## Config layout
 

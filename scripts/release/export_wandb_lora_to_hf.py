@@ -12,7 +12,7 @@ This repo contains a local ./wandb directory (run logs) that can shadow the
 real `wandb` Python package when running from the repo root. Prefer running
 this script from outside the repo root, e.g.:
   cd /tmp
-  python /home/chiche/constrained-sft-2/scripts/export_wandb_lora_to_hf.py ...
+  python /home/<user>/constrained-sft-2/scripts/export_wandb_lora_to_hf.py ...
 """
 
 from __future__ import annotations
@@ -301,7 +301,7 @@ def _assert_adapter_files_present(out_dir: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--entity", default="alelab")
+    ap.add_argument("--entity", default="<WB ENTITY>")
     ap.add_argument("--project", default="SAFE-llama2-long1k")
     ap.add_argument("--type_name", default="lora_adapters")
     ap.add_argument(
@@ -309,7 +309,7 @@ def main() -> None:
         default=None,
         help="Optional explicit ref: entity/project/name:alias_or_version (overrides auto-pick)",
     )
-    ap.add_argument("--hf_repo_id", default="ihounie/llama2-7b-alpaca-1k")
+    ap.add_argument("--hf_repo_id", default="/llama2-7b-alpaca-1k")
     ap.add_argument(
         "--base_model",
         default=None,

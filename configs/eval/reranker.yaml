@@ -7,7 +7,7 @@ train_config: "configs/train/paper_experiments/reranker/paper_rerank_shared.yaml
 train:
   seed: 42
   data_proportion: 1.0  # Use full dataset for evaluation
-  size: large           # Paper appendix D.2 pooled subset (`iboero16/reranker`, cfg `large`)
+  size: large           # Paper appendix D.2 pooled subset (`<hf-user>/reranker`, cfg `large`)
   dropout: 0.05        # Matches `paper_rerank_shared.yaml`
   output_dir: "./outputs/eval"  # Temporary output dir for evaluation
   hf_args:

@@ -25,7 +25,7 @@ train:
   save_model: true
   push_adapters_to_wandb: true
   wandb_project: "paper_when2call"
-  wandb_entity: "alelab"
+  wandb_entity: "<WB ENTITY>"
   run_name: "paper-sweep-llama32-dpo-beta:${exp.loss_alpha}-ep:${train.hf_args.num_train_epochs}"
   eval_at_end: true
   eval_on_train: true

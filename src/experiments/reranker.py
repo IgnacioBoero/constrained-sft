@@ -67,8 +67,8 @@ class RERANKER(Experiment):
         dataset_size = getattr(cfg.train, 'size',' large')
         
         # Load all splits
-        train = load_dataset("iboero16/reranker", dataset_size, split="train")
-        eval = load_dataset("iboero16/reranker", dataset_size, split="validation")
+        train = load_dataset("<hf-user>/reranker", dataset_size, split="train")
+        eval = load_dataset("<hf-user>/reranker", dataset_size, split="validation")
 
         # Apply data proportion if specified
         tr_size = int(cfg.train.data_proportion * len(train))

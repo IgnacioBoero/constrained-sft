@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Create SAFE-ALPACA-4 by attaching model generations as `unsafe_response` to the
-`iboero16/SAFE-ALPACA-3` validation split.
+`<hf-user>/SAFE-ALPACA-3` validation split.
 
 Input file format: JSON list of objects with keys: {prompt, answer, safe}
 where prompt looks like:
@@ -166,8 +166,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--source_dataset",
         type=str,
-        default="iboero16/SAFE-ALPACA-3",
-        help="HF dataset name to load (defaults to iboero16/SAFE-ALPACA-3).",
+        default="<hf-user>/SAFE-ALPACA-3",
+        help="HF dataset name to load (defaults to <hf-user>/SAFE-ALPACA-3).",
     )
     p.add_argument(
         "--validation_split",
@@ -185,7 +185,7 @@ def parse_args() -> argparse.Namespace:
         "--push_to_hub",
         type=str,
         default=None,
-        help="If set (e.g. ihounie/SAFE-ALPACA-4), pushes the resulting DatasetDict to hub.",
+        help="If set (e.g. /SAFE-ALPACA-4), pushes the resulting DatasetDict to hub.",
     )
     p.add_argument(
         "--private",

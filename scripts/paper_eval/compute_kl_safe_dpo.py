@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Download the LoRA adapters for runs tagged ``safe_dpo`` in
-``alelab/SAFE-long1k``, replicate the SAFETY end-of-training KL evaluation
+``<WB ENTITY>/SAFE-long1k``, replicate the SAFETY end-of-training KL evaluation
 on the *eval* split only, and push the resulting metrics back to the
 matching W&B run.
 
@@ -35,7 +35,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from utils import format_prompt  # noqa: E402
 
-ENTITY = "alelab"
+ENTITY = "<WB ENTITY>"
 PROJECT = "SAFE-long1k"
 
 
@@ -72,7 +72,7 @@ def _pick_dataset_name(run_obj: Any) -> str:
     for c in candidates:
         if isinstance(c, str) and c.strip():
             return c.strip()
-    return "ihounie/SAFE-ALPACA-4"
+    return "/SAFE-ALPACA-4"
 
 
 def _pick_max_length(run_obj: Any, default: int = 512) -> int:
