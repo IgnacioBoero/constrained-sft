@@ -9,7 +9,7 @@ hydra:
       exp.loss_alpha: 1.0, 10.0, 0.1
       exp.tilt_t: 1.0, 10.0, 0.1
       exp.loss_tol: 1
-      train.seed: 0,1
+      train.seed: 42
 
   launcher:
     _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
