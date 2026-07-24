@@ -7,7 +7,7 @@ hydra:
     params:
       exp.loss_type: topk
       exp.loss_alpha: 1.0,10.0,0.1
-      exp.topk_k: 1000, 10000
+      exp.topk_per:  0.1, 0.3
       exp.loss_tol: 1
       train.seed: 42
 
@@ -54,8 +54,10 @@ exp:
   max_length: 512
   loss_type: topk                 # Options: "erm", "dual", "aug_dual", "resilient", "penalty", "tilted", "topk"
   loss_tol: 1.0
-  loss_alpha: 1                       # Top-k-loss weight added to the objective loss
-  topk_k: 20                          # Number of worst constraint violations (out of B*num_negatives) averaged
+  loss_alpha: 1                       # Weight of the (avg + topk) constraint term added to the objective loss
+  topk_per: 0.1                       # Fraction of the flattened (B*num_negatives) violations averaged as the tail term
+  include_avg: true                  # If true, also add the plain mean over all violations alongside the tail term
+  topk_weight: 10.0                   # Extra multiplier on the tail term, so it dominates over the plain average
   dual_step_size: 1.0             # Only used for dual loss
   length_constraint: true
   ls_clamp: false
