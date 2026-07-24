@@ -66,7 +66,7 @@ class RERANKER(Experiment):
         assert num_neg >= 1, f"num_negatives must be >= 1, got {num_neg}"
         dataset_size = getattr(cfg.train, 'size',' large')
         
-        # Load all splits
+        # Load all splitsb
         train = load_dataset("iboero16/reranker", dataset_size, split="train")
         eval = load_dataset("iboero16/reranker", dataset_size, split="validation")
 
@@ -167,10 +167,18 @@ class RERANKER(Experiment):
                 self.experiment = experiment
                 self.custom_cfg = custom_cfg
                 self.tok = tokenizer
+                self.eval_lengths = self._get_eval_lengths()
                 if not eval:
                     self.init_dual_vars()
                 self.compute_metrics = self._compute_metrics
-                
+            
+            def _get_eval_lengths(self):
+                all_lengths = []
+                for ex in self.eval_dataset:
+                    passage_lengths = ex["passage_lengths"]
+                    all_lengths.append(passage_lengths)
+                return np.array(all_lengths)
+
             def init_dual_vars(self):
                 """Initialize dual variables for the current batch."""
                 self.dual_vars = torch.zeros((len(self.train_dataset), self.custom_cfg.exp.num_negatives), dtype=torch.float, requires_grad=False).to(self.model.device)
@@ -366,7 +374,28 @@ class RERANKER(Experiment):
                     
                 elif cfg.loss_type == "penalty":
                     loss += cfg.loss_alpha * slack.mean(dim=1)
-                    
+
+                ## TAIL-RISK METHODS
+                elif cfg.loss_type == "tilted":
+                    # Tilted Empirical Risk Minimization (Li et al., https://arxiv.org/pdf/2007.01162)
+                    # applied to the raw constraint margins (s_pos - s_neg), i.e. slack without the
+                    # loss_tol margin subtracted. The objective term above is left untouched (plain
+                    # batch average); only the constraint term is replaced by the tilted aggregation.
+                    t = cfg.tilt_t
+                    constraint_violation = -(s_pos[:, None] - s_neg)  # (B, K), positive = violation
+                    flat = constraint_violation.reshape(-1)
+                    tilted_loss = torch.logsumexp(t * flat, dim=0) / t - math.log(flat.numel()) / t
+                    loss = loss + cfg.loss_alpha * tilted_loss
+
+                elif cfg.loss_type == "topk":
+                    # Average top-k loss (Fan et al., https://arxiv.org/pdf/1705.08826) applied to the
+                    # same raw constraint margins used above for the tilted loss.
+                    constraint_violation = -(s_pos[:, None] - s_neg)  # (B, K), positive = violation
+                    flat = constraint_violation.reshape(-1)
+                    k = min(int(cfg.topk_k), flat.numel())
+                    topk_violations, _ = torch.topk(flat, k)
+                    loss = loss + cfg.loss_alpha * topk_violations.mean()
+
                 loss = loss.mean()
                 
                 if return_outputs:
@@ -401,9 +430,13 @@ class RERANKER(Experiment):
                     raise ValueError(f"Logits shape {logits.shape} is incompatible with labels shape {labels.shape}.")
 
                 # Compute passage lengths if inputs are available
-                passage_lengths = None
+                passage_lengths = None 
                 all_lengths = compute_passage_lengths_from_tokens(inputs, self.tok)
+                override_lengths = getattr(cfg.exp, 'override_lengths', False)
+                if override_lengths:
+                    all_lengths = self.eval_lengths
                 passage_lengths = torch.tensor(all_lengths).view(N, G)  # (N, G)
+
 
                 # Compute rank of the positive for each query
                 scores = logits.detach().cpu().numpy()
@@ -455,7 +488,7 @@ class RERANKER(Experiment):
                         top3_indices = order[:3]
                         top3_lengths = [passage_lengths[i, idx].item() for idx in top3_indices]
                         top3_avg_lengths.append(np.mean(top3_lengths))
-                
+
                 # Standard metrics
                 mrr10 = sum((1.0 / r) if r <= 10 else 0.0 for r in ranks) / N
                 mean_ndcg10 = sum(ndcg_at_k(r, 10) for r in ranks) / N
