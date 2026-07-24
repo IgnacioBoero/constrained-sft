@@ -6,7 +6,7 @@ hydra:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     params:
       exp.loss_type: tilted
-      exp.loss_alpha: 0.1,0.01,0.5,
+      exp.loss_alpha: 0.1, 0.01, 0.5
       exp.tilt_t: 1.0
       exp.loss_tol: 1
       train.seed: 42
