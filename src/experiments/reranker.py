@@ -389,12 +389,16 @@ class RERANKER(Experiment):
 
                 elif cfg.loss_type == "topk":
                     # Average top-k loss (Fan et al., https://arxiv.org/pdf/1705.08826) applied to the
-                    # same raw constraint margins used above for the tilted loss.
+                    # same raw constraint margins used above for the tilted loss. topk_per is a
+                    # fraction of the batch (not an absolute count), so it scales with batch size.
                     constraint_violation = -(s_pos[:, None] - s_neg)  # (B, K), positive = violation
                     flat = constraint_violation.reshape(-1)
-                    k = min(int(cfg.topk_k), flat.numel())
+                    k = max(1, int(round(cfg.topk_per * flat.numel())))
                     topk_violations, _ = torch.topk(flat, k)
-                    loss = loss + cfg.loss_alpha * topk_violations.mean()
+                    term = cfg.topk_weight * topk_violations.mean()
+                    if cfg.include_avg:
+                        term = term + flat.mean()
+                    loss = loss + cfg.loss_alpha * term
 
                 loss = loss.mean()
                 
