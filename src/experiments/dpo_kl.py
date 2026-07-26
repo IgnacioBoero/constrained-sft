@@ -38,6 +38,8 @@ class DPO_KL(Experiment):
       - penalty_both: linear penalty on win/loose slacks
       - penalty_tilt_both: fixed-weight penalty with exponentially tilted constraint avg
         (objective unchanged; constraint term uses E[exp(t * slack)] instead of E[slack])
+      - penalty_topk_both: fixed-weight penalty using mean of top-k constraint violations
+        (objective unchanged; constraint term uses mean of the k largest slacks)
       - aug_dual_both: augmented dual on win/loose slacks
       - resilient_both: resilient augmented dual on win/loose slacks
       - dual_both: classical λ·slack on win/loose slacks
@@ -52,6 +54,7 @@ class DPO_KL(Experiment):
             "average_both",
             "penalty_both",
             "penalty_tilt_both",
+            "penalty_topk_both",
             "aug_dual_both",
             "resilient_both",
             "dual_both",
@@ -1046,6 +1049,7 @@ class DPO_KL(Experiment):
                     "average_both",
                     "penalty_both",
                     "penalty_tilt_both",
+                    "penalty_topk_both",
                     "aug_dual_both",
                     "dual_both",
                     "resilient_both",
@@ -1416,10 +1420,24 @@ class DPO_KL(Experiment):
                         + alpha_loose * torch.exp(t * slack_loose)
                     )
 
+                elif loss_type == "penalty_topk_both":
+                    # Same fixed regularization weight as penalty_both, but replace
+                    # batch-mean(slack) with mean of the top-k largest slacks (worst violations).
+                    alpha_win = float(getattr(cfg, "loss_alpha_win", getattr(cfg, "loss_alpha", 1.0)))
+                    alpha_loose = float(getattr(cfg, "loss_alpha_loose", getattr(cfg, "loss_alpha", 1.0)))
+                    k = int(getattr(cfg, "topk_k", 1))
+                    if k < 1:
+                        raise ValueError(f"penalty_topk_both requires topk_k >= 1, got {k}")
+                    k_eff = min(k, slack_win.shape[0])
+                    topk_win = torch.topk(slack_win, k=k_eff, largest=True).values
+                    topk_loose = torch.topk(slack_loose, k=k_eff, largest=True).values
+                    loss = loss.mean() + alpha_win * topk_win.mean() + alpha_loose * topk_loose.mean()
+
                 else:
                     raise AssertionError(f"Unhandled KL loss_type: {loss_type}")
 
-                loss = loss.mean()
+                if loss.ndim > 0:
+                    loss = loss.mean()
                 if model.training:
                     objective_mean = float(kl_mean.mean().detach().cpu().item())
                     slack_mean = float(
